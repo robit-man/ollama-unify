@@ -1,0 +1,4 @@
+*.bak
+*.orphan-blobs
+*.swp
+.DS_Store
