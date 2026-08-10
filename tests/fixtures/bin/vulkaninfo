@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${MOCK_PROFILE:-}" != "vulkan" ]; then
+  exit 1
+fi
+
+printf '%s\n' \
+  'Vulkan Instance Version: 1.3.280' \
+  '' \
+  'Devices:' \
+  '========' \
+  'GPU0:' \
+  '    deviceType = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU' \
+  '    deviceName = Mock Integrated Vulkan GPU'

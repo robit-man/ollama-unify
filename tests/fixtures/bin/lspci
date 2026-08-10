@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fixture profiles describe their own accelerators. Keep host PCI devices out
+# of CPU-only assertions so the test is independent of the machine running it.
+exit 0

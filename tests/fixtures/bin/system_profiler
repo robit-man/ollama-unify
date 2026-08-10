@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ "${MOCK_PROFILE:-}" = "metal" ] || exit 1
+printf '%s\n' \
+  'Graphics/Displays:' \
+  '' \
+  '    Apple Mock GPU:' \
+  '      Chipset Model: Apple Mock GPU'

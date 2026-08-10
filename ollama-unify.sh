@@ -53,23 +53,43 @@ BANNER
 
 # ───────────────────────────────────────────────────── prerequisite checks
 require() { command -v "$1" >/dev/null 2>&1 || { err "missing required command: $1"; exit 2; }; }
-require rsync; require du; require df; require find; require stat; require awk; require sort
+require_migration_tools() {
+  require rsync; require du; require df; require find; require stat; require awk; require sort
+}
 
 HAS_SUDO=0; command -v sudo >/dev/null 2>&1 && HAS_SUDO=1
-HAS_SYSTEMD=0; command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1 && HAS_SYSTEMD=1
+HAS_SYSTEMD=0; SYSTEMD_VERSION=0
+if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+  HAS_SYSTEMD=1
+  SYSTEMD_VERSION=$(systemctl --version | awk 'NR==1 {print $2; exit}')
+  [[ "$SYSTEMD_VERSION" =~ ^[0-9]+$ ]] || SYSTEMD_VERSION=0
+fi
 HAS_CURL=0; command -v curl >/dev/null 2>&1 && HAS_CURL=1
-[ "$(uname -s)" = "Linux" ] || warn "Tested on Linux only. macOS/WSL may need manual tweaks."
 
-# ─────────────────────────────────── dynamic Ollama resource safety profile
-# Defaults can be tuned per run with OLLAMA_SAFE_* variables. GPU UUIDs are
-# used instead of indices because their ordering can change between boots.
+# ─────────────────────────────────── portable host + accelerator classifier
+# The safety layer always produces a scheduler/host-memory profile. Accelerator
+# discovery is capability-driven and degrades through CUDA → ROCm → Vulkan →
+# Metal → CPU unless OLLAMA_SAFE_BACKEND explicitly selects an available one.
 SAFETY_READY=0
-SAFETY_NVIDIA_SMI=""
-SAFETY_GPU_UUID_CSV=""
-SAFETY_GPU_COUNT=0
+HOST_OS=""
+HOST_ARCH=""
+HOST_NAME=""
+HOST_CPU=""
+HOST_CPU_CORES=0
+HOST_VIRTUALIZATION="none"
+HOST_SERVICE_MANAGER="none"
+HOST_MEMORY_SOURCE=""
+SAFETY_PHYSICAL_MEMORY_MIB=0
+SAFETY_HOST_TOTAL_MIB=0
+SAFETY_HOST_CLASS=""
+SAFETY_BACKEND="cpu"
+SAFETY_BACKEND_CLASS="fallback"
+SAFETY_BACKEND_REASON=""
+SAFETY_DEVICE_COUNT=0
+SAFETY_SHARED_ACCELERATOR=0
+SAFETY_MIN_DEVICE_MEMORY_MIB=0
 SAFETY_VRAM_RESERVE_MIB=0
 SAFETY_VRAM_RESERVE_BYTES=0
-SAFETY_HOST_TOTAL_MIB=0
 SAFETY_HOST_MEMORY_HIGH_MIB=0
 SAFETY_HOST_MEMORY_MAX_MIB=0
 SAFETY_CONTEXT_LENGTH=0
@@ -78,7 +98,17 @@ SAFETY_MAX_LOADED_MODELS=0
 SAFETY_MAX_QUEUE=0
 SAFETY_KEEP_ALIVE=""
 SAFETY_SWAP_MAX=""
-declare -a SAFETY_GPU_UUIDS=() SAFETY_GPU_SUMMARIES=() SAFETY_EXCLUDED_GPU_SUMMARIES=()
+
+CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_SHARED=0
+ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_SHARED=0
+VULKAN_TOOL=""; VULKAN_COUNT=0; VULKAN_SHARED=0
+METAL_COUNT=0
+declare -a ACCELERATOR_SUMMARIES=() SAFETY_DEVICE_IDS=() SAFETY_SELECTED_SUMMARIES=()
+declare -a SAFETY_PREFLIGHT_DIRECTIVES=()
+declare -a CUDA_IDS=() CUDA_SUMMARIES=() CUDA_PREFLIGHT=()
+declare -a ROCM_IDS=() ROCM_SUMMARIES=() ROCM_PREFLIGHT=()
+declare -a VULKAN_IDS=() VULKAN_SUMMARIES=() VULKAN_PREFLIGHT=()
+declare -a METAL_SUMMARIES=()
 
 trim_ws() {
   local value="$1"
@@ -92,105 +122,392 @@ require_uint_value() {
   [[ "$value" =~ ^[0-9]+$ ]] || { err "$name must be an unsigned integer (got: $value)"; exit 2; }
 }
 
-build_safety_profile() {
-  [ "$SAFETY_READY" = 1 ] && return 0
-  command -v nvidia-smi >/dev/null 2>&1 || { warn "nvidia-smi not found; GPU guardrails unavailable."; return 1; }
-  SAFETY_NVIDIA_SMI=$(command -v nvidia-smi)
-  [[ "$SAFETY_NVIDIA_SMI" == /* ]] \
-    || { warn "nvidia-smi did not resolve to an absolute path; GPU guardrails unavailable."; return 1; }
-  [ -r /proc/meminfo ] || { warn "/proc/meminfo unavailable; host-memory guardrails unavailable."; return 1; }
+detect_host_profile() {
+  HOST_OS=$(uname -s 2>/dev/null || printf 'Unknown')
+  HOST_ARCH=$(uname -m 2>/dev/null || printf 'unknown')
+  HOST_NAME=$(hostname 2>/dev/null || printf 'unknown')
+  HOST_CPU_CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')
+  [[ "$HOST_CPU_CORES" =~ ^[0-9]+$ ]] || HOST_CPU_CORES=1
 
-  local inventory
-  if ! inventory=$(nvidia-smi \
-      --query-gpu=index,uuid,name,display_active,memory.total,compute_cap \
-      --format=csv,noheader,nounits 2>/dev/null); then
-    warn "nvidia-smi does not expose the telemetry needed for dynamic GPU selection."
-    return 1
+  case "$HOST_OS" in
+    Linux)
+      if [ -r /etc/os-release ]; then
+        HOST_NAME=$(awk -F= '/^PRETTY_NAME=/{v=substr($0,index($0,"=")+1); gsub(/^"|"$/,"",v); print v; exit}' /etc/os-release)
+      fi
+      HOST_CPU=$(awk -F: '/^(model name|Hardware)[[:space:]]*:/{v=$2; sub(/^[[:space:]]+/,"",v); print v; exit}' /proc/cpuinfo 2>/dev/null)
+      [ -n "$HOST_CPU" ] || HOST_CPU="$HOST_ARCH CPU"
+      if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        HOST_VIRTUALIZATION="wsl"
+      elif [ -e /.dockerenv ]; then
+        HOST_VIRTUALIZATION="container"
+      elif command -v systemd-detect-virt >/dev/null 2>&1; then
+        local detected_virt=""
+        if detected_virt=$(systemd-detect-virt 2>/dev/null); then
+          HOST_VIRTUALIZATION="$detected_virt"
+        else
+          HOST_VIRTUALIZATION="none"
+        fi
+      fi
+      if [ -d /run/systemd/system ] && [ "$HAS_SYSTEMD" = 1 ]; then HOST_SERVICE_MANAGER="systemd"; fi
+      ;;
+    Darwin)
+      HOST_NAME="macOS $(sw_vers -productVersion 2>/dev/null || true)"
+      HOST_CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model 2>/dev/null || printf '%s CPU' "$HOST_ARCH")
+      HOST_SERVICE_MANAGER="launchd"
+      ;;
+    FreeBSD)
+      HOST_NAME="FreeBSD $(uname -r 2>/dev/null || true)"
+      HOST_CPU=$(sysctl -n hw.model 2>/dev/null || printf '%s CPU' "$HOST_ARCH")
+      HOST_SERVICE_MANAGER="rc.d"
+      ;;
+    *) HOST_CPU="$HOST_ARCH CPU" ;;
+  esac
+
+  local physical_mib=0
+  if [ -r /proc/meminfo ]; then
+    physical_mib=$(awk '/^MemTotal:/ { print int($2 / 1024); exit }' /proc/meminfo)
+    HOST_MEMORY_SOURCE="/proc/meminfo"
+  elif command -v sysctl >/dev/null 2>&1; then
+    local memory_bytes
+    memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || printf '0')
+    if [[ "$memory_bytes" =~ ^[0-9]+$ ]]; then physical_mib=$((memory_bytes / 1024 / 1024)); fi
+    HOST_MEMORY_SOURCE="sysctl"
+  fi
+  if ! [[ "$physical_mib" =~ ^[0-9]+$ ]] || [ "$physical_mib" -lt 1024 ]; then
+    physical_mib=4096
+    HOST_MEMORY_SOURCE="conservative 4 GiB fallback"
+  fi
+  SAFETY_PHYSICAL_MEMORY_MIB="$physical_mib"
+  SAFETY_HOST_TOTAL_MIB="$physical_mib"
+
+  local limit_file="" limit_raw="" limit_mib=0
+  if [ -r /sys/fs/cgroup/memory.max ]; then
+    limit_file=/sys/fs/cgroup/memory.max
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    limit_file=/sys/fs/cgroup/memory/memory.limit_in_bytes
+  fi
+  if [ -n "$limit_file" ]; then
+    limit_raw=$(tr -d '[:space:]' < "$limit_file")
+    if [[ "$limit_raw" =~ ^[0-9]+$ ]]; then
+      limit_mib=$(awk -v bytes="$limit_raw" 'BEGIN { printf "%.0f", bytes / 1048576 }')
+      if [ "$limit_mib" -ge 1024 ] && [ "$limit_mib" -lt "$SAFETY_HOST_TOTAL_MIB" ]; then
+        SAFETY_HOST_TOTAL_MIB="$limit_mib"
+        HOST_MEMORY_SOURCE="$HOST_MEMORY_SOURCE, constrained by cgroup"
+      fi
+    fi
+  fi
+  if [ -n "${OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB "$OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB"
+    [ "$OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB" -ge 1024 ] \
+      || { err "OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB must be at least 1024"; exit 2; }
+    SAFETY_HOST_TOTAL_MIB="$OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB"
+    HOST_MEMORY_SOURCE="explicit override"
   fi
 
-  local min_gpu_memory_mib="${OLLAMA_SAFE_MIN_GPU_MEMORY_MIB:-16384}"
-  local min_compute_major="${OLLAMA_SAFE_MIN_COMPUTE_MAJOR:-7}"
-  require_uint_value OLLAMA_SAFE_MIN_GPU_MEMORY_MIB "$min_gpu_memory_mib"
-  require_uint_value OLLAMA_SAFE_MIN_COMPUTE_MAJOR "$min_compute_major"
+  case "$SAFETY_HOST_TOTAL_MIB" in
+    ''|*[!0-9]*) SAFETY_HOST_CLASS="unknown" ;;
+    *)
+      if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then SAFETY_HOST_CLASS="constrained"
+      elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ]; then SAFETY_HOST_CLASS="personal"
+      elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then SAFETY_HOST_CLASS="workstation"
+      else SAFETY_HOST_CLASS="memory-rich server"
+      fi
+      ;;
+  esac
+}
 
-  local min_selected_vram_mib=0
-  local -a gpu_uuids=()
-  SAFETY_GPU_SUMMARIES=()
-  SAFETY_EXCLUDED_GPU_SUMMARIES=()
+detect_cuda_devices() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  CUDA_TOOL=$(command -v nvidia-smi)
+  [[ "$CUDA_TOOL" == /* ]] || { CUDA_TOOL=""; return 0; }
+  local inventory=""
+  inventory=$("$CUDA_TOOL" --query-gpu=index,uuid,name,display_active,memory.total,compute_cap \
+    --format=csv,noheader,nounits 2>/dev/null) || return 0
+
+  local min_vram="${OLLAMA_SAFE_MIN_GPU_MEMORY_MIB:-4096}"
+  local min_compute="${OLLAMA_SAFE_MIN_COMPUTE_MAJOR:-5}"
+  require_uint_value OLLAMA_SAFE_MIN_GPU_MEMORY_MIB "$min_vram"
+  require_uint_value OLLAMA_SAFE_MIN_COMPUTE_MAJOR "$min_compute"
+  local -a dedicated_ids=() dedicated_summaries=() shared_ids=() shared_summaries=()
+  local dedicated_min=0 shared_min=0
 
   while IFS=',' read -r raw_index raw_uuid raw_name raw_display raw_vram raw_compute; do
-    local gpu_index gpu_uuid gpu_name display_active vram_mib compute_cap compute_major reason
-    gpu_index=$(trim_ws "$raw_index")
-    gpu_uuid=$(trim_ws "$raw_uuid")
-    gpu_name=$(trim_ws "$raw_name")
-    display_active=$(trim_ws "$raw_display")
-    vram_mib=$(trim_ws "$raw_vram")
-    compute_cap=$(trim_ws "$raw_compute")
-    compute_major="${compute_cap%%.*}"
-    reason=""
-
-    if ! [[ "$vram_mib" =~ ^[0-9]+$ && "$compute_major" =~ ^[0-9]+$ ]]; then
-      reason="incomplete CUDA telemetry"
-    elif [[ "$gpu_name" == *"GT 1030"* ]]; then
-      reason="desktop GT 1030"
-    elif [ "$display_active" = "Enabled" ]; then
-      reason="active display GPU"
-    elif [ "$vram_mib" -lt "$min_gpu_memory_mib" ]; then
-      reason="only ${vram_mib} MiB VRAM"
-    elif [ "$compute_major" -lt "$min_compute_major" ]; then
-      reason="CUDA compute capability ${compute_cap}"
-    fi
-
-    if [ -n "$reason" ]; then
-      SAFETY_EXCLUDED_GPU_SUMMARIES+=("GPU $gpu_index: $gpu_name ($reason)")
-      continue
-    fi
-
-    gpu_uuids+=("$gpu_uuid")
-    SAFETY_GPU_SUMMARIES+=("GPU $gpu_index: $gpu_name, ${vram_mib} MiB, compute $compute_cap, $gpu_uuid")
-    if [ "$min_selected_vram_mib" -eq 0 ] || [ "$vram_mib" -lt "$min_selected_vram_mib" ]; then
-      min_selected_vram_mib="$vram_mib"
+    local index uuid name display vram compute major role summary
+    index=$(trim_ws "$raw_index"); uuid=$(trim_ws "$raw_uuid"); name=$(trim_ws "$raw_name")
+    display=$(trim_ws "$raw_display"); vram=$(trim_ws "$raw_vram"); compute=$(trim_ws "$raw_compute")
+    major="${compute%%.*}"
+    if ! [[ "$vram" =~ ^[0-9]+$ && "$major" =~ ^[0-9]+$ && "$uuid" == GPU-* ]]; then
+      ACCELERATOR_SUMMARIES+=("[cuda/unusable] GPU $index: $name — incomplete CUDA telemetry")
+    elif [ "$major" -lt "$min_compute" ]; then
+      ACCELERATOR_SUMMARIES+=("[cuda/legacy] GPU $index: $name, ${vram} MiB, compute $compute — below compute ${min_compute}.x")
+    elif [ "$vram" -lt "$min_vram" ]; then
+      ACCELERATOR_SUMMARIES+=("[cuda/constrained] GPU $index: $name, ${vram} MiB, compute $compute — below ${min_vram} MiB safety floor")
+    else
+      if [ "$display" = "Enabled" ]; then role="shared-display"; else role="dedicated"; fi
+      summary="GPU $index: $name, ${vram} MiB, compute $compute, $uuid ($role)"
+      ACCELERATOR_SUMMARIES+=("[cuda/$role] $summary")
+      if [ "$role" = "dedicated" ]; then
+        dedicated_ids+=("$uuid"); dedicated_summaries+=("$summary")
+        if [ "$dedicated_min" -eq 0 ] || [ "$vram" -lt "$dedicated_min" ]; then dedicated_min="$vram"; fi
+      else
+        shared_ids+=("$uuid"); shared_summaries+=("$summary")
+        if [ "$shared_min" -eq 0 ] || [ "$vram" -lt "$shared_min" ]; then shared_min="$vram"; fi
+      fi
     fi
   done <<< "$inventory"
 
-  [ ${#gpu_uuids[@]} -gt 0 ] || { warn "No eligible non-display CUDA inference GPUs detected; safety profile skipped."; return 1; }
+  if [ ${#dedicated_ids[@]} -gt 0 ]; then
+    CUDA_IDS=("${dedicated_ids[@]}"); CUDA_SUMMARIES=("${dedicated_summaries[@]}")
+    CUDA_MIN_VRAM_MIB="$dedicated_min"; CUDA_SHARED=0
+  elif [ ${#shared_ids[@]} -gt 0 ]; then
+    CUDA_IDS=("${shared_ids[@]}"); CUDA_SUMMARIES=("${shared_summaries[@]}")
+    CUDA_MIN_VRAM_MIB="$shared_min"; CUDA_SHARED=1
+  fi
+  CUDA_COUNT=${#CUDA_IDS[@]}
+  local uuid
+  for uuid in "${CUDA_IDS[@]}"; do
+    CUDA_PREFLIGHT+=("ExecStartPre=$CUDA_TOOL --id=$uuid --query-gpu=uuid,memory.total,compute_cap --format=csv,noheader,nounits")
+  done
+}
 
-  SAFETY_GPU_UUID_CSV=$(IFS=,; printf '%s' "${gpu_uuids[*]}")
-  SAFETY_GPU_UUIDS=("${gpu_uuids[@]}")
-  SAFETY_GPU_COUNT=${#gpu_uuids[@]}
+detect_rocm_devices() {
+  local inventory="" tool=""
+  if command -v amd-smi >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    tool=$(command -v amd-smi)
+    local amd_json=""
+    amd_json=$("$tool" static --json 2>/dev/null) || amd_json=""
+    if [ -n "$amd_json" ]; then
+      inventory=$(printf '%s\n' "$amd_json" | jq -r '
+        (if type == "array" then to_entries elif type == "object" then to_entries else [] end)[] |
+        .key as $ordinal | .value as $g |
+        [($g.gpu // $g.gpu_id // $g.id // $ordinal),
+         ($g.uuid // $g.asic.uuid // $g.gpu_uuid // ""),
+         ($g.asic.market_name // $g.asic.name // $g.board.product_name // $g.name // "AMD GPU"),
+         ($g.vram.size.value // $g.vram.size // 0)] | @tsv' 2>/dev/null || true)
+    fi
+  fi
+  if [ -z "$inventory" ] && command -v rocminfo >/dev/null 2>&1; then
+    tool=$(command -v rocminfo)
+    inventory=$("$tool" 2>/dev/null | awk '
+      function flush() { if (is_gpu) { print ordinal "\t" uuid "\t" market "\t0"; ordinal++ } }
+      /^[[:space:]]*Agent[[:space:]][0-9]+/ { flush(); is_gpu=0; uuid=""; market="AMD ROCm GPU"; next }
+      /^[[:space:]]*Device Type:/ { if ($NF == "GPU") is_gpu=1; next }
+      /^[[:space:]]*Uuid:/ { uuid=$NF; next }
+      /^[[:space:]]*Marketing Name:/ { sub(/^[^:]*:[[:space:]]*/,""); market=$0; next }
+      END { flush() }' || true)
+  fi
+  [ -n "$inventory" ] || return 0
+  ROCM_TOOL="$tool"
+  local ordinal=0
+  while IFS=$'\t' read -r raw_id raw_uuid raw_name raw_vram; do
+    local id uuid name vram role summary
+    id=$(trim_ws "$raw_id"); uuid=$(trim_ws "$raw_uuid"); name=$(trim_ws "$raw_name"); vram=$(trim_ws "$raw_vram")
+    [[ "$vram" =~ ^[0-9]+$ ]] || vram=0
+    if [ -n "$uuid" ] && [ "$uuid" != "N/A" ]; then id="$uuid"; else id="$ordinal"; fi
+    if [ "$vram" -eq 0 ]; then role="unknown-memory"; ROCM_SHARED=1
+    elif [ "$vram" -lt 4096 ]; then role="shared-or-constrained"; ROCM_SHARED=1
+    else role="discrete"; fi
+    summary="GPU $ordinal: $name"
+    [ "$vram" -gt 0 ] && summary="$summary, ${vram} MiB"
+    summary="$summary, id $id ($role)"
+    ROCM_IDS+=("$id"); ROCM_SUMMARIES+=("$summary")
+    ACCELERATOR_SUMMARIES+=("[rocm/$role] $summary")
+    if [ "$vram" -gt 0 ] && { [ "$ROCM_MIN_VRAM_MIB" -eq 0 ] || [ "$vram" -lt "$ROCM_MIN_VRAM_MIB" ]; }; then
+      ROCM_MIN_VRAM_MIB="$vram"
+    fi
+    ordinal=$((ordinal + 1))
+  done <<< "$inventory"
+  ROCM_COUNT=${#ROCM_IDS[@]}
+  if [ "$ROCM_COUNT" -gt 0 ]; then
+    if [[ "$ROCM_TOOL" == */amd-smi ]]; then ROCM_PREFLIGHT+=("ExecStartPre=$ROCM_TOOL list")
+    else ROCM_PREFLIGHT+=("ExecStartPre=$ROCM_TOOL"); fi
+  fi
+}
 
-  SAFETY_VRAM_RESERVE_MIB="${OLLAMA_SAFE_VRAM_RESERVE_MIB:-$((min_selected_vram_mib * 8 / 100))}"
-  require_uint_value OLLAMA_SAFE_VRAM_RESERVE_MIB "$SAFETY_VRAM_RESERVE_MIB"
-  [ "$SAFETY_VRAM_RESERVE_MIB" -lt 4096 ] && SAFETY_VRAM_RESERVE_MIB=4096
+detect_vulkan_devices() {
+  command -v vulkaninfo >/dev/null 2>&1 || return 0
+  VULKAN_TOOL=$(command -v vulkaninfo)
+  [[ "$VULKAN_TOOL" == /* ]] || { VULKAN_TOOL=""; return 0; }
+  local inventory=""
+  inventory=$("$VULKAN_TOOL" --summary 2>/dev/null | awk '
+    function flush() { if (seen && name != "") print idx "\t" name "\t" dtype }
+    /^[[:space:]]*GPU[0-9]+:/ { flush(); idx=$1; sub(/^GPU/,"",idx); sub(/:$/,"",idx); name=""; dtype="unknown"; seen=1; next }
+    /^[[:space:]]*deviceName[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/,""); name=$0; next }
+    /^[[:space:]]*deviceType[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/,""); dtype=$0; next }
+    END { flush() }' || true)
+  [ -n "$inventory" ] || { VULKAN_TOOL=""; return 0; }
+  local -a discrete_ids=() discrete_summaries=() shared_ids=() shared_summaries=()
+  while IFS=$'\t' read -r id name dtype; do
+    local role summary
+    case "$dtype" in
+      *DISCRETE_GPU*) role="discrete" ;;
+      *INTEGRATED_GPU*|*VIRTUAL_GPU*) role="shared" ;;
+      *CPU*) ACCELERATOR_SUMMARIES+=("[vulkan/cpu-device] GPU $id: $name — not an accelerator"); continue ;;
+      *) role="unknown" ;;
+    esac
+    summary="GPU $id: $name ($role, memory telemetry unavailable)"
+    ACCELERATOR_SUMMARIES+=("[vulkan/$role] $summary")
+    if [ "$role" = "discrete" ]; then discrete_ids+=("$id"); discrete_summaries+=("$summary")
+    else shared_ids+=("$id"); shared_summaries+=("$summary"); fi
+  done <<< "$inventory"
+  if [ ${#discrete_ids[@]} -gt 0 ]; then
+    VULKAN_IDS=("${discrete_ids[@]}"); VULKAN_SUMMARIES=("${discrete_summaries[@]}"); VULKAN_SHARED=0
+  else
+    VULKAN_IDS=("${shared_ids[@]}"); VULKAN_SUMMARIES=("${shared_summaries[@]}"); VULKAN_SHARED=1
+  fi
+  VULKAN_COUNT=${#VULKAN_IDS[@]}
+  [ "$VULKAN_COUNT" -gt 0 ] && VULKAN_PREFLIGHT+=("ExecStartPre=$VULKAN_TOOL --summary")
+}
+
+detect_metal_devices() {
+  [ "$HOST_OS" = "Darwin" ] || return 0
+  if command -v system_profiler >/dev/null 2>&1; then
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      METAL_SUMMARIES+=("$name (Metal, unified/shared memory)")
+      ACCELERATOR_SUMMARIES+=("[metal/unified] $name")
+    done < <(system_profiler SPDisplaysDataType 2>/dev/null | awk -F: '/Chipset Model:/{sub(/^[[:space:]]+/,"",$2); print $2}')
+  fi
+  if [ ${#METAL_SUMMARIES[@]} -eq 0 ] && [ "$HOST_ARCH" = "arm64" ]; then
+    METAL_SUMMARIES+=("Apple Silicon GPU (Metal, unified memory)")
+    ACCELERATOR_SUMMARIES+=("[metal/unified] Apple Silicon GPU")
+  fi
+  METAL_COUNT=${#METAL_SUMMARIES[@]}
+}
+
+detect_unconfigured_accelerators() {
+  [ ${#ACCELERATOR_SUMMARIES[@]} -eq 0 ] || return 0
+  [ "$HOST_OS" = "Linux" ] || return 0
+  if command -v lspci >/dev/null 2>&1; then
+    while IFS= read -r device; do
+      [ -n "$device" ] || continue
+      ACCELERATOR_SUMMARIES+=("[pci/unconfigured] $device — no usable Ollama backend telemetry")
+    done < <(lspci 2>/dev/null | awk 'tolower($0) ~ /vga compatible controller|3d controller|display controller/ {$1=""; sub(/^[[:space:]]+/,""); print}')
+  fi
+  if [ ${#ACCELERATOR_SUMMARIES[@]} -eq 0 ] && compgen -G '/dev/dri/renderD*' >/dev/null 2>&1; then
+    ACCELERATOR_SUMMARIES+=("[drm/unconfigured] render nodes exist, but neither ROCm nor Vulkan telemetry is available")
+  fi
+}
+
+select_safety_backend() {
+  local requested="${OLLAMA_SAFE_BACKEND:-auto}"
+  requested="${requested,,}"
+  case "$requested" in auto|cuda|rocm|vulkan|metal|cpu) ;; *) err "OLLAMA_SAFE_BACKEND must be auto, cuda, rocm, vulkan, metal, or cpu"; exit 2 ;; esac
+  if [ "$requested" = "auto" ]; then
+    if [ "$HOST_OS" = "Darwin" ] && [ "$METAL_COUNT" -gt 0 ]; then requested="metal"
+    elif [ "$CUDA_COUNT" -gt 0 ]; then requested="cuda"
+    elif [ "$ROCM_COUNT" -gt 0 ]; then requested="rocm"
+    elif [ "$VULKAN_COUNT" -gt 0 ]; then requested="vulkan"
+    else requested="cpu"; fi
+  fi
+
+  case "$requested" in
+    cuda)
+      [ "$CUDA_COUNT" -gt 0 ] || { err "CUDA was requested but no eligible CUDA device was classified"; exit 2; }
+      SAFETY_DEVICE_IDS=("${CUDA_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${CUDA_SUMMARIES[@]}")
+      SAFETY_PREFLIGHT_DIRECTIVES=("${CUDA_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$CUDA_COUNT"
+      SAFETY_MIN_DEVICE_MEMORY_MIB="$CUDA_MIN_VRAM_MIB"; SAFETY_SHARED_ACCELERATOR="$CUDA_SHARED"
+      SAFETY_BACKEND_CLASS=$([ "$CUDA_SHARED" = 1 ] && printf 'shared-display' || printf 'dedicated')
+      SAFETY_BACKEND_REASON="highest-confidence native NVIDIA backend"
+      ;;
+    rocm)
+      [ "$ROCM_COUNT" -gt 0 ] || { err "ROCm was requested but no ROCm device was classified"; exit 2; }
+      SAFETY_DEVICE_IDS=("${ROCM_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${ROCM_SUMMARIES[@]}")
+      SAFETY_PREFLIGHT_DIRECTIVES=("${ROCM_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$ROCM_COUNT"
+      SAFETY_MIN_DEVICE_MEMORY_MIB="$ROCM_MIN_VRAM_MIB"; SAFETY_SHARED_ACCELERATOR="$ROCM_SHARED"
+      SAFETY_BACKEND_CLASS=$([ "$ROCM_SHARED" = 1 ] && printf 'shared/integrated' || printf 'discrete')
+      SAFETY_BACKEND_REASON="native AMD ROCm backend"
+      ;;
+    vulkan)
+      [ "$VULKAN_COUNT" -gt 0 ] || { err "Vulkan was requested but no Vulkan accelerator was classified"; exit 2; }
+      SAFETY_DEVICE_IDS=("${VULKAN_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${VULKAN_SUMMARIES[@]}")
+      SAFETY_PREFLIGHT_DIRECTIVES=("${VULKAN_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$VULKAN_COUNT"
+      SAFETY_SHARED_ACCELERATOR="$VULKAN_SHARED"; SAFETY_MIN_DEVICE_MEMORY_MIB=0
+      SAFETY_BACKEND_CLASS=$([ "$VULKAN_SHARED" = 1 ] && printf 'shared/integrated' || printf 'discrete')
+      SAFETY_BACKEND_REASON="portable GPU fallback with approximate memory telemetry"
+      ;;
+    metal)
+      [ "$METAL_COUNT" -gt 0 ] || { err "Metal was requested but no Metal device was classified"; exit 2; }
+      SAFETY_SELECTED_SUMMARIES=("${METAL_SUMMARIES[@]}"); SAFETY_DEVICE_COUNT="$METAL_COUNT"
+      SAFETY_SHARED_ACCELERATOR=1; SAFETY_MIN_DEVICE_MEMORY_MIB=0
+      SAFETY_BACKEND_CLASS="unified-memory"; SAFETY_BACKEND_REASON="native Apple Metal backend"
+      ;;
+    cpu)
+      SAFETY_DEVICE_COUNT=0; SAFETY_SHARED_ACCELERATOR=1; SAFETY_MIN_DEVICE_MEMORY_MIB=0
+      SAFETY_SELECTED_SUMMARIES=("$HOST_CPU (${HOST_CPU_CORES} logical cores)")
+      SAFETY_BACKEND_CLASS="host-memory"; SAFETY_BACKEND_REASON="no eligible accelerator or explicit CPU selection"
+      ;;
+  esac
+  SAFETY_BACKEND="$requested"
+}
+
+build_resource_limits() {
+  local host_reserve="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$((SAFETY_HOST_TOTAL_MIB / 5))}"
+  require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$host_reserve"
+  local reserve_floor
+  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then reserve_floor=1024
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then reserve_floor=2048
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 65536 ]; then reserve_floor=4096
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then reserve_floor=8192
+  else reserve_floor=65536; fi
+  [ "$host_reserve" -lt "$reserve_floor" ] && host_reserve="$reserve_floor"
+  [ "$host_reserve" -gt $((SAFETY_HOST_TOTAL_MIB / 2)) ] && host_reserve=$((SAFETY_HOST_TOTAL_MIB / 2))
+  SAFETY_HOST_MEMORY_MAX_MIB=$((SAFETY_HOST_TOTAL_MIB - host_reserve))
+
+  local throttle_band=$((SAFETY_HOST_TOTAL_MIB / 20)) throttle_floor
+  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then throttle_floor=256
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ]; then throttle_floor=1024
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then throttle_floor=4096
+  else throttle_floor=16384; fi
+  [ "$throttle_band" -lt "$throttle_floor" ] && throttle_band="$throttle_floor"
+  [ "$throttle_band" -gt $((SAFETY_HOST_MEMORY_MAX_MIB / 3)) ] && throttle_band=$((SAFETY_HOST_MEMORY_MAX_MIB / 3))
+  SAFETY_HOST_MEMORY_HIGH_MIB=$((SAFETY_HOST_MEMORY_MAX_MIB - throttle_band))
+  [ "$SAFETY_HOST_MEMORY_HIGH_MIB" -gt 0 ] || { err "host-memory limits leave no usable RAM for Ollama"; exit 2; }
+
+  SAFETY_VRAM_RESERVE_MIB=0
+  case "$SAFETY_BACKEND" in
+    cuda|rocm)
+      if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ]; then
+        local percentage=10 floor=1024 max_reserve
+        [ "$SAFETY_SHARED_ACCELERATOR" = 1 ] && percentage=20
+        if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -ge 16384 ]; then floor=2048; fi
+        if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -ge 32768 ]; then floor=4096; fi
+        SAFETY_VRAM_RESERVE_MIB=$((SAFETY_MIN_DEVICE_MEMORY_MIB * percentage / 100))
+        [ "$SAFETY_VRAM_RESERVE_MIB" -lt "$floor" ] && SAFETY_VRAM_RESERVE_MIB="$floor"
+        max_reserve=$((SAFETY_MIN_DEVICE_MEMORY_MIB - SAFETY_MIN_DEVICE_MEMORY_MIB / 2))
+        [ "$SAFETY_VRAM_RESERVE_MIB" -gt "$max_reserve" ] && SAFETY_VRAM_RESERVE_MIB="$max_reserve"
+      else SAFETY_VRAM_RESERVE_MIB=2048; fi
+      ;;
+    vulkan) SAFETY_VRAM_RESERVE_MIB=1024 ;;
+  esac
+  if [ -n "${OLLAMA_SAFE_VRAM_RESERVE_MIB:-}" ] && [ "$SAFETY_BACKEND" != "cpu" ] && [ "$SAFETY_BACKEND" != "metal" ]; then
+    require_uint_value OLLAMA_SAFE_VRAM_RESERVE_MIB "$OLLAMA_SAFE_VRAM_RESERVE_MIB"
+    SAFETY_VRAM_RESERVE_MIB="$OLLAMA_SAFE_VRAM_RESERVE_MIB"
+  fi
   [ "$SAFETY_VRAM_RESERVE_MIB" -gt 16384 ] && SAFETY_VRAM_RESERVE_MIB=16384
+  if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ] \
+    && [ "$SAFETY_VRAM_RESERVE_MIB" -gt $((SAFETY_MIN_DEVICE_MEMORY_MIB / 2)) ]; then
+    SAFETY_VRAM_RESERVE_MIB=$((SAFETY_MIN_DEVICE_MEMORY_MIB / 2))
+  fi
   SAFETY_VRAM_RESERVE_BYTES=$((SAFETY_VRAM_RESERVE_MIB * 1024 * 1024))
 
-  SAFETY_HOST_TOTAL_MIB=$(awk '/^MemTotal:/ { print int($2 / 1024); exit }' /proc/meminfo)
-  require_uint_value HOST_TOTAL_MIB "$SAFETY_HOST_TOTAL_MIB"
-  local host_reserve_mib="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$((SAFETY_HOST_TOTAL_MIB / 5))}"
-  require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$host_reserve_mib"
-  if [ "$SAFETY_HOST_TOTAL_MIB" -ge 131072 ] && [ "$host_reserve_mib" -lt 65536 ]; then
-    host_reserve_mib=65536
-  elif [ "$host_reserve_mib" -lt 8192 ]; then
-    host_reserve_mib=8192
+  local default_context=8192 default_queue=64 default_models=1
+  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then default_context=2048; default_queue=8
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then default_context=4096; default_queue=16; fi
+  if [ "$SAFETY_BACKEND" = "cpu" ] && [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ] && [ "$default_context" -gt 4096 ]; then
+    default_context=4096
   fi
+  if [ "$SAFETY_DEVICE_COUNT" -gt 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
+    && [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ] \
+    && [ "$SAFETY_HOST_TOTAL_MIB" -ge 32768 ]; then default_models=2; fi
 
-  SAFETY_HOST_MEMORY_MAX_MIB=$((SAFETY_HOST_TOTAL_MIB - host_reserve_mib))
-  local throttle_band_mib=$((SAFETY_HOST_TOTAL_MIB / 20))
-  [ "$throttle_band_mib" -lt 16384 ] && throttle_band_mib=16384
-  SAFETY_HOST_MEMORY_HIGH_MIB=$((SAFETY_HOST_MEMORY_MAX_MIB - throttle_band_mib))
-  if [ "$SAFETY_HOST_MEMORY_HIGH_MIB" -le 0 ] \
-    || [ "$SAFETY_HOST_MEMORY_MAX_MIB" -le "$SAFETY_HOST_MEMORY_HIGH_MIB" ]; then
-    err "dynamic host-memory guardrails leave too little RAM for Ollama"
-    exit 2
-  fi
-
-  SAFETY_CONTEXT_LENGTH="${OLLAMA_SAFE_CONTEXT_LENGTH:-8192}"
+  SAFETY_CONTEXT_LENGTH="${OLLAMA_SAFE_CONTEXT_LENGTH:-$default_context}"
   SAFETY_NUM_PARALLEL="${OLLAMA_SAFE_NUM_PARALLEL:-1}"
-  SAFETY_MAX_QUEUE="${OLLAMA_SAFE_MAX_QUEUE:-64}"
+  SAFETY_MAX_QUEUE="${OLLAMA_SAFE_MAX_QUEUE:-$default_queue}"
   SAFETY_KEEP_ALIVE="${OLLAMA_SAFE_KEEP_ALIVE:-5m}"
-  SAFETY_MAX_LOADED_MODELS="${OLLAMA_SAFE_MAX_LOADED_MODELS:-$((SAFETY_GPU_COUNT > 1 ? 2 : 1))}"
-  SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-8G}"
+  SAFETY_MAX_LOADED_MODELS="${OLLAMA_SAFE_MAX_LOADED_MODELS:-$default_models}"
+  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-2G}"
+  else SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-8G}"; fi
 
   require_uint_value OLLAMA_SAFE_CONTEXT_LENGTH "$SAFETY_CONTEXT_LENGTH"
   require_uint_value OLLAMA_SAFE_NUM_PARALLEL "$SAFETY_NUM_PARALLEL"
@@ -198,82 +515,188 @@ build_safety_profile() {
   require_uint_value OLLAMA_SAFE_MAX_LOADED_MODELS "$SAFETY_MAX_LOADED_MODELS"
   [ "$SAFETY_NUM_PARALLEL" -ge 1 ] || { err "OLLAMA_SAFE_NUM_PARALLEL must be at least 1"; exit 2; }
   [ "$SAFETY_MAX_LOADED_MODELS" -ge 1 ] || { err "OLLAMA_SAFE_MAX_LOADED_MODELS must be at least 1"; exit 2; }
-  [[ "$SAFETY_KEEP_ALIVE" =~ ^[0-9]+(ms|s|m|h)$ ]] \
-    || { err "OLLAMA_SAFE_KEEP_ALIVE must be a finite duration such as 5m"; exit 2; }
-  [[ "$SAFETY_SWAP_MAX" =~ ^[0-9]+[KMGT]$ ]] \
-    || { err "OLLAMA_SAFE_SWAP_MAX must be a systemd size such as 8G"; exit 2; }
+  [[ "$SAFETY_KEEP_ALIVE" =~ ^[0-9]+(ms|s|m|h)$ ]] || { err "OLLAMA_SAFE_KEEP_ALIVE must be a finite duration such as 5m"; exit 2; }
+  [[ "$SAFETY_SWAP_MAX" =~ ^(0|[0-9]+[KMGT])$ ]] || { err "OLLAMA_SAFE_SWAP_MAX must be 0 or a systemd size such as 8G"; exit 2; }
+}
 
+build_safety_profile() {
+  [ "$SAFETY_READY" = 1 ] && return 0
+  detect_host_profile
+  detect_cuda_devices
+  detect_rocm_devices
+  detect_vulkan_devices
+  detect_metal_devices
+  detect_unconfigured_accelerators
+  select_safety_backend
+  build_resource_limits
   SAFETY_READY=1
 }
 
 print_safety_profile() {
-  hdr "Dynamic Ollama safety profile"
-  say "  Selected CUDA inference GPUs:"
-  printf '    %s\n' "${SAFETY_GPU_SUMMARIES[@]}"
-  if [ ${#SAFETY_EXCLUDED_GPU_SUMMARIES[@]} -gt 0 ]; then
-    say "  Excluded GPUs:"
-    printf '    %s\n' "${SAFETY_EXCLUDED_GPU_SUMMARIES[@]}"
+  hdr "Host classification"
+  say "  Platform: $HOST_NAME ($HOST_OS/$HOST_ARCH; $HOST_VIRTUALIZATION)"
+  say "  CPU: $HOST_CPU — $HOST_CPU_CORES logical cores"
+  if [ "$SAFETY_PHYSICAL_MEMORY_MIB" -ne "$SAFETY_HOST_TOTAL_MIB" ]; then
+    say "  Memory: ${SAFETY_PHYSICAL_MEMORY_MIB} MiB physical; ${SAFETY_HOST_TOTAL_MIB} MiB effective ($HOST_MEMORY_SOURCE)"
+  else
+    say "  Memory: ${SAFETY_HOST_TOTAL_MIB} MiB ($HOST_MEMORY_SOURCE)"
   fi
-  say "  VRAM reserve: ${SAFETY_VRAM_RESERVE_MIB} MiB per selected GPU"
-  say "  Host RAM: throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
-  say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} loaded model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token default context"
+  if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
+    say "  Class: $SAFETY_HOST_CLASS; service manager: systemd $SYSTEMD_VERSION"
+  else
+    say "  Class: $SAFETY_HOST_CLASS; service manager: $HOST_SERVICE_MANAGER"
+  fi
+
+  hdr "Accelerator classification"
+  if [ ${#ACCELERATOR_SUMMARIES[@]} -gt 0 ]; then printf '  %s\n' "${ACCELERATOR_SUMMARIES[@]}"
+  else say "  No usable accelerator telemetry; CPU fallback is available."; fi
+
+  hdr "Selected Ollama safety policy"
+  say "  Backend: $SAFETY_BACKEND ($SAFETY_BACKEND_CLASS) — $SAFETY_BACKEND_REASON"
+  printf '  Device: %s\n' "${SAFETY_SELECTED_SUMMARIES[@]}"
+  if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then say "  Device-memory reserve: ${SAFETY_VRAM_RESERVE_MIB} MiB per selected accelerator"; fi
+  say "  Host memory: throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
+  say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
+  if [ "$HOST_SERVICE_MANAGER" = "systemd" ] && [ "$SYSTEMD_VERSION" -lt 231 ]; then
+    warn "systemd $SYSTEMD_VERSION is too old for MemoryHigh/MemoryMax; scheduler limits still apply."
+  elif [ "$HOST_SERVICE_MANAGER" != "systemd" ]; then
+    warn "Native cgroup OOM containment is unavailable under $HOST_SERVICE_MANAGER; scheduler limits still apply."
+  fi
 }
 
-render_safety_service_directives() {
+csv_from_array() { local IFS=,; printf '%s' "$*"; }
+
+render_safety_environment_directives() {
+  local ids
+  ids=$(csv_from_array "${SAFETY_DEVICE_IDS[@]}")
+  case "$SAFETY_BACKEND" in
+    cuda)
+      printf '%s\n' "Environment=\"CUDA_VISIBLE_DEVICES=$ids\"" "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
+        "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
+        "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\"" "Environment=\"OLLAMA_IGPU_ENABLE=0\""
+      ;;
+    rocm)
+      printf '%s\n' "Environment=\"ROCR_VISIBLE_DEVICES=$ids\"" \
+        "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\"" \
+        "Environment=\"OLLAMA_IGPU_ENABLE=$SAFETY_SHARED_ACCELERATOR\""
+      ;;
+    vulkan)
+      printf '%s\n' "Environment=\"CUDA_VISIBLE_DEVICES=-1\"" "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
+        "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
+        "Environment=\"GGML_VK_VISIBLE_DEVICES=$ids\"" "Environment=\"OLLAMA_VULKAN=1\"" \
+        "Environment=\"OLLAMA_IGPU_ENABLE=$SAFETY_SHARED_ACCELERATOR\""
+      ;;
+    cpu)
+      printf '%s\n' "Environment=\"CUDA_VISIBLE_DEVICES=-1\"" "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
+        "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
+        "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\"" "Environment=\"OLLAMA_IGPU_ENABLE=0\""
+      ;;
+  esac
   printf '%s\n' \
-    "Environment=\"CUDA_VISIBLE_DEVICES=${SAFETY_GPU_UUID_CSV}\"" \
-    "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
-    "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" \
-    "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
-    "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" \
-    "Environment=\"OLLAMA_VULKAN=0\"" \
-    "Environment=\"OLLAMA_IGPU_ENABLE=0\"" \
     "Environment=\"OLLAMA_MAX_LOADED_MODELS=${SAFETY_MAX_LOADED_MODELS}\"" \
     "Environment=\"OLLAMA_NUM_PARALLEL=${SAFETY_NUM_PARALLEL}\"" \
+    "Environment=\"OLLAMA_SCHED_SPREAD=0\"" \
     "Environment=\"OLLAMA_CONTEXT_LENGTH=${SAFETY_CONTEXT_LENGTH}\"" \
     "Environment=\"OLLAMA_KEEP_ALIVE=${SAFETY_KEEP_ALIVE}\"" \
     "Environment=\"OLLAMA_MAX_QUEUE=${SAFETY_MAX_QUEUE}\"" \
-    "Environment=\"OLLAMA_GPU_OVERHEAD=${SAFETY_VRAM_RESERVE_BYTES}\"" \
     "Environment=\"OLLAMA_FLASH_ATTENTION=1\"" \
-    "Environment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"" \
-    "Environment=\"LLAMA_ARG_FIT=on\"" \
-    "Environment=\"LLAMA_ARG_FIT_TARGET=${SAFETY_VRAM_RESERVE_MIB}\"" \
-    "MemoryAccounting=yes" \
-    "MemoryHigh=${SAFETY_HOST_MEMORY_HIGH_MIB}M" \
-    "MemoryMax=${SAFETY_HOST_MEMORY_MAX_MIB}M" \
-    "MemorySwapMax=${SAFETY_SWAP_MAX}" \
-    "OOMPolicy=stop" \
-    "Restart=on-failure" \
-    "RestartSec=15s"
-  local gpu_uuid
-  for gpu_uuid in "${SAFETY_GPU_UUIDS[@]}"; do
-    printf 'ExecStartPre=%s --id=%s --query-gpu=uuid,memory.total,compute_cap --format=csv,noheader,nounits\n' \
-      "$SAFETY_NVIDIA_SMI" "$gpu_uuid"
-  done
+    "Environment=\"OLLAMA_KV_CACHE_TYPE=q8_0\""
+  if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then
+    printf '%s\n' "Environment=\"OLLAMA_GPU_OVERHEAD=${SAFETY_VRAM_RESERVE_BYTES}\"" \
+      "Environment=\"LLAMA_ARG_FIT=on\"" "Environment=\"LLAMA_ARG_FIT_TARGET=${SAFETY_VRAM_RESERVE_MIB}\""
+  fi
+}
+
+render_safety_shell_exports() {
+  if [ "$SAFETY_BACKEND" = "rocm" ]; then
+    printf '%s\n' "unset CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES GPU_DEVICE_ORDINAL"
+  fi
+  local line assignment
+  while IFS= read -r line; do
+    [[ "$line" == Environment=\"*\" ]] || continue
+    assignment="${line#Environment=\"}"
+    assignment="${assignment%\"}"
+    printf 'export %q\n' "$assignment"
+  done < <(render_safety_environment_directives)
+}
+
+render_safety_service_directives() {
+  if [ "$SYSTEMD_VERSION" -ge 235 ]; then
+    printf '%s\n' "UnsetEnvironment=OLLAMA_LLM_LIBRARY"
+    if [ "$SAFETY_VRAM_RESERVE_MIB" -eq 0 ]; then
+      printf '%s\n' "UnsetEnvironment=OLLAMA_GPU_OVERHEAD LLAMA_ARG_FIT LLAMA_ARG_FIT_TARGET"
+    fi
+  fi
+  if [ "$SAFETY_BACKEND" = "rocm" ] && [ "$SYSTEMD_VERSION" -ge 235 ]; then
+    printf '%s\n' "UnsetEnvironment=CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES GPU_DEVICE_ORDINAL"
+  fi
+  render_safety_environment_directives
+  if [ "$SYSTEMD_VERSION" -ge 231 ]; then
+    printf '%s\n' "MemoryAccounting=yes" "MemoryHigh=${SAFETY_HOST_MEMORY_HIGH_MIB}M" \
+      "MemoryMax=${SAFETY_HOST_MEMORY_MAX_MIB}M"
+  fi
+  if [ "$SYSTEMD_VERSION" -ge 232 ]; then printf '%s\n' "MemorySwapMax=${SAFETY_SWAP_MAX}"; fi
+  if [ "$SYSTEMD_VERSION" -ge 243 ]; then printf '%s\n' "OOMPolicy=stop"; fi
+  printf '%s\n' "Restart=on-failure" "RestartSec=15s"
+  if [ ${#SAFETY_PREFLIGHT_DIRECTIVES[@]} -gt 0 ]; then printf '%s\n' "${SAFETY_PREFLIGHT_DIRECTIVES[@]}"; fi
 }
 
 preview_safety_profile() {
   banner
-  build_safety_profile || exit 1
+  build_safety_profile
   print_safety_profile
-  hdr "Generated late-priority systemd drop-in"
-  printf '%s\n' \
-    "# Managed by ollama-unify" \
-    "[Unit]" \
-    "StartLimitIntervalSec=5min" \
-    "StartLimitBurst=4" \
-    "" \
-    "[Service]"
-  render_safety_service_directives
+  if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
+    hdr "Generated late-priority systemd drop-in"
+    printf '%s\n' "# Managed by ollama-unify" "[Unit]" "StartLimitIntervalSec=5min" \
+      "StartLimitBurst=4" "" "[Service]"
+    render_safety_service_directives
+  else
+    hdr "Generated portable Ollama environment policy"
+    render_safety_shell_exports
+  fi
+}
+
+classify_host() {
+  banner
+  build_safety_profile
+  print_safety_profile
+}
+
+print_environment_policy() {
+  build_safety_profile
+  render_safety_shell_exports
 }
 
 # ─────────────────────────────────────────── store discovery (read-only)
 declare -a STORE_PATHS=()
+canonical_path() {
+  local path="$1"
+  if command -v realpath >/dev/null 2>&1 && realpath -m -- "$path" >/dev/null 2>&1; then
+    realpath -m -- "$path"
+    return
+  fi
+  if readlink -m -- "$path" >/dev/null 2>&1; then
+    readlink -m -- "$path"
+    return
+  fi
+  if [ -d "$path" ]; then
+    (cd "$path" 2>/dev/null && pwd -P)
+    return
+  fi
+  [[ "$path" == /* ]] || path="$PWD/$path"
+  local parent="${path%/*}" base="${path##*/}"
+  if [ -d "$parent" ]; then
+    printf '%s/%s\n' "$(cd "$parent" 2>/dev/null && pwd -P)" "$base"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 add_store() {
   local p="$1"
   [ -z "$p" ] && return
   # canonicalize without requiring existence
-  p="$(readlink -m -- "$p" 2>/dev/null || echo "$p")"
+  p="$(canonical_path "$p")"
   [ -d "$p" ] || return
   for existing in "${STORE_PATHS[@]:-}"; do [ "$existing" = "$p" ] && return; done
   STORE_PATHS+=("$p")
@@ -304,7 +727,8 @@ discover_stores() {
   if [ "$HAS_SYSTEMD" = 1 ]; then
     if systemctl cat ollama >/dev/null 2>&1; then
       local v
-      v=$(systemctl cat ollama 2>/dev/null | grep -oP 'OLLAMA_MODELS=\K[^"\s]+' | tail -1)
+      v=$(systemctl cat ollama 2>/dev/null \
+        | sed -n 's/.*OLLAMA_MODELS=\([^"[:space:]]*\).*/\1/p' | tail -1)
       add_store "$v"
     fi
   fi
@@ -312,7 +736,7 @@ discover_stores() {
   if command -v pgrep >/dev/null 2>&1; then
     while IFS= read -r path; do add_store "$path"; done < <(
       pgrep -af 'ollama runner' 2>/dev/null \
-        | grep -oP '/[^ ]+/blobs/sha256-[a-f0-9]+' \
+        | sed -n 's#.*\(/[^ ]*/blobs/sha256-[a-f0-9]*\).*#\1#p' \
         | sed 's|/blobs/.*||' | sort -u
     )
   fi
@@ -320,11 +744,14 @@ discover_stores() {
 
 count_manifests() { find "$1/manifests" -type f 2>/dev/null | wc -l; }
 count_blobs()     { find "$1/blobs"     -type f 2>/dev/null | wc -l; }
-fs_of()           { df --output=source,target "$1" 2>/dev/null | tail -1 | awk '{print $1" ("$2")"}'; }
-dev_of()          { df --output=source "$1" 2>/dev/null | tail -1 | tr -d ' '; }
-mount_of()        { df --output=target "$1" 2>/dev/null | tail -1 | tr -d ' '; }
-own_of()          { stat -c '%U:%G' "$1" 2>/dev/null || echo "?"; }
-size_of()         { du -sb "$1" 2>/dev/null | awk '{print $1}'; }
+fs_of()           { df -Pk "$1" 2>/dev/null | awk 'END {print $1" ("$NF")"}'; }
+dev_of()          { df -Pk "$1" 2>/dev/null | awk 'END {print $1}'; }
+mount_of()        { df -Pk "$1" 2>/dev/null | awk 'END {print $NF}'; }
+own_of()          { stat -c '%U:%G' "$1" 2>/dev/null || stat -f '%Su:%Sg' "$1" 2>/dev/null || echo "?"; }
+size_of() {
+  if du -sb /dev/null >/dev/null 2>&1; then du -sb "$1" 2>/dev/null | awk '{print $1}'
+  else du -sk "$1" 2>/dev/null | awk '{print $1 * 1024}'; fi
+}
 human() {
   local b="${1:-0}"; local u=(B K M G T P); local i=0
   while [ "$b" -ge 1024 ] && [ $i -lt 5 ]; do b=$(( b / 1024 )); i=$(( i + 1 )); done
@@ -364,9 +791,8 @@ print_store_table() {
 # ─────────────────────────────────────── mount-point candidates for dest
 print_dest_candidates() {
   hdr "Available mount points for unified storage:"
-  df -h --output=target,size,avail,fstype 2>/dev/null \
-    | awk 'NR==1 || ($1 ~ /^\/(home|srv|var|opt|mnt|media|data)/) || $1=="/"' \
-    | awk 'NR==1 {print "  "$0; next} !seen[$1]++ {print "  "$0}'
+  df -hP 2>/dev/null \
+    | awk 'NR==1 {print "  "$0; next} ($NF ~ /^\/(home|Users|srv|var|opt|mnt|media|data|Volumes)(\/|$)/) || $NF=="/" {if (!seen[$NF]++) print "  "$0}'
 }
 
 # ────────────────────────────────────────── transfer-strategy selection
@@ -379,9 +805,10 @@ transfer_strategy() {
   if [ "$sd" = "$dd" ]; then
     echo "mv"; return
   fi
-  # reflink test: try cp --reflink=always on a tiny file
-  local probe="$dst/.reflink_probe_$$"
-  if cp --reflink=always /dev/null "$probe" 2>/dev/null; then
+  # Reflink test when GNU cp exposes it; otherwise use rsync cross-filesystem.
+  local probe="$dst/.reflink_probe_$$" cp_help=""
+  cp_help=$(cp --help 2>&1 || true)
+  if [[ "$cp_help" == *--reflink* ]] && cp --reflink=always /dev/null "$probe" 2>/dev/null; then
     rm -f "$probe"
     echo "reflink"; return
   fi
@@ -400,12 +827,14 @@ transfer_store() {
       # mv each subdir's contents so we merge into existing dst structure
       "${elevate[@]}" mkdir -p "$dst/manifests" "$dst/blobs"
       if [ -d "$src/manifests" ]; then
-        find "$src/manifests" -mindepth 1 -maxdepth 1 -print0 \
-          | xargs -0 -r -I{} "${elevate[@]}" mv -n "{}" "$dst/manifests/"
+        while IFS= read -r -d '' item; do
+          "${elevate[@]}" mv -n "$item" "$dst/manifests/"
+        done < <(find "$src/manifests" -mindepth 1 -maxdepth 1 -print0)
       fi
       if [ -d "$src/blobs" ]; then
-        find "$src/blobs" -mindepth 1 -maxdepth 1 -print0 \
-          | xargs -0 -r -I{} "${elevate[@]}" mv -n "{}" "$dst/blobs/"
+        while IFS= read -r -d '' item; do
+          "${elevate[@]}" mv -n "$item" "$dst/blobs/"
+        done < <(find "$src/blobs" -mindepth 1 -maxdepth 1 -print0)
       fi
       ;;
     reflink)
@@ -413,12 +842,16 @@ transfer_store() {
       "${elevate[@]}" cp -a --reflink=auto -n "$src/." "$dst/"
       ;;
     rsync)
-      ok "cross-filesystem copy → using rsync (NVMe-tuned)"
-      # hardware-tuned: --whole-file (skip delta), --inplace, no compression,
-      # ignore-existing for content-addressed dedup, progress2 for ETA
-      "${elevate[@]}" rsync -aH --whole-file --inplace --no-compress \
-        --ignore-existing --info=progress2 \
-        "$src/" "$dst/"
+      ok "cross-filesystem copy → using rsync (local-copy tuned)"
+      local rsync_help
+      rsync_help=$(rsync --help 2>&1)
+      local -a rsync_args=(-a --ignore-existing)
+      [[ "$rsync_help" == *--hard-links* ]] && rsync_args+=(-H)
+      [[ "$rsync_help" == *--whole-file* ]] && rsync_args+=(--whole-file)
+      [[ "$rsync_help" == *--inplace* ]] && rsync_args+=(--inplace)
+      [[ "$rsync_help" == *--no-compress* ]] && rsync_args+=(--no-compress)
+      if [[ "$rsync_help" == *--info* ]]; then rsync_args+=(--info=progress2); else rsync_args+=(--progress); fi
+      "${elevate[@]}" rsync "${rsync_args[@]}" "$src/" "$dst/"
       ;;
   esac
 }
@@ -426,19 +859,30 @@ transfer_store() {
 # ───────────────────────────────────────────────────────────── main flow
 main() {
   case "${1:-}" in
+    --classify)
+      classify_host
+      exit 0
+      ;;
     --safety-preview)
       preview_safety_profile
       exit 0
       ;;
+    --print-env)
+      print_environment_policy
+      exit 0
+      ;;
     -h|--help)
-      say "Usage: ./ollama-unify.sh [--safety-preview]"
-      say "  --safety-preview  Detect eligible GPUs and print OOM guardrails without changing the system."
+      say "Usage: ./ollama-unify.sh [--classify|--safety-preview|--print-env]"
+      say "  --classify        Classify the host, accelerators, backend, and risk tier without changes."
+      say "  --safety-preview  Classify the host and print the generated safety policy without changes."
+      say "  --print-env       Print shell exports for the selected scheduler/backend policy."
       exit 0
       ;;
     "") ;;
     *) err "unknown argument: $1"; exit 2 ;;
   esac
 
+  require_migration_tools
   banner
   discover_stores
   detect_daemons
@@ -460,6 +904,9 @@ main() {
     say "  • ${#MANUAL_SERVE_PIDS[@]} manual 'ollama serve' processes (PIDs: ${MANUAL_SERVE_PIDS[*]})"
   fi
 
+  build_safety_profile
+  print_safety_profile
+
   local ALREADY_UNIFIED=0
   if [ ${#STORE_PATHS[@]} -eq 1 ]; then
     ok "Only one store found — your setup is already unified at: ${STORE_PATHS[0]}"
@@ -477,14 +924,14 @@ main() {
     max_free=0
     for s in "${STORE_PATHS[@]}"; do
       local free
-      free=$(df --output=avail "$s" 2>/dev/null | tail -1 | tr -d ' ')
+      free=$(df -Pk "$s" 2>/dev/null | awk 'END {print $4}')
       [ -z "$free" ] && continue
       if [ "$free" -gt "$max_free" ]; then max_free=$free; default_dst="$s"; fi
     done
 
     hdr "Destination"
     DEST=$(ask "Where to unify all models?" "$default_dst")
-    DEST="$(readlink -m -- "$DEST")"
+    DEST="$(canonical_path "$DEST")"
   fi
 
   # opt-ins
@@ -496,12 +943,9 @@ main() {
       DO_SYSTEMD_MODELS=1
     fi
 
-    if build_safety_profile; then
-      print_safety_profile
-      if confirm "Apply these dynamic GPU and OOM safety guardrails to ollama.service?" "Y"; then
-        DO_SYSTEMD=1
-        DO_SAFETY=1
-      fi
+    if confirm "Apply this classified backend and OOM safety policy to ollama.service?" "Y"; then
+      DO_SYSTEMD=1
+      DO_SAFETY=1
     fi
 
     if [ "$DO_SYSTEMD" = 1 ]; then
@@ -549,7 +993,7 @@ main() {
   done
   say "  Total to move: $(human "$total_bytes")"
   [ "$DO_SYSTEMD_MODELS" = 1 ] && say "  • Point ollama.service at the unified model store"
-  [ "$DO_SAFETY"       = 1 ] && say "  • Install dynamic GPU/VRAM/host-memory OOM guardrails"
+  [ "$DO_SAFETY"       = 1 ] && say "  • Install classified backend/device/host-memory OOM guardrails"
   [ "$DO_SERVICE_USER" = 1 ] && say "  • Change service User/Group to $USER"
   [ "$DO_SYMLINKS"     = 1 ] && say "  • Symlink originals → destination"
   [ "$DO_BASHRC"       = 1 ] && say "  • Add OLLAMA_MODELS export to $SHELL_RC"
@@ -648,7 +1092,7 @@ main() {
     local dropin_file="$dropin_dir/zz-ollama-unify.conf"
     $SUDO mkdir -p "$dropin_dir"
     {
-      printf '# Managed by ollama-unify — generated %s\n' "$(date -Is)"
+      printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
       if [ "$DO_SAFETY" = 1 ]; then
         printf '[Unit]\n'
         printf 'StartLimitIntervalSec=5min\n'
@@ -720,7 +1164,7 @@ main() {
   if [ "$HAS_CURL" = 1 ]; then
     local api_count
     api_count=$(curl -s --max-time 5 http://127.0.0.1:11434/api/tags 2>/dev/null \
-      | grep -oP '"name"\s*:\s*"[^"]+"' | wc -l || true)
+      | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l || true)
     [ -n "$api_count" ] && [ "$api_count" -gt 0 ] && ok "/api/tags reports $api_count models"
   fi
 

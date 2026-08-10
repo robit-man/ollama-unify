@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ "${MOCK_PROFILE:-}" = "metal" ] || exit 1
+if [ "${1:-}" = "-productVersion" ]; then printf '%s\n' '15.0-mock'; else printf '%s\n' 'macOS mock'; fi

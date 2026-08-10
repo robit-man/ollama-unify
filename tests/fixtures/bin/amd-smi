@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${MOCK_PROFILE:-}" != "rocm" ]; then
+  exit 1
+fi
+
+case "${1:-}" in
+  static)
+    printf '%s\n' '[
+      {
+        "gpu": 0,
+        "uuid": "GPU-mock-amd-0",
+        "asic": {"market_name": "Mock AMD 48GB"},
+        "vram": {"size": {"value": 49152, "unit": "MB"}}
+      },
+      {
+        "gpu": 1,
+        "uuid": "GPU-mock-amd-1",
+        "asic": {"market_name": "Mock AMD 48GB"},
+        "vram": {"size": {"value": 49152, "unit": "MB"}}
+      }
+    ]'
+    ;;
+  list) printf '%s\n' '2 mock AMD GPUs' ;;
+  *) exit 1 ;;
+esac

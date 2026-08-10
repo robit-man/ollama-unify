@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${MOCK_PROFILE:-}" = "metal" ]; then
+  case "${1:-}" in
+    -s) printf '%s\n' Darwin ;;
+    -m) printf '%s\n' arm64 ;;
+    *) printf '%s\n' Darwin ;;
+  esac
+else
+  /usr/bin/uname "$@"
+fi

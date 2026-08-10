@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${MOCK_PROFILE:-}" != cuda* ]]; then
+  exit 1
+fi
+
+case "$*" in
+  *--query-gpu=index,uuid,name,display_active,memory.total,compute_cap*)
+    if [ "$MOCK_PROFILE" = "cuda_display" ]; then
+      printf '%s\n' '0, GPU-display, Mock CUDA Display 12GB, Enabled, 12288, 8.6'
+    else
+      printf '%s\n' \
+        '0, GPU-dedicated, Mock CUDA 24GB, Disabled, 24576, 8.6' \
+        '1, GPU-display, Mock CUDA Display 12GB, Enabled, 12288, 8.6' \
+        '2, GPU-small, Mock CUDA 2GB, Enabled, 2048, 6.1'
+    fi
+    ;;
+  *--query-gpu=uuid,memory.total,compute_cap*)
+    printf '%s\n' 'GPU-dedicated, 24576, 8.6'
+    ;;
+  *) exit 1 ;;
+esac
