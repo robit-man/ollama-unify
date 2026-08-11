@@ -629,10 +629,12 @@ build_resource_limits() {
   SAFETY_VRAM_RESERVE_BYTES=$((SAFETY_VRAM_RESERVE_MIB * 1024 * 1024))
 
   SAFETY_GPU_PREFERRED=0
+  # Do not force every selected accelerator to participate in every load.
+  # Ollama's native scheduler can then place against live free VRAM and only
+  # split a model when the load actually requires multiple devices.
   SAFETY_SCHED_SPREAD=0
   if [[ "$SAFETY_BACKEND" =~ ^(cuda|rocm)$ ]] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
     SAFETY_GPU_PREFERRED=1
-    [ "$SAFETY_DEVICE_COUNT" -gt 1 ] && SAFETY_SCHED_SPREAD=1
   fi
 
   local default_context=8192 default_queue=64 default_models=1
@@ -744,7 +746,7 @@ print_safety_profile() {
   say "  Host limit basis: $SAFETY_HOST_LIMIT_SOURCE"
   say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
   if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then
-    say "  GPU policy: maximum safe GPU layers; spread=$SAFETY_SCHED_SPREAD; pageable/cgroup-bounded CPU overflow only"
+    say "  GPU policy: native live-VRAM placement; forced spread disabled; pageable/cgroup-bounded CPU overflow only"
     say "  GPU host paths: unified spill and pinned-host buffers disabled"
   fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
