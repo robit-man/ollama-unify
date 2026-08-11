@@ -91,12 +91,17 @@ SAFETY_MIN_DEVICE_MEMORY_MIB=0
 SAFETY_AGGREGATE_DEVICE_MEMORY_MIB=0
 SAFETY_DEVICE_MEMORY_KNOWN=0
 SAFETY_DEDICATED_VRAM_RATIO_PERCENT=0
-SAFETY_HOST_RESERVE_PERCENT=35
 SAFETY_VRAM_RESERVE_MIB=0
 SAFETY_VRAM_RESERVE_BYTES=0
 SAFETY_HOST_RESERVE_MIB=0
 SAFETY_HOST_MEMORY_HIGH_MIB=0
 SAFETY_HOST_MEMORY_MAX_MIB=0
+SAFETY_LARGEST_MODEL_MIB=0
+SAFETY_LARGEST_MODEL_SOURCE=""
+SAFETY_OBSERVED_HOST_MIB=0
+SAFETY_HOST_LIMIT_SOURCE=""
+SAFETY_GPU_STRICT=0
+SAFETY_SCHED_SPREAD=0
 SAFETY_CONTEXT_LENGTH=0
 SAFETY_NUM_PARALLEL=0
 SAFETY_MAX_LOADED_MODELS=0
@@ -466,71 +471,169 @@ select_safety_backend() {
   SAFETY_BACKEND="$requested"
 }
 
+detect_model_memory_profile() {
+  SAFETY_LARGEST_MODEL_MIB=0
+  SAFETY_LARGEST_MODEL_SOURCE=""
+  SAFETY_OBSERVED_HOST_MIB=0
+
+  if [ -n "${OLLAMA_SAFE_LARGEST_MODEL_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_LARGEST_MODEL_MIB "$OLLAMA_SAFE_LARGEST_MODEL_MIB"
+    SAFETY_LARGEST_MODEL_MIB="$OLLAMA_SAFE_LARGEST_MODEL_MIB"
+    SAFETY_LARGEST_MODEL_SOURCE="explicit override"
+  else
+    local -a roots=() candidates=()
+    local candidate existing duplicate
+    if [ -n "${OLLAMA_SAFE_MODEL_STORE:-}" ]; then
+      candidates+=("$OLLAMA_SAFE_MODEL_STORE")
+    else
+      [ -n "${OLLAMA_MODELS:-}" ] && candidates+=("$OLLAMA_MODELS")
+      candidates+=("/srv/ollama/models" "${HOME}/.ollama/models" \
+        "/usr/share/ollama/.ollama/models" "/var/lib/ollama/.ollama/models" "/root/.ollama/models")
+      candidates+=("${STORE_PATHS[@]:-}")
+
+      local configured=""
+      if [ "$HAS_SYSTEMD" = 1 ]; then
+        configured=$(systemctl show ollama.service -p Environment --value 2>/dev/null \
+          | grep -o 'OLLAMA_MODELS=[^[:space:]]*' | tail -n 1 || true)
+        [ -n "$configured" ] && candidates+=("${configured#OLLAMA_MODELS=}")
+      fi
+      for existing in /etc/default/ollama /etc/environment; do
+        [ -r "$existing" ] || continue
+        while IFS= read -r configured; do
+          configured="${configured#OLLAMA_MODELS=}"
+          configured="${configured%\"}"; configured="${configured#\"}"
+          configured="${configured%\'}"; configured="${configured#\'}"
+          [ -n "$configured" ] && candidates+=("$configured")
+        done < <(grep -E '^[[:space:]]*(export[[:space:]]+)?OLLAMA_MODELS=' "$existing" 2>/dev/null \
+          | sed -E 's/^[[:space:]]*(export[[:space:]]+)?OLLAMA_MODELS=//' || true)
+      done
+    fi
+
+    for candidate in "${candidates[@]}"; do
+      [ -d "$candidate/manifests" ] || continue
+      duplicate=0
+      for existing in "${roots[@]:-}"; do
+        [ "$candidate" = "$existing" ] && { duplicate=1; break; }
+      done
+      [ "$duplicate" = 1 ] || roots+=("$candidate")
+    done
+
+    local manifest bytes mib max_bytes=0
+    for candidate in "${roots[@]:-}"; do
+      while IFS= read -r -d '' manifest; do
+        # Sum only inference payloads in each manifest. This includes split
+        # model/projector/adapter/tensor layers while excluding templates,
+        # licenses, prompts, and other metadata.
+        bytes=$(awk 'BEGIN { RS="}" }
+          /"mediaType"[[:space:]]*:[[:space:]]*"application\/vnd\.ollama\.image\.(model|projector|adapter|tensor)"/ {
+            record=$0
+            sub(/^.*"size"[[:space:]]*:[[:space:]]*/, "", record)
+            sub(/[^0-9].*$/, "", record)
+            if (record ~ /^[0-9]+$/) sum += record
+          }
+          END { printf "%.0f", sum + 0 }' "$manifest" 2>/dev/null || printf '0')
+        [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+        if [ "$bytes" -gt "$max_bytes" ]; then
+          max_bytes="$bytes"
+          SAFETY_LARGEST_MODEL_SOURCE="$manifest"
+        fi
+      done < <(find "$candidate/manifests" -type f -print0 2>/dev/null)
+    done
+    if [ "$max_bytes" -gt 0 ]; then
+      mib=$(((max_bytes + 1048575) / 1048576))
+      SAFETY_LARGEST_MODEL_MIB="$mib"
+    fi
+  fi
+
+  if [ -n "${OLLAMA_SAFE_OBSERVED_HOST_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_OBSERVED_HOST_MIB "$OLLAMA_SAFE_OBSERVED_HOST_MIB"
+    SAFETY_OBSERVED_HOST_MIB="$OLLAMA_SAFE_OBSERVED_HOST_MIB"
+  elif command -v journalctl >/dev/null 2>&1; then
+    local observed=""
+    observed=$(journalctl -u ollama.service --no-pager --since '-30 days' --grep 'host memory' -n 512 2>/dev/null \
+      | awk '/projected to use [0-9]+ MiB of host memory/ {
+          line=$0
+          sub(/^.*projected to use /, "", line)
+          sub(/ .*/, "", line)
+          if (line + 0 > max) max=line + 0
+        }
+        END { print max + 0 }' || true)
+    [[ "$observed" =~ ^[0-9]+$ ]] && SAFETY_OBSERVED_HOST_MIB="$observed"
+  fi
+}
+
 build_resource_limits() {
-  # Keep enough RAM outside Ollama for the desktop, kernel, filesystem, and GPU
-  # driver. A large reserve matters especially when a runner pins user pages:
-  # those pages can outlive the process that caused the allocation failure.
+  # Host limits are measurements, not percentages selected for a particular
+  # machine: normal pressure begins at the largest host projection Ollama has
+  # reported, and the hard boundary is the largest installed inference payload.
   SAFETY_DEDICATED_VRAM_RATIO_PERCENT=0
-  local reserve_bonus_percent=0
   if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
     && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -gt 0 ]; then
     SAFETY_DEDICATED_VRAM_RATIO_PERCENT=$((SAFETY_AGGREGATE_DEVICE_MEMORY_MIB * 100 / SAFETY_HOST_TOTAL_MIB))
-    reserve_bonus_percent=$((SAFETY_AGGREGATE_DEVICE_MEMORY_MIB * 40 / SAFETY_HOST_TOTAL_MIB))
-    [ "$reserve_bonus_percent" -gt 40 ] && reserve_bonus_percent=40
   fi
-  SAFETY_HOST_RESERVE_PERCENT=$((35 + reserve_bonus_percent))
-  local default_host_reserve=$((SAFETY_HOST_TOTAL_MIB * SAFETY_HOST_RESERVE_PERCENT / 100))
-  local host_reserve="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$default_host_reserve}"
-  require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$host_reserve"
-  local reserve_floor
-  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then reserve_floor=1024
-  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then reserve_floor=2048
-  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 65536 ]; then reserve_floor=4096
-  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then reserve_floor=8192
-  else reserve_floor=65536; fi
-  [ "$host_reserve" -lt "$reserve_floor" ] && host_reserve="$reserve_floor"
-  local reserve_ceiling=$((SAFETY_HOST_TOTAL_MIB * 3 / 4))
-  [ "$host_reserve" -gt "$reserve_ceiling" ] && host_reserve="$reserve_ceiling"
-  SAFETY_HOST_RESERVE_MIB="$host_reserve"
-  SAFETY_HOST_RESERVE_PERCENT=$(((SAFETY_HOST_RESERVE_MIB * 100 + SAFETY_HOST_TOTAL_MIB / 2) / SAFETY_HOST_TOTAL_MIB))
-  SAFETY_HOST_MEMORY_MAX_MIB=$((SAFETY_HOST_TOTAL_MIB - host_reserve))
 
-  local throttle_band=$((SAFETY_HOST_TOTAL_MIB / 10)) throttle_floor
-  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then throttle_floor=256
-  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ]; then throttle_floor=1024
-  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then throttle_floor=4096
-  else throttle_floor=16384; fi
-  [ "$throttle_band" -lt "$throttle_floor" ] && throttle_band="$throttle_floor"
-  [ "$throttle_band" -gt $((SAFETY_HOST_MEMORY_MAX_MIB / 3)) ] && throttle_band=$((SAFETY_HOST_MEMORY_MAX_MIB / 3))
-  SAFETY_HOST_MEMORY_HIGH_MIB=$((SAFETY_HOST_MEMORY_MAX_MIB - throttle_band))
-  [ "$SAFETY_HOST_MEMORY_HIGH_MIB" -gt 0 ] || { err "host-memory limits leave no usable RAM for Ollama"; exit 2; }
+  local host_max=0 host_high=0
+  if [ -n "${OLLAMA_SAFE_HOST_RESERVE_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$OLLAMA_SAFE_HOST_RESERVE_MIB"
+    [ "$OLLAMA_SAFE_HOST_RESERVE_MIB" -lt "$SAFETY_HOST_TOTAL_MIB" ] \
+      || { err "OLLAMA_SAFE_HOST_RESERVE_MIB must be smaller than effective host memory"; exit 2; }
+    host_max=$((SAFETY_HOST_TOTAL_MIB - OLLAMA_SAFE_HOST_RESERVE_MIB))
+    host_high="$host_max"
+    SAFETY_HOST_LIMIT_SOURCE="explicit host reserve"
+  else
+    [ "$SAFETY_LARGEST_MODEL_MIB" -gt 0 ] || {
+      err "no installed Ollama inference payload was found; refusing to invent a host-memory limit"
+      err "install a model, set OLLAMA_SAFE_MODEL_STORE, or explicitly set OLLAMA_SAFE_HOST_RESERVE_MIB"
+      exit 2
+    }
+    host_max="$SAFETY_LARGEST_MODEL_MIB"
+    [ "$SAFETY_OBSERVED_HOST_MIB" -gt "$host_max" ] && host_max="$SAFETY_OBSERVED_HOST_MIB"
+    host_high="$SAFETY_OBSERVED_HOST_MIB"
+    [ "$host_high" -gt 0 ] || host_high="$host_max"
+    SAFETY_HOST_LIMIT_SOURCE="installed manifests and Ollama journal projections"
+  fi
+  if [ -n "${OLLAMA_SAFE_HOST_MEMORY_MAX_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_HOST_MEMORY_MAX_MIB "$OLLAMA_SAFE_HOST_MEMORY_MAX_MIB"
+    host_max="$OLLAMA_SAFE_HOST_MEMORY_MAX_MIB"
+    SAFETY_HOST_LIMIT_SOURCE="explicit host-memory boundary"
+  fi
+  if [ -n "${OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB:-}" ]; then
+    require_uint_value OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB "$OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB"
+    host_high="$OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB"
+  fi
+  if [ "$host_max" -le 0 ] || [ "$host_max" -ge "$SAFETY_HOST_TOTAL_MIB" ]; then
+    err "derived host-memory hard cap (${host_max} MiB) must be between 1 MiB and effective host RAM"
+    exit 2
+  fi
+  if [ "$host_high" -le 0 ] || [ "$host_high" -gt "$host_max" ]; then
+    err "host-memory throttle (${host_high} MiB) must be between 1 MiB and the hard cap"
+    exit 2
+  fi
+  SAFETY_HOST_MEMORY_MAX_MIB="$host_max"
+  SAFETY_HOST_MEMORY_HIGH_MIB="$host_high"
+  SAFETY_HOST_RESERVE_MIB=$((SAFETY_HOST_TOTAL_MIB - SAFETY_HOST_MEMORY_MAX_MIB))
 
+  # Ollama already measures live free VRAM when it schedules a load. Do not
+  # subtract a guessed percentage a second time. A fixed carve-out exists only
+  # when the operator explicitly requests one.
   SAFETY_VRAM_RESERVE_MIB=0
-  case "$SAFETY_BACKEND" in
-    cuda|rocm)
-      if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ]; then
-        local percentage=10 floor=1024 max_reserve
-        [ "$SAFETY_SHARED_ACCELERATOR" = 1 ] && percentage=20
-        if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -ge 16384 ]; then floor=2048; fi
-        if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -ge 32768 ]; then floor=4096; fi
-        SAFETY_VRAM_RESERVE_MIB=$((SAFETY_MIN_DEVICE_MEMORY_MIB * percentage / 100))
-        [ "$SAFETY_VRAM_RESERVE_MIB" -lt "$floor" ] && SAFETY_VRAM_RESERVE_MIB="$floor"
-        max_reserve=$((SAFETY_MIN_DEVICE_MEMORY_MIB - SAFETY_MIN_DEVICE_MEMORY_MIB / 2))
-        [ "$SAFETY_VRAM_RESERVE_MIB" -gt "$max_reserve" ] && SAFETY_VRAM_RESERVE_MIB="$max_reserve"
-      else SAFETY_VRAM_RESERVE_MIB=2048; fi
-      ;;
-    vulkan) SAFETY_VRAM_RESERVE_MIB=1024 ;;
-  esac
   if [ -n "${OLLAMA_SAFE_VRAM_RESERVE_MIB:-}" ] && [ "$SAFETY_BACKEND" != "cpu" ] && [ "$SAFETY_BACKEND" != "metal" ]; then
     require_uint_value OLLAMA_SAFE_VRAM_RESERVE_MIB "$OLLAMA_SAFE_VRAM_RESERVE_MIB"
     SAFETY_VRAM_RESERVE_MIB="$OLLAMA_SAFE_VRAM_RESERVE_MIB"
   fi
-  [ "$SAFETY_VRAM_RESERVE_MIB" -gt 16384 ] && SAFETY_VRAM_RESERVE_MIB=16384
   if [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ] \
     && [ "$SAFETY_VRAM_RESERVE_MIB" -gt $((SAFETY_MIN_DEVICE_MEMORY_MIB / 2)) ]; then
-    SAFETY_VRAM_RESERVE_MIB=$((SAFETY_MIN_DEVICE_MEMORY_MIB / 2))
+    err "OLLAMA_SAFE_VRAM_RESERVE_MIB cannot exceed half of the smallest selected device"
+    exit 2
   fi
   SAFETY_VRAM_RESERVE_BYTES=$((SAFETY_VRAM_RESERVE_MIB * 1024 * 1024))
+
+  SAFETY_GPU_STRICT=0
+  SAFETY_SCHED_SPREAD=0
+  if [[ "$SAFETY_BACKEND" =~ ^(cuda|rocm)$ ]] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
+    SAFETY_GPU_STRICT=1
+    [ "$SAFETY_DEVICE_COUNT" -gt 1 ] && SAFETY_SCHED_SPREAD=1
+  fi
 
   local default_context=8192 default_queue=64 default_models=1
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then default_context=2048; default_queue=8
@@ -544,7 +647,8 @@ build_resource_limits() {
   SAFETY_MAX_QUEUE="${OLLAMA_SAFE_MAX_QUEUE:-$default_queue}"
   SAFETY_KEEP_ALIVE="${OLLAMA_SAFE_KEEP_ALIVE:-5m}"
   SAFETY_MAX_LOADED_MODELS="${OLLAMA_SAFE_MAX_LOADED_MODELS:-$default_models}"
-  if [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-2G}"
+  if [ "$SAFETY_GPU_STRICT" = 1 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-0}"
+  elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-2G}"
   else SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-8G}"; fi
   SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT="${OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT:-20}"
   SAFETY_CPU_QUOTA_PERCENT="${OLLAMA_SAFE_CPU_QUOTA_PERCENT:-400}"
@@ -595,6 +699,7 @@ build_safety_profile() {
   detect_metal_devices
   detect_unconfigured_accelerators
   select_safety_backend
+  detect_model_memory_profile
   build_resource_limits
   SAFETY_READY=1
 }
@@ -621,12 +726,26 @@ print_safety_profile() {
   hdr "Selected Ollama safety policy"
   say "  Backend: $SAFETY_BACKEND ($SAFETY_BACKEND_CLASS) — $SAFETY_BACKEND_REASON"
   printf '  Device: %s\n' "${SAFETY_SELECTED_SUMMARIES[@]}"
-  if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then say "  Device-memory reserve: ${SAFETY_VRAM_RESERVE_MIB} MiB per selected accelerator"; fi
+  if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then
+    say "  Device memory: explicit ${SAFETY_VRAM_RESERVE_MIB} MiB carve-out per selected accelerator"
+  elif [ "$SAFETY_DEVICE_COUNT" -gt 0 ]; then
+    say "  Device memory: live free-VRAM telemetry; no guessed fixed carve-out"
+  fi
   if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
     say "  Aggregate dedicated device memory: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB across ${SAFETY_DEVICE_COUNT} accelerator(s); ${SAFETY_DEDICATED_VRAM_RATIO_PERCENT}% of host RAM"
   fi
-  say "  Host memory: reserve ${SAFETY_HOST_RESERVE_MIB} MiB (${SAFETY_HOST_RESERVE_PERCENT}%); throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
+  if [ "$SAFETY_LARGEST_MODEL_MIB" -gt 0 ]; then
+    say "  Model scan: largest installed inference payload ${SAFETY_LARGEST_MODEL_MIB} MiB ($SAFETY_LARGEST_MODEL_SOURCE)"
+  fi
+  if [ "$SAFETY_OBSERVED_HOST_MIB" -gt 0 ]; then
+    say "  Ollama history: largest observed host projection ${SAFETY_OBSERVED_HOST_MIB} MiB"
+  fi
+  say "  Host memory: throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB; ${SAFETY_HOST_RESERVE_MIB} MiB remains outside the cgroup"
+  say "  Host limit basis: $SAFETY_HOST_LIMIT_SOURCE"
   say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
+  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+    say "  GPU policy: all layers on dedicated accelerators; spread=$SAFETY_SCHED_SPREAD; unified spill and pinned-host buffers disabled"
+  fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     say "  Containment: memory PSI ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%; CPU quota ${SAFETY_CPU_QUOTA_PERCENT}%; restart $SAFETY_RESTART_POLICY"
   fi
@@ -668,19 +787,33 @@ render_safety_environment_directives() {
   printf '%s\n' \
     "Environment=\"OLLAMA_MAX_LOADED_MODELS=${SAFETY_MAX_LOADED_MODELS}\"" \
     "Environment=\"OLLAMA_NUM_PARALLEL=${SAFETY_NUM_PARALLEL}\"" \
-    "Environment=\"OLLAMA_SCHED_SPREAD=0\"" \
+    "Environment=\"OLLAMA_SCHED_SPREAD=${SAFETY_SCHED_SPREAD}\"" \
     "Environment=\"OLLAMA_CONTEXT_LENGTH=${SAFETY_CONTEXT_LENGTH}\"" \
     "Environment=\"OLLAMA_KEEP_ALIVE=${SAFETY_KEEP_ALIVE}\"" \
     "Environment=\"OLLAMA_MAX_QUEUE=${SAFETY_MAX_QUEUE}\"" \
     "Environment=\"OLLAMA_FLASH_ATTENTION=1\"" \
     "Environment=\"OLLAMA_KV_CACHE_TYPE=q8_0\""
   if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then
-    printf '%s\n' "Environment=\"OLLAMA_GPU_OVERHEAD=${SAFETY_VRAM_RESERVE_BYTES}\"" \
-      "Environment=\"LLAMA_ARG_FIT=on\"" "Environment=\"LLAMA_ARG_FIT_TARGET=${SAFETY_VRAM_RESERVE_MIB}\""
+    printf '%s\n' "Environment=\"OLLAMA_GPU_OVERHEAD=${SAFETY_VRAM_RESERVE_BYTES}\""
+  fi
+  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+    printf '%s\n' \
+      "Environment=\"LLAMA_ARG_N_GPU_LAYERS=all\"" \
+      "Environment=\"LLAMA_ARG_SPLIT_MODE=layer\"" \
+      "Environment=\"LLAMA_ARG_FIT=off\"" \
+      "Environment=\"GGML_CUDA_NO_PINNED=1\""
   fi
 }
 
 render_safety_shell_exports() {
+  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+    printf '%s\n' "unset GGML_CUDA_ENABLE_UNIFIED_MEMORY GGML_CUDA_REGISTER_HOST LLAMA_ARG_FIT_TARGET"
+  else
+    printf '%s\n' "unset GGML_CUDA_NO_PINNED LLAMA_ARG_N_GPU_LAYERS LLAMA_ARG_SPLIT_MODE LLAMA_ARG_FIT LLAMA_ARG_FIT_TARGET"
+  fi
+  if [ "$SAFETY_VRAM_RESERVE_MIB" -eq 0 ]; then
+    printf '%s\n' "unset OLLAMA_GPU_OVERHEAD"
+  fi
   if [ "$SAFETY_BACKEND" = "rocm" ]; then
     printf '%s\n' "unset CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES GPU_DEVICE_ORDINAL"
   fi
@@ -738,7 +871,14 @@ render_safety_service_directives() {
   if [ "$SYSTEMD_VERSION" -ge 235 ]; then
     printf '%s\n' "UnsetEnvironment=OLLAMA_LLM_LIBRARY"
     if [ "$SAFETY_VRAM_RESERVE_MIB" -eq 0 ]; then
-      printf '%s\n' "UnsetEnvironment=OLLAMA_GPU_OVERHEAD LLAMA_ARG_FIT LLAMA_ARG_FIT_TARGET"
+      printf '%s\n' "UnsetEnvironment=OLLAMA_GPU_OVERHEAD"
+    fi
+    if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+      # llama.cpp treats mere presence as true for these CUDA flags. They must
+      # be absent, not assigned the string "0".
+      printf '%s\n' "UnsetEnvironment=GGML_CUDA_ENABLE_UNIFIED_MEMORY GGML_CUDA_REGISTER_HOST LLAMA_ARG_FIT_TARGET"
+    else
+      printf '%s\n' "UnsetEnvironment=GGML_CUDA_NO_PINNED LLAMA_ARG_N_GPU_LAYERS LLAMA_ARG_SPLIT_MODE LLAMA_ARG_FIT LLAMA_ARG_FIT_TARGET"
     fi
   fi
   if [ "$SAFETY_BACKEND" = "rocm" ] && [ "$SYSTEMD_VERSION" -ge 235 ]; then

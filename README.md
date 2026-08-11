@@ -15,7 +15,7 @@ The result: `ollama list` on port 11434 shows a different set of models than `ol
 
 ## What it does
 
-`ollama-unify` first classifies the operating system, architecture, effective RAM, cgroup/container boundary, CPU, service manager, and every accelerator backend it can interrogate. It then chooses CUDA, ROCm, Vulkan, Metal, or CPU according to the capabilities actually present and derives conservative scheduler, device-memory, and host-memory limits.
+`ollama-unify` first classifies the operating system, architecture, effective RAM, cgroup/container boundary, CPU, service manager, installed model payloads, recent Ollama memory projections, and every accelerator backend it can interrogate. It then chooses CUDA, ROCm, Vulkan, Metal, or CPU according to the capabilities actually present and derives scheduler, device-memory, and host-memory limits from those measurements.
 
 The model-store workflow remains independent: it scans every place Ollama stores models, shows exactly what is where, and interactively migrates everything into one canonical location. On compatible systemd hosts, the classified policy is installed as a late-priority service drop-in. It refuses unsafe starts, gives Ollama low CPU/I/O priority, asks `systemd-oomd` to kill it under sustained memory pressure, and leaves it stopped after a failure instead of replaying a destructive request loop.
 
@@ -50,7 +50,11 @@ Accelerator classification
 
 Selected Ollama safety policy
   Backend: cuda (dedicated) — highest-confidence native NVIDIA backend
-  Device-memory reserve: 2457 MiB per selected accelerator
+  Device memory: live free-VRAM telemetry; no guessed fixed carve-out
+  Model scan: largest installed inference payload 14336 MiB (/srv/ollama/models/manifests/...)
+  Ollama history: largest observed host projection 6144 MiB
+  Host memory: throttle at 6144 MiB; hard cap at 14336 MiB; 51200 MiB remains outside the cgroup
+  GPU policy: all layers on dedicated accelerators; spread=0; unified spill and pinned-host buffers disabled
   Scheduler: 1 model, 1 parallel request, 8192-token context, queue 64
 
 Available mount points for unified storage:
@@ -93,11 +97,12 @@ Proceed? [N]: y
   - **cross-drive** → local-copy-tuned `rsync`, enabling optimization flags only when that installed rsync supports them
 - **Content-addressed dedup** — blobs are SHA-256-named, so `rsync --ignore-existing` collapses duplicates across stores for free
 - **Systemd integration** — installs a drop-in to set `OLLAMA_MODELS` and (optionally) change the service `User/Group` to your user for cleaner single-user setups
-- **Role-aware accelerator selection** — prefers dedicated devices; display/shared GPUs remain usable when they are the only safe accelerator, with a larger memory reserve
+- **Role-aware accelerator selection** — prefers dedicated devices; display/shared GPUs remain usable when they are the only eligible accelerator
 - **Generic capability floors** — classifies constrained or legacy devices from memory and compute telemetry rather than special-casing product names
 - **Backend isolation and preflight** — emits the correct visibility variables for the selected backend and validates CUDA, ROCm, or Vulkan telemetry before systemd starts Ollama
-- **Dynamic device headroom** — reserves 10% of dedicated or 20% of shared device memory, subject to size-aware floors and a 16 GiB ceiling; conservative estimates are used when a backend cannot expose memory
-- **Host OOM containment** — derives the reserve continuously from scanned host RAM and dedicated VRAM, then sets `MemoryHigh` and `MemoryMax`, limits service swap, and makes Ollama the preferred OOM victim
+- **GPU-first dedicated mode** — spreads one model across every selected dedicated CUDA/ROCm device, requests all model layers on GPU, disables runner fitting that can silently reduce GPU layers, disables CUDA/HIP pinned-host buffers, and explicitly removes the unified-memory spill switch
+- **Live device capacity** — lets Ollama schedule against current free-VRAM telemetry instead of subtracting a guessed percentage; an explicit `OLLAMA_SAFE_VRAM_RESERVE_MIB` remains available when another workload needs a fixed carve-out
+- **Measured host OOM containment** — sets `MemoryHigh` from the largest recent Ollama host-memory projection and `MemoryMax` from the larger of that projection or the largest installed inference payload; the unallocated host RAM is the result, not a target selected by the script
 - **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
 - **Proactive pressure killing** — configures `systemd-oomd` to kill Ollama at sustained memory pressure or swap exhaustion before the host becomes unusable
 - **CPU and storage protection** — caps Ollama at four logical CPU cores by default and gives its CPU and I/O cgroups low weight, keeping interactive work responsive during cold loads
@@ -215,22 +220,25 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | --- | --- |
 | Effective RAM | Physical RAM reduced to the current cgroup limit when running inside a constrained container or service |
 | Host class | `<8 GiB` constrained, `<32 GiB` personal, `<128 GiB` workstation, otherwise memory-rich server |
-| Host reserve | `35% + min(40%, 40% × summed dedicated VRAM ÷ host RAM)`. The resulting scan-derived reserve is bounded at 75%; shared or unknown-memory accelerators add no bonus |
-| Device reserve | 10% of the smallest dedicated CUDA/ROCm device or 20% for a shared device, with size-aware floors and a 16 GiB ceiling |
-| Unknown GPU memory | 2 GiB ROCm estimate or 1 GiB Vulkan estimate |
+| Installed payload | Sums inference-bearing model/projector/adapter/tensor layers per manifest and selects the largest installed manifest footprint |
+| Host throttle | Largest `projected to use … MiB of host memory` value found in the last 30 days of `ollama.service` journal history; falls back to the installed-payload boundary when no projection exists |
+| Host hard cap | Larger of the largest installed inference payload and largest observed host projection; the script fails closed instead of inventing a cap when neither a model nor an explicit operator limit exists |
+| Host remainder | Effective RAM minus the hard cap. This derived remainder is used by the startup preflight; it is not a fixed percentage or host-specific constant |
+| Device capacity | Current free VRAM as measured by Ollama at load time; no automatic fixed carve-out is subtracted a second time |
+| Dedicated multi-GPU | `OLLAMA_SCHED_SPREAD=1` when more than one dedicated CUDA/ROCm accelerator is selected; aggregate capacity is reported directly from the hardware scan |
+| Dedicated GPU load | All layers requested on GPU, layer splitting enabled, runner fitting disabled, unified-memory spill absent, pinned-host allocation disabled, and cgroup swap disabled |
 | Loaded models | 1 on every hardware shape by default; an override is required to allow simultaneous resident models |
 | Parallel requests | 1 per model |
 | Context | 2,048 below 8 GiB RAM; 4,096 below 16 GiB; 8,192 otherwise (CPU hosts below 32 GiB never exceed 4,096 by default) |
 | Request queue | 8, 16, or 64 according to effective RAM |
 | Idle retention | 5 minutes rather than indefinitely |
 | KV cache | Flash Attention plus `q8_0`, reducing cache growth compared with `f16` |
-| Host throttle | The scan-derived hard cap minus a 10%-of-host-RAM band (bounded to one third of the cap). Aggregate VRAM remains separate device telemetry |
 | Start preflight | Refuses startup below the host-memory reserve or at/above 20% full memory PSI over 10 seconds |
 | CPU and I/O | 400% CPU quota (capped to host capacity), CPU weight 10, I/O weight 10, and nice level 10 |
 | systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, `ManagedOOMMemoryPressure`, and `ManagedOOMSwap` |
 | Failure behavior | `Restart=no` by default, so an OOM, driver failure, or refused preflight requires an explicit `systemctl start ollama` after the cause is resolved |
 
-These defaults are intentionally conservative. Ollama documents that parallel processing multiplies context allocation, so 32K context × 3 parallel requests can require roughly 96K tokens of context memory per loaded model. Ollama recommends UUIDs for NVIDIA and AMD selection because numeric ordering may vary. See Ollama's [concurrency and memory guidance](https://docs.ollama.com/faq), [GPU/backend guidance](https://docs.ollama.com/gpu), and AMD's [ROCm isolation guidance](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/env_variables.html).
+These defaults are intentionally fail-closed. Ollama documents that parallel processing multiplies context allocation, so 32K context × 3 parallel requests can require roughly 96K tokens of context memory per loaded model. Ollama recommends UUIDs for NVIDIA and AMD selection because numeric ordering may vary. llama.cpp enables unified memory by the presence of `GGML_CUDA_ENABLE_UNIFIED_MEMORY`; the generated policy therefore removes it instead of assigning `0`. See Ollama's [concurrency and memory guidance](https://docs.ollama.com/faq), [GPU/backend guidance](https://docs.ollama.com/gpu), llama.cpp's [CUDA build/runtime guidance](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#unified-memory), and AMD's [ROCm isolation guidance](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/env_variables.html).
 
 The defaults can be changed for a single run:
 
@@ -244,7 +252,7 @@ OLLAMA_SAFE_BACKEND=cuda \
 ./ollama-unify.sh
 ```
 
-Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, and `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`).
+Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, and `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`).
 
 `OLLAMA_CONTEXT_LENGTH` is a server default, not an API-enforced maximum. A client can still request a larger `num_ctx`, and API `keep_alive` can override model retention. The one-model scheduler, PSI kill, hard cgroup boundary, and no-restart policy are therefore the containment layer: a pathological request can fail Ollama, but it should not be allowed to replay until it wedges the host. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated with that service manually and native cgroup containment is unavailable.
 
@@ -291,7 +299,7 @@ volumes:
 
 - **Classification is broader than service integration.** CUDA, ROCm, Vulkan, Metal, CPU, containers, WSL, macOS, and FreeBSD are classified best-effort; automatic cgroup installation currently targets `ollama.service` on systemd.
 - **Native Windows needs WSL.** The project is Bash-based and does not install a Windows service policy.
-- **ROCm and Vulkan telemetry varies by driver generation.** Missing memory telemetry is reported explicitly and uses a conservative estimate rather than pretending it is exact.
+- **ROCm and Vulkan telemetry varies by driver generation.** Missing memory telemetry is reported explicitly instead of being presented as an exact capacity.
 - **Single host only.** No remote/multi-host orchestration. For distributed Ollama deployments, run the script per host.
 - **Doesn't handle in-flight model pulls.** If `ollama pull` is mid-download when daemons stop, restart it after migration.
 - **Systemd containment only covers `ollama.service`.** Manually launched `ollama serve` processes do not inherit the cgroup limits or generated environment.
