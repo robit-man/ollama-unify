@@ -24,4 +24,20 @@ expected=$(cd "$fixture/rsync-dst" && pwd -P)
 actual=$(canonical_path "$fixture/rsync-dst")
 test "$actual" = "$expected"
 
+# Optional discovery locations must be harmless under `set -e` when absent.
+STORE_PATHS=()
+add_store "$fixture/does-not-exist"
+test ${#STORE_PATHS[@]} -eq 0
+
+SERVICE_PIDS=()
+plan_requires_sudo 1 0 "$fixture"
+plan_requires_sudo 0 1 "$fixture"
+plan_requires_sudo 0 0 /srv/ollama/models
+if plan_requires_sudo 0 0 "$fixture"; then
+  printf 'FAIL: unprivileged plan unexpectedly requires sudo\n' >&2
+  exit 1
+fi
+SERVICE_PIDS=(123)
+plan_requires_sudo 0 0 "$fixture"
+
 printf 'transfer fixtures: PASS (same-filesystem move, rsync, canonical paths)\n'

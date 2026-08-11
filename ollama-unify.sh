@@ -902,11 +902,11 @@ canonical_path() {
 
 add_store() {
   local p="$1"
-  [ -z "$p" ] && return
+  [ -n "$p" ] || return 0
   # canonicalize without requiring existence
   p="$(canonical_path "$p")"
-  [ -d "$p" ] || return
-  for existing in "${STORE_PATHS[@]:-}"; do [ "$existing" = "$p" ] && return; done
+  [ -d "$p" ] || return 0
+  for existing in "${STORE_PATHS[@]:-}"; do [ "$existing" = "$p" ] && return 0; done
   STORE_PATHS+=("$p")
 }
 
@@ -922,13 +922,13 @@ discover_stores() {
   # /etc/default/ollama
   if [ -r /etc/default/ollama ]; then
     local v
-    v=$(grep -E '^OLLAMA_MODELS=' /etc/default/ollama | tail -1 | cut -d= -f2- | tr -d '"'"'"'')
+    v=$(grep -E '^OLLAMA_MODELS=' /etc/default/ollama 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)
     add_store "$v"
   fi
   # /etc/environment
   if [ -r /etc/environment ]; then
     local v
-    v=$(grep -E '^OLLAMA_MODELS=' /etc/environment | tail -1 | cut -d= -f2- | tr -d '"'"'"'')
+    v=$(grep -E '^OLLAMA_MODELS=' /etc/environment 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true)
     add_store "$v"
   fi
   # systemd unit + drop-ins
@@ -1062,6 +1062,15 @@ transfer_store() {
       "${elevate[@]}" rsync "${rsync_args[@]}" "$src/" "$dst/"
       ;;
   esac
+}
+
+plan_requires_sudo() {
+  local do_systemd="$1" do_service_user="$2" destination="$3"
+  if [ "$do_systemd" = 1 ] || [ "$do_service_user" = 1 ] \
+    || [[ "$destination" =~ ^/(srv|var|opt|usr|etc) ]]; then
+    return 0
+  fi
+  [ ${#SERVICE_PIDS[@]} -gt 0 ] && [ -n "${SERVICE_PIDS[0]:-}" ]
 }
 
 # ───────────────────────────────────────────────────────────── main flow
@@ -1218,9 +1227,7 @@ main() {
 
   # ── sudo gate
   local SUDO=""
-  if [ "$DO_SYSTEMD" = 1 ] || [ "$DO_SERVICE_USER" = 1 ] \
-     || [[ "$DEST" =~ ^/(srv|var|opt|usr|etc) ]] \
-     || [ ${#SERVICE_PIDS[@]} -gt 0 ] && [ -n "${SERVICE_PIDS[0]:-}" ]; then
+  if plan_requires_sudo "$DO_SYSTEMD" "$DO_SERVICE_USER" "$DEST"; then
     [ "$HAS_SUDO" = 1 ] || { err "sudo required but not installed."; exit 2; }
     SUDO="sudo"
     say "${C_DIM}(sudo will prompt for your password)${C_RST}"
@@ -1364,7 +1371,13 @@ main() {
       if systemctl is-active ollama >/dev/null 2>&1; then
         ok "ollama.service is active"
       else
-        err "ollama.service stopped after launch — check 'journalctl -u ollama -n 50'"
+        local service_result
+        service_result=$(systemctl show ollama.service -p Result --value 2>/dev/null || true)
+        if [ "$service_result" = "exec-condition" ]; then
+          warn "ollama.service was safely held inactive by the memory-pressure condition"
+        else
+          err "ollama.service stopped after launch — check 'journalctl -u ollama -n 50'"
+        fi
       fi
     else
       warn "ollama.service was left stopped; the safety preflight may have refused an unsafe restart"
