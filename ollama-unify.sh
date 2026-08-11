@@ -90,7 +90,8 @@ SAFETY_SHARED_ACCELERATOR=0
 SAFETY_MIN_DEVICE_MEMORY_MIB=0
 SAFETY_AGGREGATE_DEVICE_MEMORY_MIB=0
 SAFETY_DEVICE_MEMORY_KNOWN=0
-SAFETY_ACCELERATOR_RICH_HOST=0
+SAFETY_DEDICATED_VRAM_RATIO_PERCENT=0
+SAFETY_HOST_RESERVE_PERCENT=35
 SAFETY_VRAM_RESERVE_MIB=0
 SAFETY_VRAM_RESERVE_BYTES=0
 SAFETY_HOST_RESERVE_MIB=0
@@ -469,48 +470,39 @@ build_resource_limits() {
   # Keep enough RAM outside Ollama for the desktop, kernel, filesystem, and GPU
   # driver. A large reserve matters especially when a runner pins user pages:
   # those pages can outlive the process that caused the allocation failure.
-  SAFETY_ACCELERATOR_RICH_HOST=0
+  SAFETY_DEDICATED_VRAM_RATIO_PERCENT=0
+  local reserve_bonus_percent=0
   if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
-    && [ "$SAFETY_DEVICE_COUNT" -ge 2 ] \
-    && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -ge $((SAFETY_HOST_TOTAL_MIB / 2)) ]; then
-    SAFETY_ACCELERATOR_RICH_HOST=1
+    && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -gt 0 ]; then
+    SAFETY_DEDICATED_VRAM_RATIO_PERCENT=$((SAFETY_AGGREGATE_DEVICE_MEMORY_MIB * 100 / SAFETY_HOST_TOTAL_MIB))
+    reserve_bonus_percent=$((SAFETY_AGGREGATE_DEVICE_MEMORY_MIB * 40 / SAFETY_HOST_TOTAL_MIB))
+    [ "$reserve_bonus_percent" -gt 40 ] && reserve_bonus_percent=40
   fi
-
-  local default_host_reserve=$((SAFETY_HOST_TOTAL_MIB * 35 / 100))
-  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then
-    # Large dedicated accelerator pools keep model weights and KV cache off the
-    # host. Preserve a useful OS reserve without throttling hundreds of GiB too
-    # early on machines such as multi-A100 inference servers.
-    default_host_reserve=$((SAFETY_HOST_TOTAL_MIB / 10))
-  fi
+  SAFETY_HOST_RESERVE_PERCENT=$((35 + reserve_bonus_percent))
+  local default_host_reserve=$((SAFETY_HOST_TOTAL_MIB * SAFETY_HOST_RESERVE_PERCENT / 100))
   local host_reserve="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$default_host_reserve}"
   require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$host_reserve"
   local reserve_floor
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then reserve_floor=1024
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then reserve_floor=2048
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 65536 ]; then reserve_floor=4096
-  elif [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then reserve_floor=16384
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then reserve_floor=8192
   else reserve_floor=65536; fi
   [ "$host_reserve" -lt "$reserve_floor" ] && host_reserve="$reserve_floor"
-  [ "$host_reserve" -gt $((SAFETY_HOST_TOTAL_MIB / 2)) ] && host_reserve=$((SAFETY_HOST_TOTAL_MIB / 2))
+  local reserve_ceiling=$((SAFETY_HOST_TOTAL_MIB * 3 / 4))
+  [ "$host_reserve" -gt "$reserve_ceiling" ] && host_reserve="$reserve_ceiling"
   SAFETY_HOST_RESERVE_MIB="$host_reserve"
+  SAFETY_HOST_RESERVE_PERCENT=$(((SAFETY_HOST_RESERVE_MIB * 100 + SAFETY_HOST_TOTAL_MIB / 2) / SAFETY_HOST_TOTAL_MIB))
   SAFETY_HOST_MEMORY_MAX_MIB=$((SAFETY_HOST_TOTAL_MIB - host_reserve))
 
   local throttle_band=$((SAFETY_HOST_TOTAL_MIB / 10)) throttle_floor
-  [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ] && throttle_band=$((SAFETY_HOST_TOTAL_MIB / 20))
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then throttle_floor=256
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ]; then throttle_floor=1024
-  elif [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then throttle_floor=8192
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then throttle_floor=4096
   else throttle_floor=16384; fi
   [ "$throttle_band" -lt "$throttle_floor" ] && throttle_band="$throttle_floor"
   [ "$throttle_band" -gt $((SAFETY_HOST_MEMORY_MAX_MIB / 3)) ] && throttle_band=$((SAFETY_HOST_MEMORY_MAX_MIB / 3))
   SAFETY_HOST_MEMORY_HIGH_MIB=$((SAFETY_HOST_MEMORY_MAX_MIB - throttle_band))
-  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ] \
-    && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -lt "$SAFETY_HOST_MEMORY_HIGH_MIB" ]; then
-    SAFETY_HOST_MEMORY_HIGH_MIB="$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB"
-  fi
   [ "$SAFETY_HOST_MEMORY_HIGH_MIB" -gt 0 ] || { err "host-memory limits leave no usable RAM for Ollama"; exit 2; }
 
   SAFETY_VRAM_RESERVE_MIB=0
@@ -630,10 +622,10 @@ print_safety_profile() {
   say "  Backend: $SAFETY_BACKEND ($SAFETY_BACKEND_CLASS) — $SAFETY_BACKEND_REASON"
   printf '  Device: %s\n' "${SAFETY_SELECTED_SUMMARIES[@]}"
   if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then say "  Device-memory reserve: ${SAFETY_VRAM_RESERVE_MIB} MiB per selected accelerator"; fi
-  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then
-    say "  Aggregate dedicated device memory: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB across ${SAFETY_DEVICE_COUNT} accelerators"
+  if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
+    say "  Aggregate dedicated device memory: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB across ${SAFETY_DEVICE_COUNT} accelerator(s); ${SAFETY_DEDICATED_VRAM_RATIO_PERCENT}% of host RAM"
   fi
-  say "  Host memory: reserve ${SAFETY_HOST_RESERVE_MIB} MiB; throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
+  say "  Host memory: reserve ${SAFETY_HOST_RESERVE_MIB} MiB (${SAFETY_HOST_RESERVE_PERCENT}%); throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
   say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     say "  Containment: memory PSI ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%; CPU quota ${SAFETY_CPU_QUOTA_PERCENT}%; restart $SAFETY_RESTART_POLICY"

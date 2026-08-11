@@ -33,15 +33,15 @@ assert_not_contains "$(printf '%s\n' "$cuda_output" | grep CUDA_VISIBLE_DEVICES)
 
 triple_cuda_output=$(PATH="$test_path" MOCK_PROFILE=cuda_triple OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=289468 \
   "$script" --safety-preview)
-assert_contains "$triple_cuda_output" 'Aggregate dedicated device memory: 245760 MiB across 3 accelerators'
-assert_contains "$triple_cuda_output" 'Host memory: reserve 28946 MiB; throttle at 245760 MiB; hard cap at 260522 MiB'
-assert_contains "$triple_cuda_output" 'MemoryHigh=245760M'
-assert_contains "$triple_cuda_output" 'MemoryMax=260522M'
+assert_contains "$triple_cuda_output" 'Aggregate dedicated device memory: 245760 MiB across 3 accelerator(s); 84% of host RAM'
+assert_contains "$triple_cuda_output" 'Host memory: reserve 196838 MiB (68%); throttle at 63684 MiB; hard cap at 92630 MiB'
+assert_contains "$triple_cuda_output" 'MemoryHigh=63684M'
+assert_contains "$triple_cuda_output" 'MemoryMax=92630M'
 
 mixed_cuda_output=$(PATH="$test_path" MOCK_PROFILE=cuda_mixed OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=196608 \
   "$script" --safety-preview)
-assert_contains "$mixed_cuda_output" 'Aggregate dedicated device memory: 131072 MiB across 2 accelerators'
-assert_contains "$mixed_cuda_output" 'Host memory: reserve 19660 MiB; throttle at 131072 MiB; hard cap at 176948 MiB'
+assert_contains "$mixed_cuda_output" 'Aggregate dedicated device memory: 131072 MiB across 2 accelerator(s); 66% of host RAM'
+assert_contains "$mixed_cuda_output" 'Host memory: reserve 119930 MiB (61%); throttle at 57018 MiB; hard cap at 76678 MiB'
 
 display_output=$(PATH="$test_path" MOCK_PROFILE=cuda_display OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=32768 "$script" --safety-preview)
 assert_contains "$display_output" 'Backend: cuda (shared-display)'

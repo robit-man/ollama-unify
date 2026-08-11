@@ -11,9 +11,9 @@ case "$*" in
       printf '%s\n' '0, GPU-display, Mock CUDA Display 12GB, Enabled, 12288, 8.6'
     elif [ "$MOCK_PROFILE" = "cuda_triple" ]; then
       printf '%s\n' \
-        '0, GPU-a100-0, Mock A100 80GB, Disabled, 81920, 8.0' \
-        '1, GPU-a100-1, Mock A100 80GB, Disabled, 81920, 8.0' \
-        '2, GPU-a100-2, Mock A100 80GB, Disabled, 81920, 8.0'
+        '0, GPU-large-0, Mock CUDA 80GB, Disabled, 81920, 8.0' \
+        '1, GPU-large-1, Mock CUDA 80GB, Disabled, 81920, 8.0' \
+        '2, GPU-large-2, Mock CUDA 80GB, Disabled, 81920, 8.0'
     elif [ "$MOCK_PROFILE" = "cuda_mixed" ]; then
       printf '%s\n' \
         '0, GPU-large-0, Mock CUDA 80GB, Disabled, 81920, 8.0' \
@@ -27,7 +27,7 @@ case "$*" in
     ;;
   *--query-gpu=uuid,memory.total,compute_cap*)
     if [ "$MOCK_PROFILE" = "cuda_triple" ]; then
-      printf '%s\n' 'GPU-a100, 81920, 8.0'
+      printf '%s\n' 'GPU-large, 81920, 8.0'
     elif [ "$MOCK_PROFILE" = "cuda_mixed" ]; then
       printf '%s\n' 'GPU-large, 49152, 8.0'
     else

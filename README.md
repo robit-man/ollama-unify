@@ -97,7 +97,7 @@ Proceed? [N]: y
 - **Generic capability floors** — classifies constrained or legacy devices from memory and compute telemetry rather than special-casing product names
 - **Backend isolation and preflight** — emits the correct visibility variables for the selected backend and validates CUDA, ROCm, or Vulkan telemetry before systemd starts Ollama
 - **Dynamic device headroom** — reserves 10% of dedicated or 20% of shared device memory, subject to size-aware floors and a 16 GiB ceiling; conservative estimates are used when a backend cannot expose memory
-- **Host OOM containment** — reserves 35% of effective RAM on ordinary hosts or 10% on accelerator-rich multi-GPU servers, derives `MemoryHigh` and `MemoryMax`, limits service swap, and makes Ollama the preferred OOM victim
+- **Host OOM containment** — derives the reserve continuously from scanned host RAM and dedicated VRAM, then sets `MemoryHigh` and `MemoryMax`, limits service swap, and makes Ollama the preferred OOM victim
 - **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
 - **Proactive pressure killing** — configures `systemd-oomd` to kill Ollama at sustained memory pressure or swap exhaustion before the host becomes unusable
 - **CPU and storage protection** — caps Ollama at four logical CPU cores by default and gives its CPU and I/O cgroups low weight, keeping interactive work responsive during cold loads
@@ -215,7 +215,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | --- | --- |
 | Effective RAM | Physical RAM reduced to the current cgroup limit when running inside a constrained container or service |
 | Host class | `<8 GiB` constrained, `<32 GiB` personal, `<128 GiB` workstation, otherwise memory-rich server |
-| Host reserve | Starts at 35% on ordinary hosts. When the scan finds at least two dedicated GPUs whose summed reported VRAM is at least half of host RAM, it uses 10% and a 16 GiB floor |
+| Host reserve | `35% + min(40%, 40% × summed dedicated VRAM ÷ host RAM)`. The resulting scan-derived reserve is bounded at 75%; shared or unknown-memory accelerators add no bonus |
 | Device reserve | 10% of the smallest dedicated CUDA/ROCm device or 20% for a shared device, with size-aware floors and a 16 GiB ceiling |
 | Unknown GPU memory | 2 GiB ROCm estimate or 1 GiB Vulkan estimate |
 | Loaded models | 1 on every hardware shape by default; an override is required to allow simultaneous resident models |
@@ -224,7 +224,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | Request queue | 8, 16, or 64 according to effective RAM |
 | Idle retention | 5 minutes rather than indefinitely |
 | KV cache | Flash Attention plus `q8_0`, reducing cache growth compared with `f16` |
-| Throttle target | Normally the hard cap minus a 10% band. For a scanned accelerator-rich host, the target is the lower of summed dedicated VRAM or the safe host ceiling; no GPU model, count, or host size is hardcoded |
+| Host throttle | The scan-derived hard cap minus a 10%-of-host-RAM band (bounded to one third of the cap). Aggregate VRAM remains separate device telemetry |
 | Start preflight | Refuses startup below the host-memory reserve or at/above 20% full memory PSI over 10 seconds |
 | CPU and I/O | 400% CPU quota (capped to host capacity), CPU weight 10, I/O weight 10, and nice level 10 |
 | systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, `ManagedOOMMemoryPressure`, and `ManagedOOMSwap` |
