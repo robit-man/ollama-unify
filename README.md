@@ -54,7 +54,8 @@ Selected Ollama safety policy
   Model scan: largest installed inference payload 14336 MiB (/srv/ollama/models/manifests/...)
   Ollama history: largest observed host projection 6144 MiB
   Host memory: throttle at 6144 MiB; hard cap at 14336 MiB; 51200 MiB remains outside the cgroup
-  GPU policy: all layers on dedicated accelerators; spread=0; unified spill and pinned-host buffers disabled
+  GPU policy: maximum safe GPU layers; spread=0; pageable/cgroup-bounded CPU overflow only
+  GPU host paths: unified spill and pinned-host buffers disabled
   Scheduler: 1 model, 1 parallel request, 8192-token context, queue 64
 
 Available mount points for unified storage:
@@ -100,7 +101,7 @@ Proceed? [N]: y
 - **Role-aware accelerator selection** — prefers dedicated devices; display/shared GPUs remain usable when they are the only eligible accelerator
 - **Generic capability floors** — classifies constrained or legacy devices from memory and compute telemetry rather than special-casing product names
 - **Backend isolation and preflight** — emits the correct visibility variables for the selected backend and validates CUDA, ROCm, or Vulkan telemetry before systemd starts Ollama
-- **GPU-first dedicated mode** — spreads one model across every selected dedicated CUDA/ROCm device, requests all model layers on GPU, disables runner fitting that can silently reduce GPU layers, disables CUDA/HIP pinned-host buffers, and explicitly removes the unified-memory spill switch
+- **GPU-first bounded-overflow mode** — spreads one model across every selected dedicated CUDA/ROCm device and fits the maximum safe number of layers into live free VRAM; overflow uses ordinary pageable memory inside the service cgroup, never CUDA unified-memory spill, registered host mappings, pinned-host buffers, or swap
 - **Live device capacity** — lets Ollama schedule against current free-VRAM telemetry instead of subtracting a guessed percentage; an explicit `OLLAMA_SAFE_VRAM_RESERVE_MIB` remains available when another workload needs a fixed carve-out
 - **Measured host OOM containment** — sets `MemoryHigh` from the largest recent Ollama host-memory projection and `MemoryMax` from the larger of that projection or the largest installed inference payload; the unallocated host RAM is the result, not a target selected by the script
 - **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
@@ -226,7 +227,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | Host remainder | Effective RAM minus the hard cap. This derived remainder is used by the startup preflight; it is not a fixed percentage or host-specific constant |
 | Device capacity | Current free VRAM as measured by Ollama at load time; no automatic fixed carve-out is subtracted a second time |
 | Dedicated multi-GPU | `OLLAMA_SCHED_SPREAD=1` when more than one dedicated CUDA/ROCm accelerator is selected; aggregate capacity is reported directly from the hardware scan |
-| Dedicated GPU load | All layers requested on GPU, layer splitting enabled, runner fitting disabled, unified-memory spill absent, pinned-host allocation disabled, and cgroup swap disabled |
+| Dedicated GPU load | Automatic maximum GPU layers, layer splitting and runner fitting enabled, unified-memory spill absent, pinned-host allocation disabled, cgroup-bounded pageable CPU overflow allowed, and cgroup swap disabled |
 | Loaded models | 1 on every hardware shape by default; an override is required to allow simultaneous resident models |
 | Parallel requests | 1 per model |
 | Context | 2,048 below 8 GiB RAM; 4,096 below 16 GiB; 8,192 otherwise (CPU hosts below 32 GiB never exceed 4,096 by default) |

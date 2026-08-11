@@ -100,7 +100,7 @@ SAFETY_LARGEST_MODEL_MIB=0
 SAFETY_LARGEST_MODEL_SOURCE=""
 SAFETY_OBSERVED_HOST_MIB=0
 SAFETY_HOST_LIMIT_SOURCE=""
-SAFETY_GPU_STRICT=0
+SAFETY_GPU_PREFERRED=0
 SAFETY_SCHED_SPREAD=0
 SAFETY_CONTEXT_LENGTH=0
 SAFETY_NUM_PARALLEL=0
@@ -628,10 +628,10 @@ build_resource_limits() {
   fi
   SAFETY_VRAM_RESERVE_BYTES=$((SAFETY_VRAM_RESERVE_MIB * 1024 * 1024))
 
-  SAFETY_GPU_STRICT=0
+  SAFETY_GPU_PREFERRED=0
   SAFETY_SCHED_SPREAD=0
   if [[ "$SAFETY_BACKEND" =~ ^(cuda|rocm)$ ]] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
-    SAFETY_GPU_STRICT=1
+    SAFETY_GPU_PREFERRED=1
     [ "$SAFETY_DEVICE_COUNT" -gt 1 ] && SAFETY_SCHED_SPREAD=1
   fi
 
@@ -647,7 +647,7 @@ build_resource_limits() {
   SAFETY_MAX_QUEUE="${OLLAMA_SAFE_MAX_QUEUE:-$default_queue}"
   SAFETY_KEEP_ALIVE="${OLLAMA_SAFE_KEEP_ALIVE:-5m}"
   SAFETY_MAX_LOADED_MODELS="${OLLAMA_SAFE_MAX_LOADED_MODELS:-$default_models}"
-  if [ "$SAFETY_GPU_STRICT" = 1 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-0}"
+  if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-0}"
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-2G}"
   else SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-8G}"; fi
   SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT="${OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT:-20}"
@@ -743,8 +743,9 @@ print_safety_profile() {
   say "  Host memory: throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB; ${SAFETY_HOST_RESERVE_MIB} MiB remains outside the cgroup"
   say "  Host limit basis: $SAFETY_HOST_LIMIT_SOURCE"
   say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
-  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
-    say "  GPU policy: all layers on dedicated accelerators; spread=$SAFETY_SCHED_SPREAD; unified spill and pinned-host buffers disabled"
+  if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then
+    say "  GPU policy: maximum safe GPU layers; spread=$SAFETY_SCHED_SPREAD; pageable/cgroup-bounded CPU overflow only"
+    say "  GPU host paths: unified spill and pinned-host buffers disabled"
   fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     say "  Containment: memory PSI ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%; CPU quota ${SAFETY_CPU_QUOTA_PERCENT}%; restart $SAFETY_RESTART_POLICY"
@@ -796,17 +797,17 @@ render_safety_environment_directives() {
   if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then
     printf '%s\n' "Environment=\"OLLAMA_GPU_OVERHEAD=${SAFETY_VRAM_RESERVE_BYTES}\""
   fi
-  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+  if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then
     printf '%s\n' \
-      "Environment=\"LLAMA_ARG_N_GPU_LAYERS=all\"" \
+      "Environment=\"LLAMA_ARG_N_GPU_LAYERS=auto\"" \
       "Environment=\"LLAMA_ARG_SPLIT_MODE=layer\"" \
-      "Environment=\"LLAMA_ARG_FIT=off\"" \
+      "Environment=\"LLAMA_ARG_FIT=on\"" \
       "Environment=\"GGML_CUDA_NO_PINNED=1\""
   fi
 }
 
 render_safety_shell_exports() {
-  if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+  if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then
     printf '%s\n' "unset GGML_CUDA_ENABLE_UNIFIED_MEMORY GGML_CUDA_REGISTER_HOST LLAMA_ARG_FIT_TARGET"
   else
     printf '%s\n' "unset GGML_CUDA_NO_PINNED LLAMA_ARG_N_GPU_LAYERS LLAMA_ARG_SPLIT_MODE LLAMA_ARG_FIT LLAMA_ARG_FIT_TARGET"
@@ -873,7 +874,7 @@ render_safety_service_directives() {
     if [ "$SAFETY_VRAM_RESERVE_MIB" -eq 0 ]; then
       printf '%s\n' "UnsetEnvironment=OLLAMA_GPU_OVERHEAD"
     fi
-    if [ "$SAFETY_GPU_STRICT" = 1 ]; then
+    if [ "$SAFETY_GPU_PREFERRED" = 1 ]; then
       # llama.cpp treats mere presence as true for these CUDA flags. They must
       # be absent, not assigned the string "0".
       printf '%s\n' "UnsetEnvironment=GGML_CUDA_ENABLE_UNIFIED_MEMORY GGML_CUDA_REGISTER_HOST LLAMA_ARG_FIT_TARGET"

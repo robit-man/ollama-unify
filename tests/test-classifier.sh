@@ -47,9 +47,9 @@ assert_contains "$triple_cuda_output" 'MemoryHigh=50434M'
 assert_contains "$triple_cuda_output" 'MemoryMax=106217M'
 assert_contains "$triple_cuda_output" 'MemorySwapMax=0'
 assert_contains "$triple_cuda_output" 'OLLAMA_SCHED_SPREAD=1'
-assert_contains "$triple_cuda_output" 'LLAMA_ARG_N_GPU_LAYERS=all'
+assert_contains "$triple_cuda_output" 'LLAMA_ARG_N_GPU_LAYERS=auto'
 assert_contains "$triple_cuda_output" 'LLAMA_ARG_SPLIT_MODE=layer'
-assert_contains "$triple_cuda_output" 'LLAMA_ARG_FIT=off'
+assert_contains "$triple_cuda_output" 'LLAMA_ARG_FIT=on'
 assert_contains "$triple_cuda_output" 'GGML_CUDA_NO_PINNED=1'
 assert_contains "$triple_cuda_output" 'UnsetEnvironment=GGML_CUDA_ENABLE_UNIFIED_MEMORY GGML_CUDA_REGISTER_HOST LLAMA_ARG_FIT_TARGET'
 assert_not_contains "$triple_cuda_output" 'Environment="GGML_CUDA_ENABLE_UNIFIED_MEMORY='
@@ -65,7 +65,7 @@ display_output=$(PATH="$test_path" MOCK_PROFILE=cuda_display OLLAMA_SAFE_EFFECTI
 assert_contains "$display_output" 'Backend: cuda (shared-display)'
 assert_contains "$display_output" 'CUDA_VISIBLE_DEVICES=GPU-display'
 assert_contains "$display_output" 'Device memory: live free-VRAM telemetry; no guessed fixed carve-out'
-assert_not_contains "$display_output" 'LLAMA_ARG_N_GPU_LAYERS=all'
+assert_not_contains "$display_output" 'LLAMA_ARG_N_GPU_LAYERS=auto'
 
 rocm_output=$(PATH="$test_path" MOCK_PROFILE=rocm OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=131072 "$script" --safety-preview)
 assert_contains "$rocm_output" '[rocm/discrete] GPU 0: Mock AMD 48GB'
@@ -74,7 +74,7 @@ assert_contains "$rocm_output" 'ROCR_VISIBLE_DEVICES=GPU-mock-amd-0'
 rocm_env=$(PATH="$test_path" MOCK_PROFILE=rocm OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=131072 "$script" --print-env)
 assert_contains "$rocm_env" 'unset CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES GPU_DEVICE_ORDINAL'
 assert_contains "$rocm_env" 'export ROCR_VISIBLE_DEVICES=GPU-mock-amd-0\,GPU-mock-amd-1'
-assert_contains "$rocm_env" 'export LLAMA_ARG_N_GPU_LAYERS=all'
+assert_contains "$rocm_env" 'export LLAMA_ARG_N_GPU_LAYERS=auto'
 
 vulkan_output=$(PATH="$test_path" MOCK_PROFILE=vulkan OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=16384 "$script" --safety-preview)
 assert_contains "$vulkan_output" '[vulkan/shared] GPU 0: Mock Integrated Vulkan GPU'
