@@ -107,6 +107,16 @@ def proxy_generate(port, context=262144):
     assert response.status == 200, response.status
 
 
+def well_known(port):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn.request("GET", "/.well-known/ollama-unify-gpu-negotiator")
+    response = conn.getresponse()
+    payload = json.loads(response.read())
+    conn.close()
+    assert response.status == 200, response.status
+    return payload
+
+
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
@@ -125,6 +135,8 @@ def main():
                 "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{backend.server_port}",
                 "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{proxy_port}",
                 "OLLAMA_UNIFY_SOCKET": socket_path,
+                "OLLAMA_UNIFY_BACKEND_TYPE": "cuda",
+                "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
                 "OLLAMA_UNIFY_MAX_CONTEXT": "8192",
                 "OLLAMA_UNIFY_DRAIN_TIMEOUT": "3",
                 "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
@@ -134,6 +146,22 @@ def main():
                 "OLLAMA_UNIFY_ANON_MAX_DRAIN": "0.5",
             }
         )
+        discovery = subprocess.run(
+            [helper, "discover"], env=env, check=True, capture_output=True, text=True
+        )
+        discovery = json.loads(discovery.stdout)
+        assert discovery["schema"] == "io.ollama-unify.gpu-negotiator.discovery.v1"
+        assert discovery["selected_gpu_count"] == 3
+        assert discovery["commands"]["discover"] == "docker gpu discover"
+        instructions = subprocess.run(
+            [helper, "agent-instructions"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "docker gpu discover" in instructions
+        assert "physical GPUs" in instructions
         daemon = subprocess.Popen(
             [helper, "serve"],
             env=env,
@@ -190,6 +218,8 @@ def main():
             assert pending_status["leases"][0]["state"] == "pending"
             with backend.lock:
                 assert backend.models == []
+            pending_discovery = well_known(proxy_port)
+            assert pending_discovery["selected_gpu_count"] == 3
 
             blocked_error = []
             blocked = threading.Thread(

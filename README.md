@@ -104,6 +104,7 @@ Proceed? [N]: y
 - **GPU-first bounded-overflow mode** — delegates placement to Ollama's live-VRAM scheduler and fits the maximum safe number of layers into available VRAM without forcing every selected device into every load; overflow uses ordinary pageable memory inside the service cgroup, never CUDA unified-memory spill, registered host mappings, pinned-host buffers, or swap
 - **Live device capacity** — lets Ollama schedule against current free-VRAM telemetry instead of subtracting a guessed percentage; an explicit `OLLAMA_SAFE_VRAM_RESERVE_MIB` remains available when another workload needs a fixed carve-out
 - **Dynamic external-GPU negotiation** — installs a streaming API proxy and local lease broker; cooperative workloads load first, after which Ollama automatically refits into the remaining VRAM and moves the unmatched layers to cgroup-bounded pageable RAM
+- **Agent and Docker auto-discovery** — registers `docker gpu` as a Docker CLI plugin, publishes a machine-readable discovery manifest and well-known HTTP endpoint, and adds an idempotent managed CUDA policy to the invoking user's existing global Codex instructions
 - **Reactive anonymous-process yielding** — detects changes in non-Ollama CUDA process identities, drains Ollama, waits for foreign usage to settle, and reopens it for a fresh live-VRAM fit; this is best-effort because an undeclared process can fail its first allocation before userspace observes it
 - **Measured host OOM containment** — sets `MemoryHigh` from the largest recent Ollama host-memory projection and `MemoryMax` from the larger of that projection or the largest installed inference payload; the unallocated host RAM is the result, not a target selected by the script
 - **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
@@ -153,10 +154,18 @@ On a dedicated CUDA/ROCm systemd host, that command also installs and boot-enabl
 
 ### Dynamic GPU leases
 
+Deployment agents can discover the broker without knowing this repository:
+
+```bash
+docker --help                  # lists: gpu*  Negotiate CUDA VRAM with Ollama
+docker gpu discover           # machine-readable host policy and selected GPUs
+docker gpu status             # live leases, models, VRAM, and cgroup RAM
+```
+
 For a long-running Docker ASR/TTS stack, launch it through the broker and use a readiness check that succeeds only after its CUDA models are resident:
 
 ```bash
-ollama-unify-gpu-lease run \
+docker gpu run \
   --owner asr-tts \
   --vram-mib 8192 \
   --ready-command 'curl -fsS http://127.0.0.1:8080/health/ready' \
@@ -167,13 +176,15 @@ The declared MiB value is an admission sanity check and audit field, not a VRAM 
 
 For workloads managed by another supervisor, use the explicit lifecycle:
 
-1. `token=$(ollama-unify-gpu-lease acquire --owner <name> --token-only)` — queues new Ollama traffic, drains active requests, and unloads resident models.
+1. `token=$(docker gpu acquire --owner <name> --token-only)` — queues new Ollama traffic, drains active requests, and unloads resident models.
 2. Start the external workload and wait until its CUDA models are fully loaded.
-3. `ollama-unify-gpu-lease ready <token>` — reopens Ollama; its next load uses `num_gpu=-1` and fits around current external allocation.
+3. `docker gpu ready <token>` — reopens Ollama; its next load uses `num_gpu=-1` and fits around current external allocation.
 4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
 
-Use `ollama-unify-gpu-lease status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
+Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
+
+The same discovery document is installed at `/usr/local/share/ollama-unify/gpu-negotiator.json` and served at `/.well-known/ollama-unify-gpu-negotiator` on the public Ollama address. Human-readable cross-agent instructions are installed at `/usr/local/share/ollama-unify/AGENTS.md`. If the invoking account already has `~/.codex`, the installer maintains a marked block in `~/.codex/AGENTS.md`; set `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY=0` to opt out without disabling Docker or machine-readable discovery.
 
 Print shell-compatible exports for a manual server or a non-systemd supervisor:
 
@@ -283,7 +294,7 @@ OLLAMA_SAFE_BACKEND=cuda \
 ./ollama-unify.sh
 ```
 
-Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, and `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`.
+Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`, and `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY` (`0` or `1`).
 
 `OLLAMA_CONTEXT_LENGTH` is normally only a server default. When the negotiator proxy is installed, native Ollama API requests are clamped to the context ceiling derived by the hardware scan, and positive `num_gpu`/`main_gpu` overrides are replaced with automatic live fitting. Clients that bypass the proxy and contact the loopback backend directly can bypass those request-level checks; the one-model scheduler, PSI kill, hard cgroup boundary, and no-restart policy remain the final containment layer. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated manually and native cgroup containment is unavailable.
 

@@ -121,6 +121,11 @@ SAFETY_NEGOTIATOR_CONFIG_PATH="/etc/default/ollama-unify-negotiator"
 SAFETY_NEGOTIATOR_UNIT_PATH="/etc/systemd/system/ollama-unify-negotiator.service"
 SAFETY_NEGOTIATOR_SOCKET="/run/ollama-unify/gpu-negotiator.sock"
 SAFETY_OLLAMA_BACKEND="127.0.0.1:11435"
+SAFETY_DOCKER_PLUGIN_PATH="/usr/local/lib/docker/cli-plugins/docker-gpu"
+SAFETY_LEGACY_DOCKER_PLUGIN_PATH="/usr/local/lib/docker/cli-plugins/docker-gpu-lease"
+SAFETY_DISCOVERY_DIR="/usr/local/share/ollama-unify"
+SAFETY_DISCOVERY_PATH="/usr/local/share/ollama-unify/gpu-negotiator.json"
+SAFETY_AGENT_INSTRUCTIONS_PATH="/usr/local/share/ollama-unify/AGENTS.md"
 
 CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_TOTAL_VRAM_MIB=0; CUDA_SHARED=0
 ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_TOTAL_VRAM_MIB=0; ROCM_KNOWN_VRAM_COUNT=0; ROCM_SHARED=0
@@ -927,6 +932,26 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def load_environment_file(path: str) -> None:
+    """Load the installer's simple quoted KEY=VALUE file for standalone CLI calls."""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key.startswith("OLLAMA_UNIFY_") or not key.replace("_", "").isalnum():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def split_address(value: str) -> tuple[str, int]:
     value = value.removeprefix("http://").removeprefix("https://").rstrip("/")
     if value.startswith("[") and "]:" in value:
@@ -938,6 +963,9 @@ def split_address(value: str) -> tuple[str, int]:
     return host, int(port)
 
 
+load_environment_file(os.environ.get(
+    "OLLAMA_UNIFY_CONFIG", "/etc/default/ollama-unify-negotiator"
+))
 BACKEND_HOST, BACKEND_PORT = split_address(os.environ.get("OLLAMA_UNIFY_BACKEND", "127.0.0.1:11435"))
 LISTEN_HOST, LISTEN_PORT = split_address(os.environ.get("OLLAMA_UNIFY_LISTEN", "127.0.0.1:11434"))
 CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-negotiator.sock")
@@ -948,6 +976,8 @@ MAX_CONTEXT = env_int("OLLAMA_UNIFY_MAX_CONTEXT", 0)
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
 ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
 ANON_MAX_DRAIN = env_float("OLLAMA_UNIFY_ANON_MAX_DRAIN", 15.0)
+BACKEND_TYPE = os.environ.get("OLLAMA_UNIFY_BACKEND_TYPE", "unknown")
+SELECTED_GPUS = [value for value in os.environ.get("OLLAMA_UNIFY_SELECTED_GPUS", "").split(",") if value]
 LOG = logging.getLogger("ollama-unify-negotiator")
 
 HOP_HEADERS = {
@@ -1114,6 +1144,52 @@ def host_memory_snapshot() -> dict[str, int | str]:
     except (FileNotFoundError, OSError, subprocess.SubprocessError, ValueError):
         pass
     return result
+
+
+def discovery_document() -> dict[str, Any]:
+    devices = gpu_snapshot()
+    selected = set(SELECTED_GPUS)
+    for device in devices:
+        device["selected_for_ollama"] = not selected or device.get("uuid") in selected
+    return {
+        "schema": "io.ollama-unify.gpu-negotiator.discovery.v1",
+        "protocol": "ollama-unify-gpu-lease/v1",
+        "available": True,
+        "backend": BACKEND_TYPE,
+        "selected_gpu_ids": SELECTED_GPUS,
+        "selected_gpu_count": len(SELECTED_GPUS),
+        "gpus": devices,
+        "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
+        "ollama_backend": f"http://{BACKEND_HOST}:{BACKEND_PORT}",
+        "control_socket": CONTROL_SOCKET,
+        "discovery_file": "/usr/local/share/ollama-unify/gpu-negotiator.json",
+        "agent_instructions": "/usr/local/share/ollama-unify/AGENTS.md",
+        "well_known": f"http://127.0.0.1:{LISTEN_PORT}/.well-known/ollama-unify-gpu-negotiator",
+        "commands": {
+            "discover": "docker gpu discover",
+            "status": "docker gpu status",
+            "cooperative_run": (
+                "docker gpu run --owner NAME --vram-mib MIB "
+                "--ready-command 'READINESS_CHECK' -- COMMAND"
+            ),
+            "manual": ["acquire", "ready", "prepare", "release", "heartbeat"],
+        },
+        "requirements": {
+            "cuda_deployments": (
+                "Acquire a lease before loading CUDA models; signal ready only after GPU allocation is resident."
+            ),
+            "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
+            "release": "Free external CUDA allocations before releasing the lease.",
+            "num_gpu_semantics": (
+                "Ollama num_gpu is the number of GPU-offloaded layers, not the physical GPU count; -1 is automatic."
+            ),
+            "anonymous_cuda": "Reactive best-effort only; cooperative leases are required for OOM prevention.",
+        },
+    }
+
+
+def agent_instructions_text() -> str:
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --ready-command 'CHECK' -- COMMAND`. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use `acquire`, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n5. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`); every selected GPU remains available to the scheduler.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def wait_for_foreign_settle() -> None:
@@ -1342,6 +1418,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     broker: Broker
 
     def _handle(self) -> None:
+        if self.command == "GET" and self.path.split("?", 1)[0] == "/.well-known/ollama-unify-gpu-negotiator":
+            body = json.dumps(discovery_document(), indent=2, sort_keys=True).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
             self.broker.proxy_enter()
         except TimeoutError as exc:
@@ -1566,6 +1651,10 @@ def self_test() -> int:
     assert clamped["options"]["num_ctx"] == 8192
     assert split_address("0.0.0.0") == ("0.0.0.0", 11434)
     assert split_address("127.0.0.1:11435") == ("127.0.0.1", 11435)
+    document = discovery_document()
+    assert document["schema"] == "io.ollama-unify.gpu-negotiator.discovery.v1"
+    assert document["commands"]["discover"] == "docker gpu discover"
+    assert "num_gpu" in agent_instructions_text()
     print("negotiator self-test: PASS")
     return 0
 
@@ -1576,6 +1665,8 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("status")
     sub.add_parser("self-test")
+    sub.add_parser("discover")
+    sub.add_parser("agent-instructions")
     acquire = sub.add_parser("acquire")
     acquire.add_argument("--owner", default="")
     acquire.add_argument("--vram-mib", type=int, default=0)
@@ -1597,6 +1688,12 @@ def main() -> int:
         return serve()
     if args.command_name == "self-test":
         return self_test()
+    if args.command_name == "discover":
+        print(json.dumps(discovery_document(), indent=2, sort_keys=True))
+        return 0
+    if args.command_name == "agent-instructions":
+        print(agent_instructions_text(), end="")
+        return 0
     if args.command_name == "status":
         result = send_control({"action": "status"})
     elif args.command_name == "acquire":
@@ -1636,6 +1733,45 @@ exec /usr/local/libexec/ollama-unify-gpu-negotiator "$@"
 LEASE_CLI
 }
 
+render_docker_gpu_lease_plugin() {
+  cat <<'DOCKER_PLUGIN'
+#!/bin/sh
+# Generated by ollama-unify. Docker CLI plugin entrypoint.
+if [ "${1:-}" = "docker-cli-plugin-metadata" ]; then
+  printf '%s\n' '{"SchemaVersion":"0.1.0","Vendor":"ollama-unify","Version":"1.0.0","ShortDescription":"Negotiate CUDA VRAM with Ollama","URL":"https://github.com/robit-man/ollama-unify"}'
+  exit 0
+fi
+if [ "${1:-}" = "gpu" ]; then shift; fi
+exec "${OLLAMA_UNIFY_GPU_LEASE_CLI:-/usr/local/bin/ollama-unify-gpu-lease}" "$@"
+DOCKER_PLUGIN
+}
+
+render_gpu_agent_instructions() {
+  cat <<'AGENT_INSTRUCTIONS'
+# Host CUDA negotiation
+
+This host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:
+
+1. Run `docker gpu discover` and inspect the selected GPUs and current policy.
+2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --ready-command 'CHECK' -- COMMAND`. The readiness check must pass only after CUDA models are resident.
+3. For an independently supervised service, use `acquire`, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
+4. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
+5. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`); every selected GPU remains available to the scheduler.
+
+Machine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.
+AGENT_INSTRUCTIONS
+}
+
+render_global_codex_gpu_block() {
+  cat <<'CODEX_BLOCK'
+<!-- BEGIN ollama-unify GPU negotiator -->
+## CUDA deployment policy
+
+Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover`. Use `docker gpu run` for foreground deployments or the acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must allocate first so Ollama can refit from remaining live VRAM. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
+<!-- END ollama-unify GPU negotiator -->
+CODEX_BLOCK
+}
+
 detect_ollama_proxy_listen() {
   local listen="${OLLAMA_SAFE_NEGOTIATOR_LISTEN:-}" effective_env
   if [ -z "$listen" ] && [ -r "$SAFETY_NEGOTIATOR_CONFIG_PATH" ]; then
@@ -1666,6 +1802,7 @@ install_gpu_negotiator() {
     || { err "python3 is required for the streaming GPU negotiator"; exit 2; }
 
   local proxy_listen service_user service_group access_group unit_dir config_dir helper_dir cli_dir
+  local plugin_dir selected_ids
   local drain_timeout unload_timeout lease_ttl anon_poll anon_settle anon_max_drain
   proxy_listen=$(detect_ollama_proxy_listen)
   service_user=$(systemctl show ollama.service -p User --value 2>/dev/null || true)
@@ -1704,15 +1841,28 @@ install_gpu_negotiator() {
   config_dir="${SAFETY_NEGOTIATOR_CONFIG_PATH%/*}"
   helper_dir="${SAFETY_NEGOTIATOR_PATH%/*}"
   cli_dir="${SAFETY_NEGOTIATOR_CLI_PATH%/*}"
-  "${elevate[@]}" mkdir -p "$unit_dir" "$config_dir" "$helper_dir" "$cli_dir"
+  plugin_dir="${SAFETY_DOCKER_PLUGIN_PATH%/*}"
+  selected_ids=$(csv_from_array "${SAFETY_DEVICE_IDS[@]}")
+  "${elevate[@]}" mkdir -p "$unit_dir" "$config_dir" "$helper_dir" "$cli_dir" \
+    "$plugin_dir" "$SAFETY_DISCOVERY_DIR"
 
   render_gpu_negotiator_script | "${elevate[@]}" tee "$SAFETY_NEGOTIATOR_PATH" >/dev/null
   render_gpu_negotiator_cli | "${elevate[@]}" tee "$SAFETY_NEGOTIATOR_CLI_PATH" >/dev/null
-  "${elevate[@]}" chmod 0755 "$SAFETY_NEGOTIATOR_PATH" "$SAFETY_NEGOTIATOR_CLI_PATH"
+  render_docker_gpu_lease_plugin | "${elevate[@]}" tee "$SAFETY_DOCKER_PLUGIN_PATH" >/dev/null
+  if "${elevate[@]}" test -f "$SAFETY_LEGACY_DOCKER_PLUGIN_PATH" \
+    && "${elevate[@]}" grep -q '^# Generated by ollama-unify' "$SAFETY_LEGACY_DOCKER_PLUGIN_PATH"; then
+    "${elevate[@]}" rm -f "$SAFETY_LEGACY_DOCKER_PLUGIN_PATH"
+  fi
+  render_gpu_agent_instructions | "${elevate[@]}" tee "$SAFETY_AGENT_INSTRUCTIONS_PATH" >/dev/null
+  "${elevate[@]}" chmod 0755 "$SAFETY_NEGOTIATOR_PATH" "$SAFETY_NEGOTIATOR_CLI_PATH" \
+    "$SAFETY_DOCKER_PLUGIN_PATH"
+  "${elevate[@]}" chmod 0644 "$SAFETY_AGENT_INSTRUCTIONS_PATH"
 
   {
     printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'OLLAMA_UNIFY_BACKEND="%s"\n' "$SAFETY_OLLAMA_BACKEND"
+    printf 'OLLAMA_UNIFY_BACKEND_TYPE="%s"\n' "$SAFETY_BACKEND"
+    printf 'OLLAMA_UNIFY_SELECTED_GPUS="%s"\n' "$selected_ids"
     printf 'OLLAMA_UNIFY_LISTEN="%s"\n' "$proxy_listen"
     printf 'OLLAMA_UNIFY_SOCKET="%s"\n' "$SAFETY_NEGOTIATOR_SOCKET"
     printf 'OLLAMA_UNIFY_MAX_CONTEXT="%s"\n' "$SAFETY_CONTEXT_LENGTH"
@@ -1724,6 +1874,9 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_ANON_MAX_DRAIN="%s"\n' "$anon_max_drain"
   } | "${elevate[@]}" tee "$SAFETY_NEGOTIATOR_CONFIG_PATH" >/dev/null
   "${elevate[@]}" chmod 0644 "$SAFETY_NEGOTIATOR_CONFIG_PATH"
+  "${elevate[@]}" "$SAFETY_NEGOTIATOR_PATH" discover \
+    | "${elevate[@]}" tee "$SAFETY_DISCOVERY_PATH" >/dev/null
+  "${elevate[@]}" chmod 0644 "$SAFETY_DISCOVERY_PATH"
 
   {
     printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
@@ -1766,7 +1919,48 @@ UNIT
   "${elevate[@]}" "$SAFETY_NEGOTIATOR_PATH" self-test >/dev/null
   ok "dynamic GPU negotiator installed: $SAFETY_NEGOTIATOR_PATH"
   ok "GPU lease client installed: $SAFETY_NEGOTIATOR_CLI_PATH"
+  ok "Docker discovery plugin installed: $SAFETY_DOCKER_PLUGIN_PATH"
+  ok "agent discovery manifest installed: $SAFETY_DISCOVERY_PATH"
   say "  Ollama backend: $SAFETY_OLLAMA_BACKEND; negotiated API: $proxy_listen"
+}
+
+install_global_codex_gpu_instructions() {
+  local sudo_pfx="$1" enabled="${OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY:-1}"
+  [ "$enabled" = 1 ] || { [ "$enabled" = 0 ] && return; err "OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY must be 0 or 1"; exit 2; }
+
+  local agent_user agent_group agent_home agent_dir agent_file temp_file
+  agent_user="${SUDO_USER:-${USER:-}}"
+  [ -n "$agent_user" ] || return
+  agent_home=$(getent passwd "$agent_user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
+  [ -n "$agent_home" ] || return
+  agent_dir="$agent_home/.codex"
+  [ -d "$agent_dir" ] || return
+  agent_file="$agent_dir/AGENTS.md"
+  if [ -L "$agent_file" ]; then
+    warn "skipping global Codex discovery because $agent_file is a symlink"
+    return
+  fi
+  agent_group=$(id -gn "$agent_user" 2>/dev/null || printf '%s' "$agent_user")
+  temp_file=$(mktemp)
+  if [ -f "$agent_file" ]; then
+    awk '
+      $0 == "<!-- BEGIN ollama-unify GPU negotiator -->" { skip=1; next }
+      $0 == "<!-- END ollama-unify GPU negotiator -->" { skip=0; next }
+      !skip { print }
+    ' "$agent_file" > "$temp_file"
+  fi
+  if [ -s "$temp_file" ]; then printf '\n' >> "$temp_file"; fi
+  render_global_codex_gpu_block >> "$temp_file"
+
+  if [ "$EUID" -eq 0 ] || [ "$agent_user" != "${USER:-}" ]; then
+    local -a elevate=()
+    [ -n "$sudo_pfx" ] && elevate=("$sudo_pfx")
+    "${elevate[@]}" install -o "$agent_user" -g "$agent_group" -m 0644 "$temp_file" "$agent_file"
+  else
+    install -m 0644 "$temp_file" "$agent_file"
+  fi
+  rm -f "$temp_file"
+  ok "global Codex CUDA discovery installed: $agent_file"
 }
 
 render_safety_service_directives() {
@@ -1842,6 +2036,7 @@ install_systemd_safety_policy() {
 
   if [ "$SAFETY_NEGOTIATOR_ENABLED" = 1 ]; then
     install_gpu_negotiator "$sudo_pfx"
+    install_global_codex_gpu_instructions "$sudo_pfx"
   fi
 
   "${elevate[@]}" systemctl daemon-reload
