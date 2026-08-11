@@ -17,7 +17,7 @@ The result: `ollama list` on port 11434 shows a different set of models than `ol
 
 `ollama-unify` first classifies the operating system, architecture, effective RAM, cgroup/container boundary, CPU, service manager, and every accelerator backend it can interrogate. It then chooses CUDA, ROCm, Vulkan, Metal, or CPU according to the capabilities actually present and derives conservative scheduler, device-memory, and host-memory limits.
 
-The model-store workflow remains independent: it scans every place Ollama stores models, shows exactly what is where, and interactively migrates everything into one canonical location. On compatible systemd hosts, the classified policy is installed as a late-priority service drop-in so an ordinary Ollama OOM is contained inside the service cgroup.
+The model-store workflow remains independent: it scans every place Ollama stores models, shows exactly what is where, and interactively migrates everything into one canonical location. On compatible systemd hosts, the classified policy is installed as a late-priority service drop-in. It refuses unsafe starts, gives Ollama low CPU/I/O priority, asks `systemd-oomd` to kill it under sustained memory pressure, and leaves it stopped after a failure instead of replaying a destructive request loop.
 
 ```
   ___  _ _                                       _  __
@@ -97,8 +97,11 @@ Proceed? [N]: y
 - **Generic capability floors** — classifies constrained or legacy devices from memory and compute telemetry rather than special-casing product names
 - **Backend isolation and preflight** — emits the correct visibility variables for the selected backend and validates CUDA, ROCm, or Vulkan telemetry before systemd starts Ollama
 - **Dynamic device headroom** — reserves 10% of dedicated or 20% of shared device memory, subject to size-aware floors and a 16 GiB ceiling; conservative estimates are used when a backend cannot expose memory
-- **Host OOM containment** — derives `MemoryHigh` and `MemoryMax` from installed RAM, limits service swap, and makes systemd stop/restart only Ollama if its cgroup reaches the hard boundary
-- **Bounded scheduling** — derives context and queue limits from effective RAM, defaults to one parallel request, limits loaded models, and uses Flash Attention plus `q8_0` KV cache
+- **Host OOM containment** — reserves 35% of effective RAM on ordinary hosts or 10% on accelerator-rich multi-GPU servers, derives `MemoryHigh` and `MemoryMax`, limits service swap, and makes Ollama the preferred OOM victim
+- **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
+- **Proactive pressure killing** — configures `systemd-oomd` to kill Ollama at sustained memory pressure or swap exhaustion before the host becomes unusable
+- **CPU and storage protection** — caps Ollama at four logical CPU cores by default and gives its CPU and I/O cgroups low weight, keeping interactive work responsive during cold loads
+- **Bounded scheduling** — defaults to one loaded model and one parallel request on every hardware shape, derives context and queue limits from effective RAM, and uses Flash Attention plus `q8_0` KV cache
 - **Backward-compat symlinks** — replaces each original path with a symlink to the unified store, so hardcoded references in agents, scripts, and `OLLAMA_MODELS=` overrides keep working
 - **Shell rc update** — appends `export OLLAMA_MODELS=…` to your `.bashrc` / `.zshrc` / `config.fish` so new shells use the canonical path natively
 - **Safety first** — never deletes data. Originals are renamed to `.bak` (or `.orphan-blobs` for stores with no manifests). You reclaim the space manually when you've confirmed everything works.
@@ -132,6 +135,12 @@ Preview the generated backend and OOM policy:
 ./ollama-unify.sh --safety-preview
 ```
 
+Install or refresh only the systemd safety policy without scanning or migrating model stores:
+
+```bash
+./ollama-unify.sh --install-safety
+```
+
 Print shell-compatible exports for a manual server or a non-systemd supervisor:
 
 ```bash
@@ -158,10 +167,10 @@ The fixture suite exercises CUDA dedicated/display/constrained devices, multi-GP
 ## Safety guarantees
 
 - **No data is ever deleted.** Source stores are renamed (`<path>.bak` for stores with manifests, `<path>.orphan-blobs` for stores with only orphan blobs). You reclaim the space yourself with `rm -rf` after verifying.
-- **Daemons are stopped only after you confirm** the plan summary. Aborting at the confirmation prompt is a no-op.
+- **The migration flow stops daemons only after you confirm** the plan summary. `--install-safety` is an explicit maintenance command and may briefly restart an active Ollama service so the new boundary takes effect.
 - **Idempotent re-runs.** Running the script a second time on a unified setup detects "only one store," reclassifies the host, and can update the systemd safety profile without moving data.
 - **Sudo is only requested if needed.** If your destination is in your home dir, no daemons are running, and you skip the systemd step, the script runs with zero privilege escalation.
-- **On supported systemd versions, ordinary userspace OOMs are scoped to Ollama.** `MemoryHigh` throttles and reclaims first; `MemoryMax` is the last line of defense. `OOMPolicy=stop` and `Restart=on-failure` terminate and restart the service cgroup, substantially reducing the chance that pressure escalates into a host-wide OOM.
+- **On supported systemd versions, ordinary userspace OOMs are scoped to Ollama.** `MemoryHigh` throttles and reclaims first; `systemd-oomd` reacts to sustained PSI; `MemoryMax` is the last line of defense. `OOMPolicy=stop`, `KillMode=control-group`, and the default `Restart=no` terminate the entire service cgroup and do not automatically replay the failed workload.
 
 ## What the script does, step by step
 
@@ -177,7 +186,7 @@ The fixture suite exercises CUDA dedicated/display/constrained devices, multi-GP
 10. Transfers each non-destination store using the optimal strategy for that source→dest fs pair
 11. Archives originals as `.bak` (or `.orphan-blobs`)
 12. Normalizes ownership and permissions on the unified destination
-13. Installs a late-priority systemd drop-in (if requested)
+13. Installs the memory-pressure preflight and a late-priority systemd drop-in (if requested)
 14. Creates backward-compat symlinks (if requested)
 15. Appends the env export to your shell rc (if requested)
 16. Restarts `ollama.service`
@@ -206,16 +215,20 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | --- | --- |
 | Effective RAM | Physical RAM reduced to the current cgroup limit when running inside a constrained container or service |
 | Host class | `<8 GiB` constrained, `<32 GiB` personal, `<128 GiB` workstation, otherwise memory-rich server |
-| Host reserve | Starts at 20%; size-aware floors range from 1 GiB to 64 GiB and never reserve more than half the effective RAM |
+| Host reserve | Starts at 35% on ordinary hosts. When the scan finds at least two dedicated GPUs whose summed reported VRAM is at least half of host RAM, it uses 10% and a 16 GiB floor |
 | Device reserve | 10% of the smallest dedicated CUDA/ROCm device or 20% for a shared device, with size-aware floors and a 16 GiB ceiling |
 | Unknown GPU memory | 2 GiB ROCm estimate or 1 GiB Vulkan estimate |
-| Loaded models | 1 normally; 2 only with multiple dedicated accelerators, known device memory, and at least 32 GiB effective RAM |
+| Loaded models | 1 on every hardware shape by default; an override is required to allow simultaneous resident models |
 | Parallel requests | 1 per model |
 | Context | 2,048 below 8 GiB RAM; 4,096 below 16 GiB; 8,192 otherwise (CPU hosts below 32 GiB never exceed 4,096 by default) |
 | Request queue | 8, 16, or 64 according to effective RAM |
 | Idle retention | 5 minutes rather than indefinitely |
 | KV cache | Flash Attention plus `q8_0`, reducing cache growth compared with `f16` |
-| systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, and bounded restarts |
+| Throttle target | Normally the hard cap minus a 10% band. For a scanned accelerator-rich host, the target is the lower of summed dedicated VRAM or the safe host ceiling; no GPU model, count, or host size is hardcoded |
+| Start preflight | Refuses startup below the host-memory reserve or at/above 20% full memory PSI over 10 seconds |
+| CPU and I/O | 400% CPU quota (capped to host capacity), CPU weight 10, I/O weight 10, and nice level 10 |
+| systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, `ManagedOOMMemoryPressure`, and `ManagedOOMSwap` |
+| Failure behavior | `Restart=no` by default, so an OOM, driver failure, or refused preflight requires an explicit `systemctl start ollama` after the cause is resolved |
 
 These defaults are intentionally conservative. Ollama documents that parallel processing multiplies context allocation, so 32K context × 3 parallel requests can require roughly 96K tokens of context memory per loaded model. Ollama recommends UUIDs for NVIDIA and AMD selection because numeric ordering may vary. See Ollama's [concurrency and memory guidance](https://docs.ollama.com/faq), [GPU/backend guidance](https://docs.ollama.com/gpu), and AMD's [ROCm isolation guidance](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/env_variables.html).
 
@@ -225,13 +238,15 @@ The defaults can be changed for a single run:
 OLLAMA_SAFE_CONTEXT_LENGTH=16384 \
 OLLAMA_SAFE_MAX_LOADED_MODELS=1 \
 OLLAMA_SAFE_HOST_RESERVE_MIB=98304 \
+OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT=20 \
+OLLAMA_SAFE_CPU_QUOTA_PERCENT=400 \
 OLLAMA_SAFE_BACKEND=cuda \
 ./ollama-unify.sh
 ```
 
-Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, and `OLLAMA_SAFE_SWAP_MAX`.
+Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, and `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`).
 
-`OLLAMA_CONTEXT_LENGTH` is a server default, not an API-enforced maximum. A client can still request a larger `num_ctx`, and API `keep_alive` can override model retention. On systemd, the cgroup boundary remains the final containment layer. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated with that service manually and native cgroup containment is unavailable.
+`OLLAMA_CONTEXT_LENGTH` is a server default, not an API-enforced maximum. A client can still request a larger `num_ctx`, and API `keep_alive` can override model retention. The one-model scheduler, PSI kill, hard cgroup boundary, and no-restart policy are therefore the containment layer: a pathological request can fail Ollama, but it should not be allowed to replay until it wedges the host. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated with that service manually and native cgroup containment is unavailable.
 
 ## Common scenarios
 

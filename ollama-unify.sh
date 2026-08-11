@@ -88,8 +88,12 @@ SAFETY_BACKEND_REASON=""
 SAFETY_DEVICE_COUNT=0
 SAFETY_SHARED_ACCELERATOR=0
 SAFETY_MIN_DEVICE_MEMORY_MIB=0
+SAFETY_AGGREGATE_DEVICE_MEMORY_MIB=0
+SAFETY_DEVICE_MEMORY_KNOWN=0
+SAFETY_ACCELERATOR_RICH_HOST=0
 SAFETY_VRAM_RESERVE_MIB=0
 SAFETY_VRAM_RESERVE_BYTES=0
+SAFETY_HOST_RESERVE_MIB=0
 SAFETY_HOST_MEMORY_HIGH_MIB=0
 SAFETY_HOST_MEMORY_MAX_MIB=0
 SAFETY_CONTEXT_LENGTH=0
@@ -98,9 +102,15 @@ SAFETY_MAX_LOADED_MODELS=0
 SAFETY_MAX_QUEUE=0
 SAFETY_KEEP_ALIVE=""
 SAFETY_SWAP_MAX=""
+SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT=20
+SAFETY_CPU_QUOTA_PERCENT=400
+SAFETY_CPU_WEIGHT=10
+SAFETY_IO_WEIGHT=10
+SAFETY_RESTART_POLICY="no"
+SAFETY_PREFLIGHT_PATH="/usr/local/libexec/ollama-unify-memory-preflight"
 
-CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_SHARED=0
-ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_SHARED=0
+CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_TOTAL_VRAM_MIB=0; CUDA_SHARED=0
+ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_TOTAL_VRAM_MIB=0; ROCM_KNOWN_VRAM_COUNT=0; ROCM_SHARED=0
 VULKAN_TOOL=""; VULKAN_COUNT=0; VULKAN_SHARED=0
 METAL_COUNT=0
 declare -a ACCELERATOR_SUMMARIES=() SAFETY_DEVICE_IDS=() SAFETY_SELECTED_SUMMARIES=()
@@ -229,7 +239,7 @@ detect_cuda_devices() {
   require_uint_value OLLAMA_SAFE_MIN_GPU_MEMORY_MIB "$min_vram"
   require_uint_value OLLAMA_SAFE_MIN_COMPUTE_MAJOR "$min_compute"
   local -a dedicated_ids=() dedicated_summaries=() shared_ids=() shared_summaries=()
-  local dedicated_min=0 shared_min=0
+  local dedicated_min=0 dedicated_total=0 shared_min=0 shared_total=0
 
   while IFS=',' read -r raw_index raw_uuid raw_name raw_display raw_vram raw_compute; do
     local index uuid name display vram compute major role summary
@@ -248,9 +258,11 @@ detect_cuda_devices() {
       ACCELERATOR_SUMMARIES+=("[cuda/$role] $summary")
       if [ "$role" = "dedicated" ]; then
         dedicated_ids+=("$uuid"); dedicated_summaries+=("$summary")
+        dedicated_total=$((dedicated_total + vram))
         if [ "$dedicated_min" -eq 0 ] || [ "$vram" -lt "$dedicated_min" ]; then dedicated_min="$vram"; fi
       else
         shared_ids+=("$uuid"); shared_summaries+=("$summary")
+        shared_total=$((shared_total + vram))
         if [ "$shared_min" -eq 0 ] || [ "$vram" -lt "$shared_min" ]; then shared_min="$vram"; fi
       fi
     fi
@@ -258,10 +270,10 @@ detect_cuda_devices() {
 
   if [ ${#dedicated_ids[@]} -gt 0 ]; then
     CUDA_IDS=("${dedicated_ids[@]}"); CUDA_SUMMARIES=("${dedicated_summaries[@]}")
-    CUDA_MIN_VRAM_MIB="$dedicated_min"; CUDA_SHARED=0
+    CUDA_MIN_VRAM_MIB="$dedicated_min"; CUDA_TOTAL_VRAM_MIB="$dedicated_total"; CUDA_SHARED=0
   elif [ ${#shared_ids[@]} -gt 0 ]; then
     CUDA_IDS=("${shared_ids[@]}"); CUDA_SUMMARIES=("${shared_summaries[@]}")
-    CUDA_MIN_VRAM_MIB="$shared_min"; CUDA_SHARED=1
+    CUDA_MIN_VRAM_MIB="$shared_min"; CUDA_TOTAL_VRAM_MIB="$shared_total"; CUDA_SHARED=1
   fi
   CUDA_COUNT=${#CUDA_IDS[@]}
   local uuid
@@ -314,6 +326,10 @@ detect_rocm_devices() {
     ACCELERATOR_SUMMARIES+=("[rocm/$role] $summary")
     if [ "$vram" -gt 0 ] && { [ "$ROCM_MIN_VRAM_MIB" -eq 0 ] || [ "$vram" -lt "$ROCM_MIN_VRAM_MIB" ]; }; then
       ROCM_MIN_VRAM_MIB="$vram"
+    fi
+    if [ "$vram" -gt 0 ]; then
+      ROCM_TOTAL_VRAM_MIB=$((ROCM_TOTAL_VRAM_MIB + vram))
+      ROCM_KNOWN_VRAM_COUNT=$((ROCM_KNOWN_VRAM_COUNT + 1))
     fi
     ordinal=$((ordinal + 1))
   done <<< "$inventory"
@@ -405,7 +421,9 @@ select_safety_backend() {
     cuda)
       [ "$CUDA_COUNT" -gt 0 ] || { err "CUDA was requested but no eligible CUDA device was classified"; exit 2; }
       SAFETY_DEVICE_IDS=("${CUDA_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${CUDA_SUMMARIES[@]}")
-      SAFETY_PREFLIGHT_DIRECTIVES=("${CUDA_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$CUDA_COUNT"
+      SAFETY_PREFLIGHT_DIRECTIVES=("${CUDA_PREFLIGHT[@]}")
+      SAFETY_DEVICE_COUNT="$CUDA_COUNT"
+      SAFETY_AGGREGATE_DEVICE_MEMORY_MIB="$CUDA_TOTAL_VRAM_MIB"; SAFETY_DEVICE_MEMORY_KNOWN=1
       SAFETY_MIN_DEVICE_MEMORY_MIB="$CUDA_MIN_VRAM_MIB"; SAFETY_SHARED_ACCELERATOR="$CUDA_SHARED"
       SAFETY_BACKEND_CLASS=$([ "$CUDA_SHARED" = 1 ] && printf 'shared-display' || printf 'dedicated')
       SAFETY_BACKEND_REASON="highest-confidence native NVIDIA backend"
@@ -413,7 +431,11 @@ select_safety_backend() {
     rocm)
       [ "$ROCM_COUNT" -gt 0 ] || { err "ROCm was requested but no ROCm device was classified"; exit 2; }
       SAFETY_DEVICE_IDS=("${ROCM_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${ROCM_SUMMARIES[@]}")
-      SAFETY_PREFLIGHT_DIRECTIVES=("${ROCM_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$ROCM_COUNT"
+      SAFETY_PREFLIGHT_DIRECTIVES=("${ROCM_PREFLIGHT[@]}")
+      SAFETY_DEVICE_COUNT="$ROCM_COUNT"
+      if [ "$ROCM_KNOWN_VRAM_COUNT" -eq "$ROCM_COUNT" ]; then
+        SAFETY_AGGREGATE_DEVICE_MEMORY_MIB="$ROCM_TOTAL_VRAM_MIB"; SAFETY_DEVICE_MEMORY_KNOWN=1
+      fi
       SAFETY_MIN_DEVICE_MEMORY_MIB="$ROCM_MIN_VRAM_MIB"; SAFETY_SHARED_ACCELERATOR="$ROCM_SHARED"
       SAFETY_BACKEND_CLASS=$([ "$ROCM_SHARED" = 1 ] && printf 'shared/integrated' || printf 'discrete')
       SAFETY_BACKEND_REASON="native AMD ROCm backend"
@@ -421,14 +443,16 @@ select_safety_backend() {
     vulkan)
       [ "$VULKAN_COUNT" -gt 0 ] || { err "Vulkan was requested but no Vulkan accelerator was classified"; exit 2; }
       SAFETY_DEVICE_IDS=("${VULKAN_IDS[@]}"); SAFETY_SELECTED_SUMMARIES=("${VULKAN_SUMMARIES[@]}")
-      SAFETY_PREFLIGHT_DIRECTIVES=("${VULKAN_PREFLIGHT[@]}"); SAFETY_DEVICE_COUNT="$VULKAN_COUNT"
+      SAFETY_PREFLIGHT_DIRECTIVES=("${VULKAN_PREFLIGHT[@]}")
+      SAFETY_DEVICE_COUNT="$VULKAN_COUNT"
       SAFETY_SHARED_ACCELERATOR="$VULKAN_SHARED"; SAFETY_MIN_DEVICE_MEMORY_MIB=0
       SAFETY_BACKEND_CLASS=$([ "$VULKAN_SHARED" = 1 ] && printf 'shared/integrated' || printf 'discrete')
       SAFETY_BACKEND_REASON="portable GPU fallback with approximate memory telemetry"
       ;;
     metal)
       [ "$METAL_COUNT" -gt 0 ] || { err "Metal was requested but no Metal device was classified"; exit 2; }
-      SAFETY_SELECTED_SUMMARIES=("${METAL_SUMMARIES[@]}"); SAFETY_DEVICE_COUNT="$METAL_COUNT"
+      SAFETY_SELECTED_SUMMARIES=("${METAL_SUMMARIES[@]}")
+      SAFETY_DEVICE_COUNT="$METAL_COUNT"
       SAFETY_SHARED_ACCELERATOR=1; SAFETY_MIN_DEVICE_MEMORY_MIB=0
       SAFETY_BACKEND_CLASS="unified-memory"; SAFETY_BACKEND_REASON="native Apple Metal backend"
       ;;
@@ -442,26 +466,51 @@ select_safety_backend() {
 }
 
 build_resource_limits() {
-  local host_reserve="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$((SAFETY_HOST_TOTAL_MIB / 5))}"
+  # Keep enough RAM outside Ollama for the desktop, kernel, filesystem, and GPU
+  # driver. A large reserve matters especially when a runner pins user pages:
+  # those pages can outlive the process that caused the allocation failure.
+  SAFETY_ACCELERATOR_RICH_HOST=0
+  if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
+    && [ "$SAFETY_DEVICE_COUNT" -ge 2 ] \
+    && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -ge $((SAFETY_HOST_TOTAL_MIB / 2)) ]; then
+    SAFETY_ACCELERATOR_RICH_HOST=1
+  fi
+
+  local default_host_reserve=$((SAFETY_HOST_TOTAL_MIB * 35 / 100))
+  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then
+    # Large dedicated accelerator pools keep model weights and KV cache off the
+    # host. Preserve a useful OS reserve without throttling hundreds of GiB too
+    # early on machines such as multi-A100 inference servers.
+    default_host_reserve=$((SAFETY_HOST_TOTAL_MIB / 10))
+  fi
+  local host_reserve="${OLLAMA_SAFE_HOST_RESERVE_MIB:-$default_host_reserve}"
   require_uint_value OLLAMA_SAFE_HOST_RESERVE_MIB "$host_reserve"
   local reserve_floor
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then reserve_floor=1024
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then reserve_floor=2048
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 65536 ]; then reserve_floor=4096
+  elif [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then reserve_floor=16384
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then reserve_floor=8192
   else reserve_floor=65536; fi
   [ "$host_reserve" -lt "$reserve_floor" ] && host_reserve="$reserve_floor"
   [ "$host_reserve" -gt $((SAFETY_HOST_TOTAL_MIB / 2)) ] && host_reserve=$((SAFETY_HOST_TOTAL_MIB / 2))
+  SAFETY_HOST_RESERVE_MIB="$host_reserve"
   SAFETY_HOST_MEMORY_MAX_MIB=$((SAFETY_HOST_TOTAL_MIB - host_reserve))
 
-  local throttle_band=$((SAFETY_HOST_TOTAL_MIB / 20)) throttle_floor
+  local throttle_band=$((SAFETY_HOST_TOTAL_MIB / 10)) throttle_floor
+  [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ] && throttle_band=$((SAFETY_HOST_TOTAL_MIB / 20))
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 8192 ]; then throttle_floor=256
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ]; then throttle_floor=1024
+  elif [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then throttle_floor=8192
   elif [ "$SAFETY_HOST_TOTAL_MIB" -lt 131072 ]; then throttle_floor=4096
   else throttle_floor=16384; fi
   [ "$throttle_band" -lt "$throttle_floor" ] && throttle_band="$throttle_floor"
   [ "$throttle_band" -gt $((SAFETY_HOST_MEMORY_MAX_MIB / 3)) ] && throttle_band=$((SAFETY_HOST_MEMORY_MAX_MIB / 3))
   SAFETY_HOST_MEMORY_HIGH_MIB=$((SAFETY_HOST_MEMORY_MAX_MIB - throttle_band))
+  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ] \
+    && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -lt "$SAFETY_HOST_MEMORY_HIGH_MIB" ]; then
+    SAFETY_HOST_MEMORY_HIGH_MIB="$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB"
+  fi
   [ "$SAFETY_HOST_MEMORY_HIGH_MIB" -gt 0 ] || { err "host-memory limits leave no usable RAM for Ollama"; exit 2; }
 
   SAFETY_VRAM_RESERVE_MIB=0
@@ -497,9 +546,6 @@ build_resource_limits() {
   if [ "$SAFETY_BACKEND" = "cpu" ] && [ "$SAFETY_HOST_TOTAL_MIB" -lt 32768 ] && [ "$default_context" -gt 4096 ]; then
     default_context=4096
   fi
-  if [ "$SAFETY_DEVICE_COUNT" -gt 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
-    && [ "$SAFETY_MIN_DEVICE_MEMORY_MIB" -gt 0 ] \
-    && [ "$SAFETY_HOST_TOTAL_MIB" -ge 32768 ]; then default_models=2; fi
 
   SAFETY_CONTEXT_LENGTH="${OLLAMA_SAFE_CONTEXT_LENGTH:-$default_context}"
   SAFETY_NUM_PARALLEL="${OLLAMA_SAFE_NUM_PARALLEL:-1}"
@@ -508,13 +554,42 @@ build_resource_limits() {
   SAFETY_MAX_LOADED_MODELS="${OLLAMA_SAFE_MAX_LOADED_MODELS:-$default_models}"
   if [ "$SAFETY_HOST_TOTAL_MIB" -lt 16384 ]; then SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-2G}"
   else SAFETY_SWAP_MAX="${OLLAMA_SAFE_SWAP_MAX:-8G}"; fi
+  SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT="${OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT:-20}"
+  SAFETY_CPU_QUOTA_PERCENT="${OLLAMA_SAFE_CPU_QUOTA_PERCENT:-400}"
+  SAFETY_CPU_WEIGHT="${OLLAMA_SAFE_CPU_WEIGHT:-10}"
+  SAFETY_IO_WEIGHT="${OLLAMA_SAFE_IO_WEIGHT:-10}"
+  SAFETY_RESTART_POLICY="${OLLAMA_SAFE_RESTART_POLICY:-no}"
+
+  local host_cpu_capacity=$((HOST_CPU_CORES * 100))
+  [ "$host_cpu_capacity" -ge 100 ] || host_cpu_capacity=100
 
   require_uint_value OLLAMA_SAFE_CONTEXT_LENGTH "$SAFETY_CONTEXT_LENGTH"
   require_uint_value OLLAMA_SAFE_NUM_PARALLEL "$SAFETY_NUM_PARALLEL"
   require_uint_value OLLAMA_SAFE_MAX_QUEUE "$SAFETY_MAX_QUEUE"
   require_uint_value OLLAMA_SAFE_MAX_LOADED_MODELS "$SAFETY_MAX_LOADED_MODELS"
+  require_uint_value OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT "$SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT"
+  require_uint_value OLLAMA_SAFE_CPU_QUOTA_PERCENT "$SAFETY_CPU_QUOTA_PERCENT"
+  require_uint_value OLLAMA_SAFE_CPU_WEIGHT "$SAFETY_CPU_WEIGHT"
+  require_uint_value OLLAMA_SAFE_IO_WEIGHT "$SAFETY_IO_WEIGHT"
   [ "$SAFETY_NUM_PARALLEL" -ge 1 ] || { err "OLLAMA_SAFE_NUM_PARALLEL must be at least 1"; exit 2; }
   [ "$SAFETY_MAX_LOADED_MODELS" -ge 1 ] || { err "OLLAMA_SAFE_MAX_LOADED_MODELS must be at least 1"; exit 2; }
+  if [ "$SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT" -lt 1 ] \
+    || [ "$SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT" -gt 100 ]; then
+    err "OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT must be between 1 and 100"; exit 2
+  fi
+  [ "$SAFETY_CPU_QUOTA_PERCENT" -ge 100 ] \
+    || { err "OLLAMA_SAFE_CPU_QUOTA_PERCENT must be at least 100"; exit 2; }
+  [ "$SAFETY_CPU_QUOTA_PERCENT" -gt "$host_cpu_capacity" ] && SAFETY_CPU_QUOTA_PERCENT="$host_cpu_capacity"
+  if [ "$SAFETY_CPU_WEIGHT" -lt 1 ] || [ "$SAFETY_CPU_WEIGHT" -gt 10000 ]; then
+    err "OLLAMA_SAFE_CPU_WEIGHT must be between 1 and 10000"; exit 2
+  fi
+  if [ "$SAFETY_IO_WEIGHT" -lt 1 ] || [ "$SAFETY_IO_WEIGHT" -gt 10000 ]; then
+    err "OLLAMA_SAFE_IO_WEIGHT must be between 1 and 10000"; exit 2
+  fi
+  case "$SAFETY_RESTART_POLICY" in
+    no|on-failure) ;;
+    *) err "OLLAMA_SAFE_RESTART_POLICY must be no or on-failure"; exit 2 ;;
+  esac
   [[ "$SAFETY_KEEP_ALIVE" =~ ^[0-9]+(ms|s|m|h)$ ]] || { err "OLLAMA_SAFE_KEEP_ALIVE must be a finite duration such as 5m"; exit 2; }
   [[ "$SAFETY_SWAP_MAX" =~ ^(0|[0-9]+[KMGT])$ ]] || { err "OLLAMA_SAFE_SWAP_MAX must be 0 or a systemd size such as 8G"; exit 2; }
 }
@@ -555,8 +630,14 @@ print_safety_profile() {
   say "  Backend: $SAFETY_BACKEND ($SAFETY_BACKEND_CLASS) — $SAFETY_BACKEND_REASON"
   printf '  Device: %s\n' "${SAFETY_SELECTED_SUMMARIES[@]}"
   if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then say "  Device-memory reserve: ${SAFETY_VRAM_RESERVE_MIB} MiB per selected accelerator"; fi
-  say "  Host memory: throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
+  if [ "$SAFETY_ACCELERATOR_RICH_HOST" = 1 ]; then
+    say "  Aggregate dedicated device memory: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB across ${SAFETY_DEVICE_COUNT} accelerators"
+  fi
+  say "  Host memory: reserve ${SAFETY_HOST_RESERVE_MIB} MiB; throttle at ${SAFETY_HOST_MEMORY_HIGH_MIB} MiB; hard cap at ${SAFETY_HOST_MEMORY_MAX_MIB} MiB"
   say "  Scheduler: ${SAFETY_MAX_LOADED_MODELS} model(s), ${SAFETY_NUM_PARALLEL} parallel request(s), ${SAFETY_CONTEXT_LENGTH}-token context, queue ${SAFETY_MAX_QUEUE}"
+  if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
+    say "  Containment: memory PSI ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%; CPU quota ${SAFETY_CPU_QUOTA_PERCENT}%; restart $SAFETY_RESTART_POLICY"
+  fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ] && [ "$SYSTEMD_VERSION" -lt 231 ]; then
     warn "systemd $SYSTEMD_VERSION is too old for MemoryHigh/MemoryMax; scheduler limits still apply."
   elif [ "$HOST_SERVICE_MANAGER" != "systemd" ]; then
@@ -620,6 +701,47 @@ render_safety_shell_exports() {
   done < <(render_safety_environment_directives)
 }
 
+render_safety_preflight_script() {
+  cat <<'PREFLIGHT'
+#!/bin/sh
+# Generated by ollama-unify. Refuse to start Ollama while the host is already
+# short of memory or stalled in reclaim. On modern systemd this runs as an
+# ExecCondition, so a refusal skips startup without marking the unit failed.
+set -eu
+
+reserve_mib=${1:-}
+pressure_limit=${2:-}
+case "$reserve_mib:$pressure_limit" in
+  *[!0-9:]*|:|*:)
+    echo "ollama-unify preflight: invalid reserve or pressure limit" >&2
+    exit 75
+    ;;
+esac
+
+mem_available_kib=$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)
+case "$mem_available_kib" in
+  ''|*[!0-9]*)
+    echo "ollama-unify preflight: cannot read MemAvailable" >&2
+    exit 75
+    ;;
+esac
+mem_available_mib=$((mem_available_kib / 1024))
+if [ "$mem_available_mib" -lt "$reserve_mib" ]; then
+  echo "ollama-unify preflight: refusing start; ${mem_available_mib} MiB available, ${reserve_mib} MiB reserved" >&2
+  exit 75
+fi
+
+if [ -r /proc/pressure/memory ]; then
+  full_avg10=$(awk '/^full / { for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i; exit } }' /proc/pressure/memory)
+  if [ -n "$full_avg10" ] && awk -v actual="$full_avg10" -v limit="$pressure_limit" 'BEGIN { exit !(actual >= limit) }'; then
+    echo "ollama-unify preflight: refusing start; memory full avg10=${full_avg10}% (limit ${pressure_limit}%)" >&2
+    exit 75
+  fi
+fi
+exit 0
+PREFLIGHT
+}
+
 render_safety_service_directives() {
   if [ "$SYSTEMD_VERSION" -ge 235 ]; then
     printf '%s\n' "UnsetEnvironment=OLLAMA_LLM_LIBRARY"
@@ -637,8 +759,94 @@ render_safety_service_directives() {
   fi
   if [ "$SYSTEMD_VERSION" -ge 232 ]; then printf '%s\n' "MemorySwapMax=${SAFETY_SWAP_MAX}"; fi
   if [ "$SYSTEMD_VERSION" -ge 243 ]; then printf '%s\n' "OOMPolicy=stop"; fi
-  printf '%s\n' "Restart=on-failure" "RestartSec=15s"
+  if [ "$SYSTEMD_VERSION" -ge 227 ]; then
+    printf '%s\n' "CPUAccounting=yes" "CPUWeight=${SAFETY_CPU_WEIGHT}" \
+      "CPUQuota=${SAFETY_CPU_QUOTA_PERCENT}%" "IOAccounting=yes" "IOWeight=${SAFETY_IO_WEIGHT}"
+  fi
+  if [ "$SYSTEMD_VERSION" -ge 247 ]; then
+    printf '%s\n' "ManagedOOMMemoryPressure=kill" \
+      "ManagedOOMMemoryPressureLimit=${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%" \
+      "ManagedOOMSwap=kill"
+  fi
+  printf '%s\n' "OOMScoreAdjust=750" "Nice=10" "KillMode=control-group"
+  if [ "$SYSTEMD_VERSION" -ge 243 ]; then
+    printf '%s\n' "ExecCondition=${SAFETY_PREFLIGHT_PATH} ${SAFETY_HOST_RESERVE_MIB} ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}"
+  else
+    printf '%s\n' "ExecStartPre=${SAFETY_PREFLIGHT_PATH} ${SAFETY_HOST_RESERVE_MIB} ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}"
+  fi
+  printf '%s\n' "Restart=${SAFETY_RESTART_POLICY}" "RestartSec=60s"
   if [ ${#SAFETY_PREFLIGHT_DIRECTIVES[@]} -gt 0 ]; then printf '%s\n' "${SAFETY_PREFLIGHT_DIRECTIVES[@]}"; fi
+}
+
+install_systemd_safety_policy() {
+  local sudo_pfx="$1"
+  local -a elevate=()
+  [ -n "$sudo_pfx" ] && elevate=("$sudo_pfx")
+  local dropin_dir="/etc/systemd/system/ollama.service.d"
+  local safety_file="$dropin_dir/zzz-ollama-unify-safety.conf"
+  local preflight_dir="${SAFETY_PREFLIGHT_PATH%/*}"
+
+  "${elevate[@]}" mkdir -p "$dropin_dir" "$preflight_dir"
+  render_safety_preflight_script | "${elevate[@]}" tee "$SAFETY_PREFLIGHT_PATH" >/dev/null
+  "${elevate[@]}" chmod 0755 "$SAFETY_PREFLIGHT_PATH"
+  {
+    printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '[Unit]\nStartLimitIntervalSec=5min\nStartLimitBurst=2\n\n[Service]\n'
+    render_safety_service_directives
+  } | "${elevate[@]}" tee "$safety_file" >/dev/null
+
+  "${elevate[@]}" systemctl daemon-reload
+  if [ "$SYSTEMD_VERSION" -ge 247 ]; then
+    if "${elevate[@]}" systemctl enable --now systemd-oomd.service >/dev/null 2>&1; then
+      ok "systemd-oomd is enabled for proactive memory-pressure kills"
+    else
+      warn "systemd-oomd could not be enabled; MemoryMax remains active, but PSI-based killing is unavailable"
+    fi
+  fi
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    "${elevate[@]}" systemd-analyze verify ollama.service
+  fi
+  ok "memory-pressure preflight installed: $SAFETY_PREFLIGHT_PATH"
+  ok "late-priority safety drop-in installed: $safety_file"
+}
+
+install_safety_only() {
+  banner
+  [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
+    || { err "--install-safety requires a systemd host"; exit 2; }
+  systemctl cat ollama.service >/dev/null 2>&1 \
+    || { err "ollama.service was not found"; exit 2; }
+  require awk
+  build_safety_profile
+  print_safety_profile
+
+  local SUDO=""
+  if [ "$EUID" -ne 0 ]; then
+    [ "$HAS_SUDO" = 1 ] || { err "sudo is required to install the systemd policy"; exit 2; }
+    SUDO="sudo"
+    $SUDO -n true 2>/dev/null || $SUDO -v
+  fi
+
+  local was_active=0
+  if systemctl is-active ollama.service >/dev/null 2>&1; then
+    was_active=1
+    $SUDO systemctl stop ollama.service
+    ok "ollama.service stopped while its policy is replaced"
+  fi
+
+  hdr "Installing Ollama safety policy"
+  install_systemd_safety_policy "$SUDO"
+
+  if [ "$was_active" = 1 ]; then
+    $SUDO systemctl start ollama.service || true
+    if systemctl is-active ollama.service >/dev/null 2>&1; then
+      ok "ollama.service restarted under the new policy"
+    else
+      warn "ollama.service remains stopped because the safety condition refused the restart"
+    fi
+  else
+    say "  ollama.service was already stopped and has been left stopped."
+  fi
 }
 
 preview_safety_profile() {
@@ -648,7 +856,7 @@ preview_safety_profile() {
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     hdr "Generated late-priority systemd drop-in"
     printf '%s\n' "# Managed by ollama-unify" "[Unit]" "StartLimitIntervalSec=5min" \
-      "StartLimitBurst=4" "" "[Service]"
+      "StartLimitBurst=2" "" "[Service]"
     render_safety_service_directives
   else
     hdr "Generated portable Ollama environment policy"
@@ -871,11 +1079,17 @@ main() {
       print_environment_policy
       exit 0
       ;;
+    --install-safety)
+      detect_host_profile
+      install_safety_only
+      exit 0
+      ;;
     -h|--help)
-      say "Usage: ./ollama-unify.sh [--classify|--safety-preview|--print-env]"
+      say "Usage: ./ollama-unify.sh [--classify|--safety-preview|--print-env|--install-safety]"
       say "  --classify        Classify the host, accelerators, backend, and risk tier without changes."
       say "  --safety-preview  Classify the host and print the generated safety policy without changes."
       say "  --print-env       Print shell exports for the selected scheduler/backend policy."
+      say "  --install-safety  Install only the fail-closed systemd safety policy; do not migrate models."
       exit 0
       ;;
     "") ;;
@@ -993,7 +1207,7 @@ main() {
   done
   say "  Total to move: $(human "$total_bytes")"
   [ "$DO_SYSTEMD_MODELS" = 1 ] && say "  • Point ollama.service at the unified model store"
-  [ "$DO_SAFETY"       = 1 ] && say "  • Install classified backend/device/host-memory OOM guardrails"
+  [ "$DO_SAFETY"       = 1 ] && say "  • Install fail-closed memory-pressure, CPU, I/O, and OOM guardrails"
   [ "$DO_SERVICE_USER" = 1 ] && say "  • Change service User/Group to $USER"
   [ "$DO_SYMLINKS"     = 1 ] && say "  • Symlink originals → destination"
   [ "$DO_BASHRC"       = 1 ] && say "  • Add OLLAMA_MODELS export to $SHELL_RC"
@@ -1010,7 +1224,7 @@ main() {
     [ "$HAS_SUDO" = 1 ] || { err "sudo required but not installed."; exit 2; }
     SUDO="sudo"
     say "${C_DIM}(sudo will prompt for your password)${C_RST}"
-    $SUDO -v
+    $SUDO -n true 2>/dev/null || $SUDO -v
   fi
 
   # ── stop daemons
@@ -1093,11 +1307,6 @@ main() {
     $SUDO mkdir -p "$dropin_dir"
     {
       printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-      if [ "$DO_SAFETY" = 1 ]; then
-        printf '[Unit]\n'
-        printf 'StartLimitIntervalSec=5min\n'
-        printf 'StartLimitBurst=4\n\n'
-      fi
       printf '[Service]\n'
       if [ "$DO_SYSTEMD_MODELS" = 1 ]; then
         printf 'Environment="OLLAMA_MODELS=%s"\n' "$DEST"
@@ -1106,15 +1315,16 @@ main() {
         printf 'User=%s\n' "$USER"
         printf 'Group=%s\n' "$(id -gn)"
       fi
-      if [ "$DO_SAFETY" = 1 ]; then
-        render_safety_service_directives
-      fi
     } | $SUDO tee "$dropin_file" >/dev/null
-    $SUDO systemctl daemon-reload
-    if command -v systemd-analyze >/dev/null 2>&1; then
-      $SUDO systemd-analyze verify ollama.service
-    fi
     ok "late-priority drop-in installed: $dropin_file"
+    if [ "$DO_SAFETY" = 1 ]; then
+      install_systemd_safety_policy "$SUDO"
+    else
+      $SUDO systemctl daemon-reload
+      if command -v systemd-analyze >/dev/null 2>&1; then
+        $SUDO systemd-analyze verify ollama.service
+      fi
+    fi
   fi
 
   # ── symlinks for backward compat
@@ -1149,12 +1359,16 @@ main() {
   # ── restart service + verify
   if [ "$HAS_SYSTEMD" = 1 ] && systemctl cat ollama >/dev/null 2>&1; then
     hdr "Restarting ollama.service"
-    $SUDO systemctl start ollama
-    sleep 3
-    if systemctl is-active ollama >/dev/null 2>&1; then
-      ok "ollama.service is active"
+    if $SUDO systemctl start ollama; then
+      sleep 3
+      if systemctl is-active ollama >/dev/null 2>&1; then
+        ok "ollama.service is active"
+      else
+        err "ollama.service stopped after launch — check 'journalctl -u ollama -n 50'"
+      fi
     else
-      err "ollama.service failed to start — check 'journalctl -u ollama -n 50'"
+      warn "ollama.service was left stopped; the safety preflight may have refused an unsafe restart"
+      warn "check: journalctl -u ollama -n 50"
     fi
   fi
 
