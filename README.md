@@ -106,6 +106,7 @@ Proceed? [N]: y
 - **Dynamic external-GPU negotiation** — installs a streaming API proxy and local lease broker; cooperative workloads load first, after which Ollama automatically refits into the remaining VRAM and moves the unmatched layers to cgroup-bounded pageable RAM
 - **Agent and Docker auto-discovery** — registers `docker gpu` as a Docker CLI plugin, publishes a machine-readable discovery manifest and well-known HTTP endpoint, and adds an idempotent managed CUDA policy to the invoking user's existing global Codex instructions
 - **Reactive anonymous-process yielding** — detects changes in non-Ollama CUDA process identities, drains Ollama, waits for foreign usage to settle, and reopens it for a fresh live-VRAM fit; this is best-effort because an undeclared process can fail its first allocation before userspace observes it
+- **Upgrade-safe pinning** — detects when an Ollama upgrade clears the pinned loopback backend and would drop the daemon back onto the negotiator's public port; `--check-update`, `--reconcile`, and `--update-ollama` repair the drift and cycle the proxy and backend in the only safe order, and an installed path-unit watchdog does the same for upgrades taken outside this script
 - **Measured host OOM containment** — sets `MemoryHigh` from the largest recent Ollama host-memory projection and `MemoryMax` from the larger of that projection or the largest installed inference payload; the unallocated host RAM is the result, not a target selected by the script
 - **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
 - **Proactive pressure killing** — configures `systemd-oomd` to kill Ollama at sustained memory pressure or swap exhaustion before the host becomes unusable
@@ -150,7 +151,7 @@ Install or refresh only the systemd safety policy without scanning or migrating 
 ./ollama-unify.sh --install-safety
 ```
 
-On a dedicated CUDA/ROCm systemd host, that command also installs and boot-enables `ollama-unify-negotiator.service` and the `ollama-unify-gpu-lease` client. Ollama moves to the loopback backend on port `11435`; the negotiator preserves the previously configured public address on port `11434`.
+On a dedicated CUDA/ROCm systemd host, that command also installs and boot-enables `ollama-unify-negotiator.service` and the `ollama-unify-gpu-lease` client. Ollama moves to the loopback backend on port `11436`; the negotiator preserves the previously configured public address on port `11434`.
 
 ### Dynamic GPU leases
 
@@ -185,6 +186,25 @@ For workloads managed by another supervisor, use the explicit lifecycle:
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
 The same discovery document is installed at `/usr/local/share/ollama-unify/gpu-negotiator.json` and served at `/.well-known/ollama-unify-gpu-negotiator` on the public Ollama address. Human-readable cross-agent instructions are installed at `/usr/local/share/ollama-unify/AGENTS.md`. If the invoking account already has `~/.codex`, the installer maintains a marked block in `~/.codex/AGENTS.md`; set `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY=0` to opt out without disabling Docker or machine-readable discovery.
+
+### Surviving Ollama upgrades
+
+The official Ollama installer rewrites `/etc/systemd/system/ollama.service` and restarts the daemon. The unit it writes carries no `OLLAMA_HOST`, so the pinned loopback backend exists only in the late-priority ollama-unify drop-in. If that drop-in is cleared or drifts, Ollama falls back to its built-in `0.0.0.0:11434` and collides head-on with the negotiator that already owns that address — whichever process loses the bind race dies.
+
+Three commands close that gap:
+
+```bash
+./ollama-unify.sh --check-update     # installed vs latest release, plus any pinning drift (read-only)
+./ollama-unify.sh --reconcile        # repin and restart the pair after an out-of-band upgrade
+./ollama-unify.sh --update-ollama    # update inside a safe stop → repin → start envelope
+```
+
+`--update-ollama` stops the negotiator first so the public address is free while the installer runs, lets the official installer do its work, reapplies the pinned safety policy, then restarts the pair in the only safe order — proxy down, backend up, proxy up — and verifies `/api/tags` end to end before reporting success. If the installer fails, the previous policy is reapplied and the stack is brought back up.
+
+`--install-safety` also arms a watchdog for upgrades taken outside this script:
+
+- `/usr/local/libexec/ollama-unify-reconcile` — a standalone repair helper with no dependency on this repository. It reads the pinned addresses from `/usr/local/share/ollama-unify/state.env`, re-asserts `OLLAMA_HOST` in the drop-in and `OLLAMA_UNIFY_BACKEND` in the negotiator config, and cycles the pair in order. If the drop-in has vanished entirely it restores the backend pin alone and logs that `--install-safety` is needed to rebuild the full containment policy.
+- `ollama-unify-reconcile.path` — a systemd path unit watching the Ollama binary. Any upgrade that rewrites it triggers the helper, which no-ops when there is no drift.
 
 Print shell-compatible exports for a manual server or a non-systemd supervisor:
 

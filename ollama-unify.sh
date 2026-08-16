@@ -120,12 +120,18 @@ SAFETY_NEGOTIATOR_CLI_PATH="/usr/local/bin/ollama-unify-gpu-lease"
 SAFETY_NEGOTIATOR_CONFIG_PATH="/etc/default/ollama-unify-negotiator"
 SAFETY_NEGOTIATOR_UNIT_PATH="/etc/systemd/system/ollama-unify-negotiator.service"
 SAFETY_NEGOTIATOR_SOCKET="/run/ollama-unify/gpu-negotiator.sock"
-SAFETY_OLLAMA_BACKEND="127.0.0.1:11435"
+SAFETY_OLLAMA_BACKEND="127.0.0.1:11436"
 SAFETY_DOCKER_PLUGIN_PATH="/usr/local/lib/docker/cli-plugins/docker-gpu"
 SAFETY_LEGACY_DOCKER_PLUGIN_PATH="/usr/local/lib/docker/cli-plugins/docker-gpu-lease"
 SAFETY_DISCOVERY_DIR="/usr/local/share/ollama-unify"
 SAFETY_DISCOVERY_PATH="/usr/local/share/ollama-unify/gpu-negotiator.json"
 SAFETY_AGENT_INSTRUCTIONS_PATH="/usr/local/share/ollama-unify/AGENTS.md"
+SAFETY_STATE_PATH="/usr/local/share/ollama-unify/state.env"
+SAFETY_RECONCILE_HELPER_PATH="/usr/local/libexec/ollama-unify-reconcile"
+SAFETY_RECONCILE_SERVICE_PATH="/etc/systemd/system/ollama-unify-reconcile.service"
+SAFETY_RECONCILE_PATH_UNIT_PATH="/etc/systemd/system/ollama-unify-reconcile.path"
+SAFETY_OLLAMA_RELEASE_API="https://api.github.com/repos/ollama/ollama/releases/latest"
+SAFETY_OLLAMA_INSTALL_URL="https://ollama.com/install.sh"
 
 CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_TOTAL_VRAM_MIB=0; CUDA_SHARED=0
 ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_TOTAL_VRAM_MIB=0; ROCM_KNOWN_VRAM_COUNT=0; ROCM_SHARED=0
@@ -966,7 +972,7 @@ def split_address(value: str) -> tuple[str, int]:
 load_environment_file(os.environ.get(
     "OLLAMA_UNIFY_CONFIG", "/etc/default/ollama-unify-negotiator"
 ))
-BACKEND_HOST, BACKEND_PORT = split_address(os.environ.get("OLLAMA_UNIFY_BACKEND", "127.0.0.1:11435"))
+BACKEND_HOST, BACKEND_PORT = split_address(os.environ.get("OLLAMA_UNIFY_BACKEND", "127.0.0.1:11436"))
 LISTEN_HOST, LISTEN_PORT = split_address(os.environ.get("OLLAMA_UNIFY_LISTEN", "127.0.0.1:11434"))
 CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-negotiator.sock")
 DRAIN_TIMEOUT = env_float("OLLAMA_UNIFY_DRAIN_TIMEOUT", 300.0)
@@ -2060,6 +2066,7 @@ install_systemd_safety_policy() {
   fi
   ok "memory-pressure preflight installed: $SAFETY_PREFLIGHT_PATH"
   ok "late-priority safety drop-in installed: $safety_file"
+  install_reconcile_watchdog "$sudo_pfx"
 }
 
 install_safety_only() {
@@ -2337,6 +2344,445 @@ plan_requires_sudo() {
 }
 
 # ───────────────────────────────────────────────────────────── main flow
+# ──────────────────────────────── Ollama update reconciliation
+# An Ollama upgrade rewrites /etc/systemd/system/ollama.service and restarts the
+# daemon. The unit it installs carries no OLLAMA_HOST, so the pinned loopback
+# backend exists only in our late-priority drop-in. If that drop-in is lost or
+# drifts, Ollama falls back to its built-in 0.0.0.0:11434 and collides head-on
+# with the negotiator that already owns that address. These helpers detect the
+# drift, repair it, and drive upgrades inside a safe stop → repin → start
+# envelope so the proxy never races the daemon it fronts.
+
+DRIFT_FINDINGS=()
+
+ollama_binary_path() {
+  local exec_start path
+  exec_start=$(systemctl show ollama.service -p ExecStart --value 2>/dev/null || true)
+  path=$(printf '%s' "$exec_start" | grep -oE 'path=[^ ;]+' | head -n1 | cut -d= -f2- || true)
+  if [ -n "$path" ] && [ -x "$path" ]; then printf '%s' "$path"; return 0; fi
+  command -v ollama 2>/dev/null || return 1
+}
+
+ollama_installed_version() {
+  local bin ver
+  bin=$(ollama_binary_path) || return 1
+  ver=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
+  [ -n "$ver" ] || return 1
+  printf '%s' "$ver"
+}
+
+ollama_latest_version() {
+  [ "$HAS_CURL" = 1 ] || return 1
+  curl -fsSL --max-time 10 "$SAFETY_OLLAMA_RELEASE_API" 2>/dev/null \
+    | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 \
+    | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1
+}
+
+# true when $1 sorts strictly before $2 under version ordering
+version_lt() {
+  [ "$1" = "$2" ] && return 1
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
+port_holder_pid() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -tlnpH 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {print; exit}' \
+    | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2
+}
+
+effective_ollama_host() {
+  systemctl show ollama.service -p Environment --value 2>/dev/null \
+    | tr ' ' '\n' | grep -E '^OLLAMA_HOST=' | tail -n1 | cut -d= -f2- | tr -d '"'
+}
+
+negotiator_config_value() {
+  local key="$1"
+  [ -r "$SAFETY_NEGOTIATOR_CONFIG_PATH" ] || return 1
+  awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' \
+    "$SAFETY_NEGOTIATOR_CONFIG_PATH"
+}
+
+state_value() {
+  local key="$1"
+  [ -r "$SAFETY_STATE_PATH" ] || return 1
+  awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' \
+    "$SAFETY_STATE_PATH"
+}
+
+render_reconcile_state() {
+  local version
+  version=$(ollama_installed_version || printf 'unknown')
+  printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf 'OLLAMA_UNIFY_PINNED_BACKEND="%s"\n' "$SAFETY_OLLAMA_BACKEND"
+  printf 'OLLAMA_UNIFY_PINNED_LISTEN="%s"\n' "$(detect_ollama_proxy_listen)"
+  printf 'OLLAMA_UNIFY_OLLAMA_VERSION="%s"\n' "$version"
+  printf 'OLLAMA_UNIFY_OLLAMA_BINARY="%s"\n' "$(ollama_binary_path || printf '')"
+}
+
+# Populates DRIFT_FINDINGS with everything that would break the proxy↔backend pair.
+collect_policy_drift() {
+  DRIFT_FINDINGS=()
+  local dropin="/etc/systemd/system/ollama.service.d/zzz-ollama-unify-safety.conf"
+  local host backend listen backend_port holder_pid main_pid holder_comm
+
+  [ -r "$dropin" ] || DRIFT_FINDINGS+=(
+    "safety drop-in is missing ($dropin); Ollama would fall back to its built-in 0.0.0.0:11434")
+
+  host=$(effective_ollama_host || true)
+  if [ -z "$host" ]; then
+    DRIFT_FINDINGS+=("ollama.service exposes no OLLAMA_HOST; the daemon would bind its default address")
+  elif [ "$host" != "$SAFETY_OLLAMA_BACKEND" ]; then
+    DRIFT_FINDINGS+=("ollama.service OLLAMA_HOST is $host; the pinned backend is $SAFETY_OLLAMA_BACKEND")
+  fi
+
+  if [ -r "$SAFETY_NEGOTIATOR_CONFIG_PATH" ]; then
+    backend=$(negotiator_config_value OLLAMA_UNIFY_BACKEND || true)
+    listen=$(negotiator_config_value OLLAMA_UNIFY_LISTEN || true)
+    if [ -n "$backend" ] && [ "$backend" != "$SAFETY_OLLAMA_BACKEND" ]; then
+      DRIFT_FINDINGS+=("negotiator OLLAMA_UNIFY_BACKEND is $backend; the pinned backend is $SAFETY_OLLAMA_BACKEND")
+    fi
+    if [ -n "$listen" ] && [ "$listen" = "$SAFETY_OLLAMA_BACKEND" ]; then
+      DRIFT_FINDINGS+=("negotiator listen address equals the backend address ($listen); the proxy would loop onto itself")
+    fi
+  fi
+
+  backend_port="${SAFETY_OLLAMA_BACKEND##*:}"
+  holder_pid=$(port_holder_pid "$backend_port" || true)
+  main_pid=$(systemctl show ollama.service -p MainPID --value 2>/dev/null || printf '0')
+  if [ -n "$holder_pid" ] && [ "$holder_pid" != "${main_pid:-0}" ]; then
+    holder_comm=$(ps -o comm= -p "$holder_pid" 2>/dev/null || printf 'unknown')
+    DRIFT_FINDINGS+=("backend port $backend_port is held by PID $holder_pid ($holder_comm), not by ollama.service")
+  fi
+}
+
+# Returns 0 when the negotiated stack answers end to end.
+verify_negotiated_stack() {
+  local listen probe host port
+  systemctl is-active ollama.service >/dev/null 2>&1 \
+    || { warn "ollama.service is not active"; return 1; }
+  if [ "$SAFETY_NEGOTIATOR_ENABLED" = 1 ]; then
+    systemctl is-active ollama-unify-negotiator.service >/dev/null 2>&1 \
+      || { warn "ollama-unify-negotiator.service is not active"; return 1; }
+  fi
+  listen=$(negotiator_config_value OLLAMA_UNIFY_LISTEN 2>/dev/null || printf '')
+  [ -n "$listen" ] || listen="$SAFETY_OLLAMA_BACKEND"
+  host="${listen%:*}"; port="${listen##*:}"
+  [ "$host" = "0.0.0.0" ] && host="127.0.0.1"
+  [ "$HAS_CURL" = 1 ] || { warn "curl is unavailable; skipping the end-to-end probe"; return 0; }
+  probe=$(curl -fsS --max-time 15 "http://${host}:${port}/api/tags" 2>/dev/null || true)
+  [ -n "$probe" ] || { warn "the negotiated API at ${host}:${port} did not answer /api/tags"; return 1; }
+  ok "negotiated API answers on ${host}:${port}"
+}
+
+# Ordered cycle: the proxy must release its socket before the backend moves.
+cycle_negotiated_stack() {
+  local sudo_pfx="$1"
+  local -a elevate=()
+  [ -n "$sudo_pfx" ] && elevate=("$sudo_pfx")
+  "${elevate[@]}" systemctl stop ollama-unify-negotiator.service 2>/dev/null || true
+  "${elevate[@]}" systemctl restart ollama.service || {
+    err "ollama.service refused to start; the safety condition or the backend port is still blocked"
+    return 1
+  }
+  if [ "$SAFETY_NEGOTIATOR_ENABLED" = 1 ]; then
+    "${elevate[@]}" systemctl start ollama-unify-negotiator.service || {
+      err "ollama-unify-negotiator.service refused to start"
+      return 1
+    }
+  fi
+}
+
+report_update_status() {
+  local installed latest recorded
+  installed=$(ollama_installed_version || printf '')
+  recorded=$(state_value OLLAMA_UNIFY_OLLAMA_VERSION 2>/dev/null || printf '')
+  hdr "Ollama release status"
+  if [ -n "$installed" ]; then
+    say "  Installed: $installed ($(ollama_binary_path || printf 'binary not found'))"
+  else
+    warn "  Installed: could not read a version from the Ollama binary"
+  fi
+  if [ -n "$recorded" ] && [ -n "$installed" ] && [ "$recorded" != "$installed" ]; then
+    warn "  Ollama moved $recorded → $installed since the policy was last applied"
+  fi
+  latest=$(ollama_latest_version || printf '')
+  if [ -z "$latest" ]; then
+    say "  Latest:    unavailable (no network or GitHub API unreachable)"
+  elif [ -z "$installed" ]; then
+    say "  Latest:    $latest"
+  elif version_lt "$installed" "$latest"; then
+    warn "  Latest:    $latest — an update is available; run --update-ollama to take it safely"
+  else
+    ok "  Latest:    $latest — Ollama is current"
+  fi
+}
+
+report_policy_drift() {
+  collect_policy_drift
+  hdr "Pinned topology"
+  say "  Ollama backend:  $SAFETY_OLLAMA_BACKEND"
+  say "  Negotiated API:  $(negotiator_config_value OLLAMA_UNIFY_LISTEN 2>/dev/null || printf 'not installed')"
+  if [ ${#DRIFT_FINDINGS[@]} -eq 0 ]; then
+    ok "no policy drift; the proxy and the backend agree on their addresses"
+    return 0
+  fi
+  hdr "Policy drift"
+  local finding
+  for finding in "${DRIFT_FINDINGS[@]}"; do warn "  $finding"; done
+  return 1
+}
+
+check_ollama_update() {
+  banner
+  [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
+    || { err "--check-update requires a systemd host"; exit 2; }
+  build_safety_profile
+  report_update_status
+  if report_policy_drift; then
+    say ""
+    ok "nothing to reconcile"
+  else
+    say ""
+    warn "run --reconcile to repin Ollama and restart the pair in the correct order"
+  fi
+}
+
+reconcile_after_update() {
+  banner
+  [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
+    || { err "--reconcile requires a systemd host"; exit 2; }
+  systemctl cat ollama.service >/dev/null 2>&1 \
+    || { err "ollama.service was not found"; exit 2; }
+  build_safety_profile
+  report_update_status
+
+  local drifted=0
+  report_policy_drift || drifted=1
+
+  local installed recorded
+  installed=$(ollama_installed_version || printf '')
+  recorded=$(state_value OLLAMA_UNIFY_OLLAMA_VERSION 2>/dev/null || printf '')
+  [ -n "$installed" ] && [ -n "$recorded" ] && [ "$installed" != "$recorded" ] && drifted=1
+
+  if [ "$drifted" = 0 ]; then
+    say ""
+    ok "policy already matches the running stack; nothing was changed"
+    verify_negotiated_stack || true
+    return 0
+  fi
+
+  local SUDO=""
+  if [ "$EUID" -ne 0 ]; then
+    [ "$HAS_SUDO" = 1 ] || { err "sudo is required to reconcile the systemd policy"; exit 2; }
+    SUDO="sudo"
+    $SUDO -n true 2>/dev/null || $SUDO -v
+  fi
+
+  hdr "Reapplying the pinned safety policy"
+  $SUDO systemctl stop ollama-unify-negotiator.service 2>/dev/null || true
+  $SUDO systemctl stop ollama.service 2>/dev/null || true
+  install_systemd_safety_policy "$SUDO"
+
+  hdr "Restarting the negotiated pair"
+  cycle_negotiated_stack "$SUDO" || exit 1
+  verify_negotiated_stack || exit 1
+  ok "Ollama is repinned to $SAFETY_OLLAMA_BACKEND behind the negotiator"
+}
+
+update_ollama() {
+  banner
+  [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
+    || { err "--update-ollama requires a systemd host"; exit 2; }
+  [ "$HAS_CURL" = 1 ] || { err "curl is required to download an Ollama update"; exit 2; }
+  build_safety_profile
+  report_update_status
+
+  local installed latest
+  installed=$(ollama_installed_version || printf '')
+  latest=$(ollama_latest_version || printf '')
+  if [ -z "$latest" ]; then
+    err "the latest Ollama release could not be determined; refusing to run the installer blind"
+    exit 2
+  fi
+  if [ -n "$installed" ] && ! version_lt "$installed" "$latest"; then
+    say ""
+    ok "Ollama $installed is already current; nothing to update"
+    exit 0
+  fi
+
+  say ""
+  say "  The official installer rewrites /etc/systemd/system/ollama.service and restarts"
+  say "  the daemon. ollama-unify will stop the negotiator first, let the installer run,"
+  say "  then repin the backend to $SAFETY_OLLAMA_BACKEND before the proxy comes back."
+  if [ -t 0 ] && [ "${OLLAMA_UNIFY_ASSUME_YES:-0}" != "1" ]; then
+    confirm "Update Ollama ${installed:-unknown} → $latest now?" "Y" \
+      || { say "  Left unchanged."; exit 0; }
+  fi
+
+  local SUDO=""
+  if [ "$EUID" -ne 0 ]; then
+    [ "$HAS_SUDO" = 1 ] || { err "sudo is required to update Ollama"; exit 2; }
+    SUDO="sudo"
+    $SUDO -n true 2>/dev/null || $SUDO -v
+  fi
+
+  hdr "Quiescing the negotiated pair"
+  $SUDO systemctl stop ollama-unify-negotiator.service 2>/dev/null || true
+  ok "negotiator stopped; the public address is free while the installer runs"
+  $SUDO systemctl stop ollama.service 2>/dev/null || true
+  ok "ollama.service stopped"
+
+  hdr "Running the official Ollama installer"
+  if ! curl -fsSL "$SAFETY_OLLAMA_INSTALL_URL" | $SUDO sh; then
+    err "the Ollama installer failed; reconciling the previous policy before exiting"
+    install_systemd_safety_policy "$SUDO"
+    cycle_negotiated_stack "$SUDO" || true
+    exit 1
+  fi
+
+  hdr "Repinning Ollama behind the negotiator"
+  install_systemd_safety_policy "$SUDO"
+  cycle_negotiated_stack "$SUDO" || exit 1
+  verify_negotiated_stack || exit 1
+  ok "Ollama updated to $(ollama_installed_version || printf "$latest") and repinned to $SAFETY_OLLAMA_BACKEND"
+}
+
+# Standalone repair helper: no repo checkout, no python, reads the installed state.
+render_reconcile_helper() {
+  cat <<'RECONCILE'
+#!/usr/bin/env bash
+# Managed by ollama-unify — repins Ollama after an out-of-band upgrade.
+#
+# The Ollama installer rewrites ollama.service and restarts the daemon. The
+# loopback backend address lives only in the ollama-unify drop-in, so an upgrade
+# that clears or bypasses it drops Ollama back onto 0.0.0.0:11434 — the address
+# the negotiator already owns. This helper re-asserts the pin and restarts the
+# pair in the only safe order: proxy down, backend up, proxy up.
+set -euo pipefail
+
+STATE="/usr/local/share/ollama-unify/state.env"
+DROPIN="/etc/systemd/system/ollama.service.d/zzz-ollama-unify-safety.conf"
+NEG_CONF="/etc/default/ollama-unify-negotiator"
+
+log() { printf 'ollama-unify-reconcile: %s\n' "$*"; }
+
+[ -r "$STATE" ] || { log "no installed state at $STATE; nothing to reconcile"; exit 0; }
+# shellcheck disable=SC1090
+. "$STATE"
+
+BACKEND="${OLLAMA_UNIFY_PINNED_BACKEND:-}"
+[ -n "$BACKEND" ] || { log "state carries no pinned backend; nothing to reconcile"; exit 0; }
+
+changed=0
+
+current_version="$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+if [ -n "$current_version" ] && [ "$current_version" != "${OLLAMA_UNIFY_OLLAMA_VERSION:-}" ]; then
+  log "Ollama moved ${OLLAMA_UNIFY_OLLAMA_VERSION:-unknown} -> $current_version"
+  changed=1
+fi
+
+if [ ! -r "$DROPIN" ]; then
+  log "safety drop-in missing; restoring the backend pin only"
+  mkdir -p "$(dirname "$DROPIN")"
+  printf '# Restored by ollama-unify-reconcile\n[Service]\nEnvironment="OLLAMA_HOST=%s"\n' \
+    "$BACKEND" > "$DROPIN"
+  log "run 'ollama-unify.sh --install-safety' to restore the full containment policy"
+  changed=1
+elif ! grep -qF "OLLAMA_HOST=${BACKEND}" "$DROPIN"; then
+  log "drop-in OLLAMA_HOST drifted; repinning to $BACKEND"
+  if grep -qE '^Environment="OLLAMA_HOST=' "$DROPIN"; then
+    sed -i -E "s|^Environment=\"OLLAMA_HOST=.*\"|Environment=\"OLLAMA_HOST=${BACKEND}\"|" "$DROPIN"
+  else
+    printf 'Environment="OLLAMA_HOST=%s"\n' "$BACKEND" >> "$DROPIN"
+  fi
+  changed=1
+fi
+
+if [ -w "$NEG_CONF" ] && ! grep -qF "OLLAMA_UNIFY_BACKEND=\"${BACKEND}\"" "$NEG_CONF"; then
+  log "negotiator backend drifted; repinning to $BACKEND"
+  sed -i -E "s|^OLLAMA_UNIFY_BACKEND=.*|OLLAMA_UNIFY_BACKEND=\"${BACKEND}\"|" "$NEG_CONF"
+  changed=1
+fi
+
+if [ "$changed" = 0 ]; then
+  log "no drift detected"
+  exit 0
+fi
+
+systemctl daemon-reload
+systemctl stop ollama-unify-negotiator.service 2>/dev/null || true
+systemctl restart ollama.service
+if systemctl list-unit-files ollama-unify-negotiator.service >/dev/null 2>&1; then
+  systemctl start ollama-unify-negotiator.service || log "negotiator failed to start"
+fi
+
+if [ -n "$current_version" ]; then
+  sed -i -E "s|^OLLAMA_UNIFY_OLLAMA_VERSION=.*|OLLAMA_UNIFY_OLLAMA_VERSION=\"${current_version}\"|" "$STATE" || true
+fi
+log "reconciled; Ollama pinned to $BACKEND"
+RECONCILE
+}
+
+render_reconcile_units() {
+  local binary="$1"
+  cat <<UNIT
+# Managed by ollama-unify — generated $(date '+%Y-%m-%dT%H:%M:%S%z')
+[Unit]
+Description=Repin Ollama behind the ollama-unify negotiator after an upgrade
+Documentation=https://github.com/robit-man/ollama-unify
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=$SAFETY_RECONCILE_HELPER_PATH
+UNIT
+}
+
+render_reconcile_path_unit() {
+  local binary="$1"
+  cat <<UNIT
+# Managed by ollama-unify — generated $(date '+%Y-%m-%dT%H:%M:%S%z')
+[Unit]
+Description=Watch the Ollama binary for upgrades that clear the pinned backend
+Documentation=https://github.com/robit-man/ollama-unify
+
+[Path]
+PathChanged=$binary
+Unit=ollama-unify-reconcile.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+install_reconcile_watchdog() {
+  local sudo_pfx="$1"
+  local -a elevate=()
+  [ -n "$sudo_pfx" ] && elevate=("$sudo_pfx")
+  local binary helper_dir
+  binary=$(ollama_binary_path || printf '')
+  helper_dir="${SAFETY_RECONCILE_HELPER_PATH%/*}"
+
+  "${elevate[@]}" mkdir -p "$helper_dir" "$SAFETY_DISCOVERY_DIR"
+  render_reconcile_helper | "${elevate[@]}" tee "$SAFETY_RECONCILE_HELPER_PATH" >/dev/null
+  "${elevate[@]}" chmod 0755 "$SAFETY_RECONCILE_HELPER_PATH"
+  render_reconcile_state | "${elevate[@]}" tee "$SAFETY_STATE_PATH" >/dev/null
+  "${elevate[@]}" chmod 0644 "$SAFETY_STATE_PATH"
+  ok "reconcile helper installed: $SAFETY_RECONCILE_HELPER_PATH"
+
+  if [ -z "$binary" ]; then
+    warn "the Ollama binary could not be located; the upgrade watchdog was not installed"
+    return 0
+  fi
+  render_reconcile_units "$binary" | "${elevate[@]}" tee "$SAFETY_RECONCILE_SERVICE_PATH" >/dev/null
+  render_reconcile_path_unit "$binary" | "${elevate[@]}" tee "$SAFETY_RECONCILE_PATH_UNIT_PATH" >/dev/null
+  "${elevate[@]}" systemctl daemon-reload
+  "${elevate[@]}" systemctl enable --now ollama-unify-reconcile.path >/dev/null 2>&1 \
+    || warn "ollama-unify-reconcile.path could not be enabled"
+  ok "upgrade watchdog armed on $binary"
+}
+
 main() {
   case "${1:-}" in
     --classify)
@@ -2356,12 +2802,31 @@ main() {
       install_safety_only
       exit 0
       ;;
+    --check-update)
+      detect_host_profile
+      check_ollama_update
+      exit 0
+      ;;
+    --reconcile)
+      detect_host_profile
+      reconcile_after_update
+      exit 0
+      ;;
+    --update-ollama)
+      detect_host_profile
+      update_ollama
+      exit 0
+      ;;
     -h|--help)
       say "Usage: ./ollama-unify.sh [--classify|--safety-preview|--print-env|--install-safety]"
+      say "                         [--check-update|--reconcile|--update-ollama]"
       say "  --classify        Classify the host, accelerators, backend, and risk tier without changes."
       say "  --safety-preview  Classify the host and print the generated safety policy without changes."
       say "  --print-env       Print shell exports for the selected scheduler/backend policy."
       say "  --install-safety  Install systemd containment and the dynamic GPU negotiator; do not migrate models."
+      say "  --check-update    Report the installed vs latest Ollama release and any pinning drift."
+      say "  --reconcile       Repin Ollama behind the negotiator after an out-of-band Ollama upgrade."
+      say "  --update-ollama   Update Ollama inside a safe stop → repin → start envelope, then verify."
       exit 0
       ;;
     "") ;;
