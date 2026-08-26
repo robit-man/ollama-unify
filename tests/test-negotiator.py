@@ -3,6 +3,7 @@ import http.client
 import http.server
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -91,6 +92,14 @@ def control(path, payload):
     return response
 
 
+def read_line(process, timeout=5):
+    readable, _, _ = select.select([process.stdout], [], [], timeout)
+    assert readable, "timed out waiting for subprocess output"
+    line = process.stdout.readline()
+    assert line, process.stderr.read()
+    return line
+
+
 def proxy_generate(port, context=262144):
     body = json.dumps(
         {
@@ -169,6 +178,7 @@ def main():
             stderr=subprocess.PIPE,
             text=True,
         )
+        watcher = None
         try:
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
@@ -237,6 +247,42 @@ def main():
             )
             assert not blocked_error
 
+            first_heartbeat = ready["lease"]["heartbeat_at"]
+            watcher = subprocess.Popen(
+                [helper, "heartbeat", token, "--watch", "--interval", "0.1"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            acknowledgement = json.loads(read_line(watcher))
+            assert acknowledgement == {
+                "ok": True,
+                "watching": True,
+                "interval": 0.1,
+            }
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                watched_status = control(socket_path, {"action": "status"})
+                if watched_status["leases"][0]["heartbeat_at"] > first_heartbeat:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("persistent watcher did not renew the lease")
+            watcher.terminate()
+            assert watcher.wait(timeout=3) == 0, watcher.stderr.read()
+            watcher = None
+
+            denied_watcher = subprocess.run(
+                [helper, "heartbeat", "not-a-lease", "--watch", "--interval", "1"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            assert denied_watcher.returncode == 1
+            assert "unknown lease" in denied_watcher.stderr
+
             prepared = control(socket_path, {"action": "prepare", "token": token})
             assert prepared["lease"]["state"] == "pending"
             control(socket_path, {"action": "ready", "token": token})
@@ -246,13 +292,55 @@ def main():
             assert status["leases"] == []
             assert status["draining"] is False
             assert len(status["gpus"]) == 3
-        finally:
+
+            final_lease = control(
+                socket_path,
+                {
+                    "action": "acquire",
+                    "owner": "disconnect-fixture",
+                    "requested_mib": 0,
+                    "ttl": 30,
+                },
+            )
+            watcher = subprocess.Popen(
+                [
+                    helper,
+                    "heartbeat",
+                    final_lease["lease"]["token"],
+                    "--watch",
+                    "--interval",
+                    "1",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert json.loads(read_line(watcher))["watching"] is True
             daemon.terminate()
-            try:
-                daemon.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                daemon.kill()
-                daemon.wait()
+            daemon.wait(timeout=5)
+            assert watcher.wait(timeout=3) == 1
+            watcher_error = watcher.stderr.read()
+            assert (
+                "closed the heartbeat connection" in watcher_error
+                or "Broken pipe" in watcher_error
+            ), watcher_error
+            watcher = None
+        finally:
+            if watcher is not None and watcher.poll() is None:
+                watcher.terminate()
+                try:
+                    watcher.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    watcher.kill()
+                    watcher.wait()
+            if daemon.poll() is None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait()
             if daemon.returncode not in (0, -15):
                 raise RuntimeError(daemon.stderr.read())
             backend.shutdown()

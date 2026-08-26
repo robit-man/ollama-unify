@@ -15,10 +15,12 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq rsync shellcheck
       - name: Check shell syntax
-        run: bash -n ollama-unify.sh tests/test-classifier.sh tests/test-transfer.sh tests/fixtures/bin/*
+        run: bash -n ollama-unify.sh tests/test-classifier.sh tests/test-transfer.sh tests/test-negotiator.sh tests/fixtures/bin/*
       - name: Run ShellCheck
         run: shellcheck -x ollama-unify.sh tests/test-classifier.sh tests/test-transfer.sh tests/fixtures/bin/*
       - name: Exercise hardware classifiers
         run: ./tests/test-classifier.sh
       - name: Exercise transfer strategies
         run: ./tests/test-transfer.sh
+      - name: Exercise GPU lease negotiator
+        run: ./tests/test-negotiator.sh

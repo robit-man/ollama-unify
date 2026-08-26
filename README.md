@@ -183,6 +183,23 @@ For workloads managed by another supervisor, use the explicit lifecycle:
 4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
 
+An external supervisor can keep the lease alive without launching Docker and a
+new Python interpreter for every renewal:
+
+```bash
+docker gpu heartbeat "$token" --watch --interval 30
+```
+
+The watcher acknowledges its first successful renewal on stdout, then remains
+quiet while renewing over one persistent control connection. It exits non-zero if
+the broker connection closes or the lease is denied, so the parent supervisor must
+treat its exit as loss of ownership and stop the CUDA workload. `SIGINT` and
+`SIGTERM` stop the watcher cleanly without releasing the lease; lifecycle ownership
+and explicit `release` remain with the parent supervisor. With no `--interval`, the
+watcher derives a bounded interval from the lease TTL.
+Set `OLLAMA_UNIFY_HEARTBEAT_TIMEOUT` in the negotiator environment to change the
+10-second acknowledgement deadline for one-shot and watched heartbeats.
+
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
 The same discovery document is installed at `/usr/local/share/ollama-unify/gpu-negotiator.json` and served at `/.well-known/ollama-unify-gpu-negotiator` on the public Ollama address. Human-readable cross-agent instructions are installed at `/usr/local/share/ollama-unify/AGENTS.md`. If the invoking account already has `~/.codex`, the installer maintains a marked block in `~/.codex/AGENTS.md`; set `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY=0` to opt out without disabling Docker or machine-readable discovery.
