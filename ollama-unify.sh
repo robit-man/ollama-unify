@@ -978,6 +978,7 @@ CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-ne
 DRAIN_TIMEOUT = env_float("OLLAMA_UNIFY_DRAIN_TIMEOUT", 300.0)
 UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
+HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
 MAX_CONTEXT = env_int("OLLAMA_UNIFY_MAX_CONTEXT", 0)
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
 ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
@@ -1287,7 +1288,9 @@ class Broker:
                         f"requested {requested_mib} MiB but only {aggregate_free} MiB is free after Ollama unload"
                     )
                 now = time.time()
-                token = secrets.token_urlsafe(24)
+                # Prefix opaque tokens so argparse never mistakes a leading '-'
+                # from URL-safe base64 for an option in lifecycle CLI commands.
+                token = f"lease_{secrets.token_urlsafe(24)}"
                 lease = Lease(token, owner, "pending", requested_mib, now, now, ttl)
                 with self.cv:
                     self.leases[token] = lease
@@ -1499,30 +1502,36 @@ class ControlHandler(socketserver.StreamRequestHandler):
     broker: Broker
 
     def handle(self) -> None:
-        try:
-            request = json.loads(self.rfile.readline(1024 * 1024))
-            action = request.get("action")
-            if action == "acquire":
-                result = self.broker.acquire(
-                    str(request.get("owner") or "unknown"),
-                    max(0, int(request.get("requested_mib") or 0)),
-                    max(0, int(request.get("ttl", DEFAULT_LEASE_TTL))),
-                )
-            elif action == "ready":
-                result = self.broker.ready(str(request.get("token") or ""))
-            elif action == "prepare":
-                result = self.broker.prepare(str(request.get("token") or ""))
-            elif action == "release":
-                result = self.broker.release(str(request.get("token") or ""))
-            elif action == "heartbeat":
-                result = self.broker.heartbeat(str(request.get("token") or ""))
-            elif action == "status":
-                result = self.broker.status()
-            else:
-                raise ValueError(f"unknown action: {action}")
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
-        self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+        while raw_request := self.rfile.readline(1024 * 1024):
+            persistent = False
+            try:
+                request = json.loads(raw_request)
+                persistent = request.get("persistent") is True
+                action = request.get("action")
+                if action == "acquire":
+                    result = self.broker.acquire(
+                        str(request.get("owner") or "unknown"),
+                        max(0, int(request.get("requested_mib") or 0)),
+                        max(0, int(request.get("ttl", DEFAULT_LEASE_TTL))),
+                    )
+                elif action == "ready":
+                    result = self.broker.ready(str(request.get("token") or ""))
+                elif action == "prepare":
+                    result = self.broker.prepare(str(request.get("token") or ""))
+                elif action == "release":
+                    result = self.broker.release(str(request.get("token") or ""))
+                elif action == "heartbeat":
+                    result = self.broker.heartbeat(str(request.get("token") or ""))
+                elif action == "status":
+                    result = self.broker.status()
+                else:
+                    raise ValueError(f"unknown action: {action}")
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+            self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+            self.wfile.flush()
+            if not persistent:
+                return
 
 
 class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -1531,22 +1540,78 @@ class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSe
 
 def send_control(payload: dict[str, Any]) -> dict[str, Any]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    response_file = None
     try:
-        client.settimeout(DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10)
+        timeout = (HEARTBEAT_TIMEOUT if payload.get("action") == "heartbeat"
+                   else DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10)
+        client.settimeout(timeout)
         client.connect(CONTROL_SOCKET)
         client.sendall(json.dumps(payload).encode() + b"\n")
-        chunks = []
-        while True:
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        response = json.loads(b"".join(chunks) or b"{}")
+        response_file = client.makefile("rb")
+        raw_response = response_file.readline(1024 * 1024)
+        if not raw_response:
+            raise ConnectionError("negotiator closed the control connection without a response")
+        response = json.loads(raw_response)
     finally:
+        if response_file is not None:
+            response_file.close()
         client.close()
     if not response.get("ok"):
         raise RuntimeError(str(response.get("error") or "negotiator request failed"))
     return response
+
+
+def watch_heartbeat(token: str, requested_interval: float) -> int:
+    """Renew a lease without repeatedly starting the Docker CLI and Python."""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    response_file = None
+    stopped = threading.Event()
+    previous_handlers: dict[int, Any] = {}
+
+    def stop(_signum: int, _frame: Any) -> None:
+        stopped.set()
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    try:
+        client.settimeout(HEARTBEAT_TIMEOUT)
+        client.connect(CONTROL_SOCKET)
+        response_file = client.makefile("rb")
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, stop)
+
+        interval = requested_interval
+        first = True
+        while not stopped.is_set():
+            client.sendall(json.dumps({
+                "action": "heartbeat", "token": token, "persistent": True,
+            }).encode() + b"\n")
+            raw_response = response_file.readline(1024 * 1024)
+            if not raw_response:
+                if stopped.is_set():
+                    return 0
+                raise ConnectionError("negotiator closed the heartbeat connection")
+            response = json.loads(raw_response)
+            if not response.get("ok"):
+                raise RuntimeError(str(response.get("error") or "lease heartbeat failed"))
+            if first:
+                lease = response.get("lease") or {}
+                if interval <= 0:
+                    ttl = max(0, int(lease.get("ttl") or 0))
+                    interval = max(2.0, min(30.0, ttl / 3 if ttl else 30.0))
+                print(json.dumps({"ok": True, "watching": True, "interval": interval}), flush=True)
+                first = False
+            stopped.wait(interval)
+        return 0
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if response_file is not None:
+            response_file.close()
+        client.close()
 
 
 def serve() -> int:
@@ -1678,9 +1743,13 @@ def main() -> int:
     acquire.add_argument("--vram-mib", type=int, default=0)
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     acquire.add_argument("--token-only", action="store_true")
-    for name in ("ready", "prepare", "release", "heartbeat"):
+    for name in ("ready", "prepare", "release"):
         command = sub.add_parser(name)
         command.add_argument("token")
+    heartbeat = sub.add_parser("heartbeat")
+    heartbeat.add_argument("token")
+    heartbeat.add_argument("--watch", action="store_true")
+    heartbeat.add_argument("--interval", type=float, default=0.0)
     run = sub.add_parser("run")
     run.add_argument("--owner", default="")
     run.add_argument("--vram-mib", type=int, default=0)
@@ -1705,6 +1774,10 @@ def main() -> int:
     elif args.command_name == "acquire":
         result = send_control({"action": "acquire", "owner": args.owner,
                                "requested_mib": args.vram_mib, "ttl": args.ttl})
+    elif args.command_name == "heartbeat" and args.watch:
+        if args.interval < 0:
+            parser.error("heartbeat --interval must be zero (automatic) or positive")
+        return watch_heartbeat(args.token, args.interval)
     elif args.command_name in ("ready", "prepare", "release", "heartbeat"):
         result = send_control({"action": args.command_name, "token": args.token})
     elif args.command_name == "run":
@@ -2645,7 +2718,7 @@ update_ollama() {
   install_systemd_safety_policy "$SUDO"
   cycle_negotiated_stack "$SUDO" || exit 1
   verify_negotiated_stack || exit 1
-  ok "Ollama updated to $(ollama_installed_version || printf "$latest") and repinned to $SAFETY_OLLAMA_BACKEND"
+  ok "Ollama updated to $(ollama_installed_version || printf '%s' "$latest") and repinned to $SAFETY_OLLAMA_BACKEND"
 }
 
 # Standalone repair helper: no repo checkout, no python, reads the installed state.
