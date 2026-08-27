@@ -223,6 +223,7 @@ def main():
                 timeout=10,
             )
             token = acquired.stdout.strip()
+            assert token.startswith("lease_")
             pending_status = control(socket_path, {"action": "status"})
             assert pending_status["leases"][0]["token"] == token
             assert pending_status["leases"][0]["state"] == "pending"
@@ -249,7 +250,7 @@ def main():
 
             first_heartbeat = ready["lease"]["heartbeat_at"]
             watcher = subprocess.Popen(
-                [helper, "heartbeat", token, "--watch", "--interval", "0.1"],
+                [helper, "heartbeat", "--watch", "--interval", "0.1", "--", token],
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

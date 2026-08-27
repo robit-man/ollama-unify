@@ -1288,7 +1288,9 @@ class Broker:
                         f"requested {requested_mib} MiB but only {aggregate_free} MiB is free after Ollama unload"
                     )
                 now = time.time()
-                token = secrets.token_urlsafe(24)
+                # Prefix opaque tokens so argparse never mistakes a leading '-'
+                # from URL-safe base64 for an option in lifecycle CLI commands.
+                token = f"lease_{secrets.token_urlsafe(24)}"
                 lease = Lease(token, owner, "pending", requested_mib, now, now, ttl)
                 with self.cv:
                     self.leases[token] = lease
