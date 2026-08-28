@@ -185,6 +185,20 @@ For workloads managed by another supervisor, use the explicit lifecycle:
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
+### Broker-owned parallel Ollama lanes
+
+Local clients that need concurrent model processes can ask the public broker to create capacity before starting their work:
+
+```bash
+curl -fsS http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5:35b","parallel":3}'
+```
+
+The broker looks up the installed model size through `/api/tags`, adds configurable model and VRAM margins, checks each selected GPU independently against live free memory, reserves host headroom, and admits the request only if every missing lane fits. Admission is atomic: an impossible request starts no partial pool. Each accepted lane is a broker-owned `ollama serve` process pinned to one selected GPU and a private loopback port. The response exposes only safe lane IDs/GPU assignments and the public API; clients continue sending all inference to port `11434` and cannot select or bypass a private lane. If a client skips the capacity call, its first ordinary inference request lazily starts one fitting lane and concurrent requests expand the pool only while additional selected GPUs still fit.
+
+Requests for an admitted model are queued and streamed across its ready lanes. Lane and queue timing are returned in `X-Ollama-Unify-Lane` and `X-Ollama-Unify-Queue-Ms`. Idle lanes are unloaded and stopped automatically. A cooperative external lease drains active streams and stops every broker-owned lane before it is granted; after `ready`, new capacity is fitted from the VRAM that remains. Broker shutdown also terminates its complete child process groups, and lanes are intentionally ephemeral across restart.
+
 The same discovery document is installed at `/usr/local/share/ollama-unify/gpu-negotiator.json` and served at `/.well-known/ollama-unify-gpu-negotiator` on the public Ollama address. Human-readable cross-agent instructions are installed at `/usr/local/share/ollama-unify/AGENTS.md`. If the invoking account already has `~/.codex`, the installer maintains a marked block in `~/.codex/AGENTS.md`; set `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY=0` to opt out without disabling Docker or machine-readable discovery.
 
 ### Surviving Ollama upgrades
@@ -235,7 +249,7 @@ The fixture suite exercises CUDA dedicated/display/constrained devices, multi-GP
 - **The migration flow stops daemons only after you confirm** the plan summary. `--install-safety` is an explicit maintenance command and may briefly restart an active Ollama service so the new boundary takes effect.
 - **Idempotent re-runs.** Running the script a second time on a unified setup detects "only one store," reclassifies the host, and can update the systemd safety profile without moving data.
 - **Sudo is only requested if needed.** If your destination is in your home dir, no daemons are running, and you skip the systemd step, the script runs with zero privilege escalation.
-- **On supported systemd versions, ordinary userspace OOMs are scoped to Ollama.** `MemoryHigh` throttles and reclaims first; `systemd-oomd` reacts to sustained PSI; `MemoryMax` is the last line of defense. `OOMPolicy=stop`, `KillMode=control-group`, and the default `Restart=no` terminate the entire service cgroup and do not automatically replay the failed workload.
+- **On supported systemd versions, ordinary userspace OOMs are scoped to Ollama.** `MemoryHigh` throttles and reclaims first; `systemd-oomd` reacts to sustained PSI; `MemoryMax` is the last line of defense. `OOMPolicy=stop`, `KillMode=control-group`, and the default `Restart=on-success` keep OOM/driver failures fail-closed while recovering an unexpected clean daemon exit. Explicit `systemctl stop` remains stopped.
 
 ## What the script does, step by step
 
@@ -298,7 +312,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | Start preflight | Refuses startup below the host-memory reserve or at/above 20% full memory PSI over 10 seconds |
 | CPU and I/O | 400% CPU quota (capped to host capacity), CPU weight 10, I/O weight 10, and nice level 10 |
 | systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, `ManagedOOMMemoryPressure`, and `ManagedOOMSwap` |
-| Failure behavior | `Restart=no` by default, so an OOM, driver failure, or refused preflight requires an explicit `systemctl start ollama` after the cause is resolved |
+| Failure behavior | `Restart=on-success` by default: unexpected clean daemon exits recover, while an OOM, driver failure, or refused preflight remains stopped until the cause is resolved and `systemctl start ollama` is run |
 
 These defaults are intentionally fail-closed. Ollama documents that parallel processing multiplies context allocation, so 32K context × 3 parallel requests can require roughly 96K tokens of context memory per loaded model. Ollama recommends UUIDs for NVIDIA and AMD selection because numeric ordering may vary. llama.cpp enables unified memory by the presence of `GGML_CUDA_ENABLE_UNIFIED_MEMORY`; the generated policy therefore removes it instead of assigning `0`. See Ollama's [concurrency and memory guidance](https://docs.ollama.com/faq), [GPU/backend guidance](https://docs.ollama.com/gpu), llama.cpp's [CUDA build/runtime guidance](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#unified-memory), and AMD's [ROCm isolation guidance](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/env_variables.html).
 
@@ -314,9 +328,9 @@ OLLAMA_SAFE_BACKEND=cuda \
 ./ollama-unify.sh
 ```
 
-Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no` or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`, and `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY` (`0` or `1`).
+Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no`, `on-success`, or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`, `OLLAMA_SAFE_POOL_ENABLED`, `OLLAMA_SAFE_POOL_MAX_SERVERS`, `OLLAMA_SAFE_POOL_PORT_START`, `OLLAMA_SAFE_POOL_INSTANCE_PARALLEL`, `OLLAMA_SAFE_POOL_IDLE_TIMEOUT`, `OLLAMA_SAFE_POOL_READY_TIMEOUT`, `OLLAMA_SAFE_POOL_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_POOL_HOST_RESERVE_MIB`, `OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT`, `OLLAMA_SAFE_POOL_OLLAMA_BINARY`, and `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY` (`0` or `1`).
 
-`OLLAMA_CONTEXT_LENGTH` is normally only a server default. When the negotiator proxy is installed, native Ollama API requests are clamped to the context ceiling derived by the hardware scan, and positive `num_gpu`/`main_gpu` overrides are replaced with automatic live fitting. Clients that bypass the proxy and contact the loopback backend directly can bypass those request-level checks; the one-model scheduler, PSI kill, hard cgroup boundary, and no-restart policy remain the final containment layer. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated manually and native cgroup containment is unavailable.
+`OLLAMA_CONTEXT_LENGTH` is normally only a server default. When the negotiator proxy is installed, native Ollama API requests are clamped to the context ceiling derived by the hardware scan, and positive `num_gpu`/`main_gpu` overrides are replaced with automatic live fitting. Clients that bypass the proxy and contact the loopback backend directly can bypass those request-level checks; the one-model scheduler, PSI kill, hard cgroup boundary, and failure-only stop policy remain the final containment layer. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated manually and native cgroup containment is unavailable.
 
 ## Common scenarios
 

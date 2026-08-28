@@ -44,6 +44,10 @@ agent_instructions=$(
   || { printf 'global agent instructions lack Docker discovery command\n' >&2; exit 1; }
 
 python3 -m py_compile "$test_tmp/ollama-unify-gpu-negotiator"
+python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
+  "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/fixtures/bin/ollama"
 "$test_tmp/ollama-unify-gpu-negotiator" self-test
 python3 "$repo_dir/tests/test-negotiator.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+python3 "$repo_dir/tests/test-negotiator-pool.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"

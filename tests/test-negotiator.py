@@ -13,9 +13,10 @@ import time
 
 class Backend(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, port=0):
+        super().__init__(("127.0.0.1", port), Handler)
         self.models = []
         self.requests = []
         self.lock = threading.Lock()
@@ -135,8 +136,10 @@ def main():
                 "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{backend.server_port}",
                 "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{proxy_port}",
                 "OLLAMA_UNIFY_SOCKET": socket_path,
+                "OLLAMA_UNIFY_LEASE_STATE": os.path.join(temp_dir, "leases.json"),
                 "OLLAMA_UNIFY_BACKEND_TYPE": "cuda",
                 "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
+                "OLLAMA_UNIFY_POOL_ENABLED": "0",
                 "OLLAMA_UNIFY_MAX_CONTEXT": "8192",
                 "OLLAMA_UNIFY_DRAIN_TIMEOUT": "3",
                 "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
@@ -213,6 +216,7 @@ def main():
                 timeout=10,
             )
             token = acquired.stdout.strip()
+            assert token.startswith("lease_")
             pending_status = control(socket_path, {"action": "status"})
             assert pending_status["leases"][0]["token"] == token
             assert pending_status["leases"][0]["state"] == "pending"
@@ -237,6 +241,43 @@ def main():
             )
             assert not blocked_error
 
+            daemon.terminate()
+            daemon.wait(timeout=5)
+            daemon = subprocess.Popen(
+                [helper, "serve"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if daemon.poll() is not None:
+                    raise RuntimeError(daemon.stderr.read())
+                if os.path.exists(socket_path):
+                    try:
+                        restored = control(socket_path, {"action": "status"})
+                        break
+                    except (ConnectionError, OSError):
+                        pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("negotiator did not recover after restart")
+            assert restored["leases"][0]["token"] == token
+            assert restored["leases"][0]["state"] == "active"
+
+            watcher = subprocess.Popen(
+                [helper, "heartbeat", token, "--watch", "--interval", "0.1"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            watching = json.loads(watcher.stdout.readline())
+            assert watching["watching"] is True
+            watcher.terminate()
+            watcher.wait(timeout=5)
+
             prepared = control(socket_path, {"action": "prepare", "token": token})
             assert prepared["lease"]["state"] == "pending"
             control(socket_path, {"action": "ready", "token": token})
@@ -245,7 +286,44 @@ def main():
             status = control(socket_path, {"action": "status"})
             assert status["leases"] == []
             assert status["draining"] is False
+            assert status["backend_available"] is True
             assert len(status["gpus"]) == 3
+
+            backend_port = backend.server_port
+            backend.shutdown()
+            backend.server_close()
+            dead_status = control(socket_path, {"action": "status"})
+            assert dead_status["backend_available"] is False
+            assert dead_status["backend_error"]
+            assert dead_status["models"] == []
+            dead_discovery = well_known(proxy_port)
+            assert dead_discovery["available"] is False
+            assert dead_discovery["backend_available"] is False
+
+            failed_acquire = subprocess.run(
+                [helper, "acquire", "--owner", "backend-down", "--vram-mib", "1"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert failed_acquire.returncode != 0
+            assert "backend unavailable" in failed_acquire.stderr.lower()
+
+            conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=2)
+            conn.request("GET", "/api/ps")
+            unavailable = conn.getresponse()
+            unavailable.read()
+            conn.close()
+            assert unavailable.status == 503
+
+            backend = Backend(backend_port)
+            backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+            backend_thread.start()
+            recovered_discovery = well_known(proxy_port)
+            assert recovered_discovery["available"] is True
+            assert recovered_discovery["backend_available"] is True
+            proxy_generate(proxy_port, 4096)
         finally:
             daemon.terminate()
             try:
@@ -258,7 +336,7 @@ def main():
             backend.shutdown()
             backend.server_close()
 
-    print("negotiator integration: PASS (proxy clamp, drain, lease, resize, release)")
+    print("negotiator integration: PASS (proxy clamp, drain, lease, backend liveness, recovery)")
 
 
 if __name__ == "__main__":

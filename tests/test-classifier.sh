@@ -127,7 +127,7 @@ assert_contains "$modern_systemd" 'ManagedOOMMemoryPressureLimit=20%'
 assert_contains "$modern_systemd" 'ManagedOOMSwap=kill'
 assert_contains "$modern_systemd" 'ExecCondition=/usr/local/libexec/ollama-unify-memory-preflight'
 assert_not_contains "$modern_systemd" 'ExecStartPre=/usr/local/libexec/ollama-unify-memory-preflight'
-assert_contains "$modern_systemd" 'Restart=no'
+assert_contains "$modern_systemd" 'Restart=on-success'
 
 override_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=16384 \
   OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT=35 OLLAMA_SAFE_CPU_QUOTA_PERCENT=200 \
@@ -138,6 +138,11 @@ assert_contains "$override_systemd" 'CPUQuota=200%'
 assert_contains "$override_systemd" 'CPUWeight=25'
 assert_contains "$override_systemd" 'IOWeight=30'
 assert_contains "$override_systemd" 'Restart=on-failure'
+
+clean_exit_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=16384 \
+  OLLAMA_SAFE_RESTART_POLICY=on-success \
+  bash -c 'source "$1"; build_safety_profile; SYSTEMD_VERSION=255; render_safety_service_directives' _ "$script")
+assert_contains "$clean_exit_systemd" 'Restart=on-success'
 
 if PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT=101 \
   "$script" --classify >/dev/null 2>&1; then
