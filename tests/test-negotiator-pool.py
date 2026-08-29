@@ -718,6 +718,59 @@ def test_fifo_queue_and_metrics(helper, fixture_bin):
         assert final_queue["wait_ms_max"] >= final_queue["wait_ms_mean"]
 
 
+def test_ready_model_bypasses_blocked_other_model(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=2, tags=[MODEL, OTHER_MODEL]
+    ) as harness:
+        assert harness.capacity(MODEL)[0] == 200
+        assert harness.capacity(OTHER_MODEL)[0] == 200
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            other_active = executor.submit(
+                chat, harness.proxy_port, OTHER_MODEL, "other-active", 1.5, 8
+            )
+            model_active = executor.submit(
+                chat, harness.proxy_port, MODEL, "model-active", 0.4, 8
+            )
+            wait_until(
+                lambda: {
+                    event.get("request_id")
+                    for event in request_events(harness.event_log)
+                } >= {"other-active", "model-active"},
+                "both model lanes to become active",
+            )
+
+            other_waiting = executor.submit(
+                chat, harness.proxy_port, OTHER_MODEL, "other-waiting", 0.05, 8
+            )
+            wait_until(
+                lambda: queue_with_depth(harness, 1),
+                "blocked other-model queue head",
+            )
+            model_waiting = executor.submit(
+                chat, harness.proxy_port, MODEL, "model-bypass", 0.05, 8
+            )
+            wait_until(
+                lambda: queue_with_depth(harness, 2),
+                "cross-model waiter behind blocked queue head",
+            )
+
+            assert model_active.result(timeout=2)[0] == 200
+            assert model_waiting.result(timeout=1)[0] == 200
+            assert other_active.result(timeout=3)[0] == 200
+            assert other_waiting.result(timeout=2)[0] == 200
+
+        request_ids = [
+            event["request_id"] for event in request_events(harness.event_log)
+        ]
+        assert request_ids.index("model-bypass") < request_ids.index("other-waiting")
+        assert not [event for event in events(harness.event_log)
+                    if event["kind"] == "stop"]
+        final_queue = harness.status()["parallel_pool"]["queue"]
+        assert final_queue["depth"] == 0
+        assert final_queue["timed_out_total"] == 0
+
+
 def test_queued_disconnect_is_cancelled(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
         status, capacity, _ = harness.capacity(MODEL)
@@ -845,6 +898,7 @@ def main():
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
+    test_ready_model_bypasses_blocked_other_model(helper, fixture_bin)
     test_queued_disconnect_is_cancelled(helper, fixture_bin)
     test_embedding_model_uses_embedding_warmup(helper, fixture_bin)
     test_permanent_failure_does_not_block_fifo(helper, fixture_bin)
@@ -853,7 +907,7 @@ def main():
     print(
         "negotiator pool integration: PASS "
         "(fit, endpoint-aware warm lanes, stable watcher, aliases, replacement, "
-        "FIFO, cancellation, terminal admission failures)"
+        "per-model FIFO, warm-lane bypass, cancellation, terminal admission failures)"
     )
 
 

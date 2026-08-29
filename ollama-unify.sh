@@ -1987,9 +1987,14 @@ class Broker:
                     overflow = max(
                         0, len(managed) + missing - POOL_MAX_SERVERS,
                     )
+                    queued_models = {
+                        waiter.model for waiter in self.waiters
+                        if waiter.model != model
+                    }
                     replaceable = sorted(
                         (lane for lane in managed
-                         if lane.model != model and lane.in_flight == 0),
+                         if lane.model != model and lane.in_flight == 0
+                         and lane.model not in queued_models),
                         key=lambda lane: (lane.last_used, lane.created_at),
                     )
                     if len(replaceable) < overflow:
@@ -2055,12 +2060,9 @@ class Broker:
                                 and lane.model != model
                                 and lane.in_flight == 0
                                 and lane.gpu_uuid in device_uuids
+                                and lane.model not in queued_models
                             ),
-                            key=lambda lane: (
-                                lane.model in queued_models,
-                                lane.last_used,
-                                lane.created_at,
-                            ),
+                            key=lambda lane: (lane.last_used, lane.created_at),
                         )
                         victim = replaceable[0] if replaceable else None
                         if victim is not None:
@@ -2209,11 +2211,19 @@ class Broker:
                     detail = f": {waiter.last_error}" if waiter.last_error else ""
                     raise TimeoutError(f"broker queue deadline expired{detail}")
                 self._prune_dead_lanes_locked()
-                if not self.draining and self.waiters and self.waiters[0] is waiter:
+                waiter_index = next(
+                    (index for index, item in enumerate(self.waiters)
+                     if item is waiter),
+                    -1,
+                )
+                next_for_model = waiter_index >= 0 and not any(
+                    item.model == model for item in self.waiters[:waiter_index]
+                )
+                if not self.draining and next_for_model:
                     lane = self._select_lane_locked(model, True)
                     if lane is not None:
                         waiter.phase = "generating"
-                        self.waiters.pop(0)
+                        self.waiters.pop(waiter_index)
                         queue_ms = max(
                             0, int((time.monotonic() - enqueued_at) * 1000)
                         )
