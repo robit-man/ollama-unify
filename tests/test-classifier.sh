@@ -46,6 +46,8 @@ assert_contains "$triple_cuda_output" 'Host memory: throttle at 50434 MiB; hard 
 assert_contains "$triple_cuda_output" 'MemoryHigh=50434M'
 assert_contains "$triple_cuda_output" 'MemoryMax=106217M'
 assert_contains "$triple_cuda_output" 'MemorySwapMax=0'
+assert_contains "$triple_cuda_output" 'ExecCondition=/usr/local/libexec/ollama-unify-memory-preflight 106217 20'
+assert_not_contains "$triple_cuda_output" 'ollama-unify-memory-preflight 183251 20'
 assert_contains "$triple_cuda_output" 'GPU policy: native live-VRAM placement; forced spread disabled'
 assert_contains "$triple_cuda_output" 'GPU negotiator: cooperative leases plus anonymous-process rebalance'
 assert_contains "$triple_cuda_output" 'OLLAMA_SCHED_SPREAD=0'

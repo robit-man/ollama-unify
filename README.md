@@ -108,7 +108,7 @@ Proceed? [N]: y
 - **Reactive anonymous-process yielding** — detects changes in non-Ollama CUDA process identities, drains Ollama, waits for foreign usage to settle, and reopens it for a fresh live-VRAM fit; this is best-effort because an undeclared process can fail its first allocation before userspace observes it
 - **Upgrade-safe pinning** — detects when an Ollama upgrade clears the pinned loopback backend and would drop the daemon back onto the negotiator's public port; `--check-update`, `--reconcile`, and `--update-ollama` repair the drift and cycle the proxy and backend in the only safe order, and an installed path-unit watchdog does the same for upgrades taken outside this script
 - **Measured host OOM containment** — sets `MemoryHigh` from the largest recent Ollama host-memory projection and `MemoryMax` from the larger of that projection or the largest installed inference payload; the unallocated host RAM is the result, not a target selected by the script
-- **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` is below the reserve or memory PSI is already unsafe
+- **Pressure-aware fail-closed startup** — installs a systemd condition that skips startup without marking the unit failed when `MemAvailable` cannot cover the service's complete `MemoryMax` budget or memory PSI is already unsafe
 - **Proactive pressure killing** — configures `systemd-oomd` to kill Ollama at sustained memory pressure or swap exhaustion before the host becomes unusable
 - **CPU and storage protection** — caps Ollama at four logical CPU cores by default and gives its CPU and I/O cgroups low weight, keeping interactive work responsive during cold loads
 - **Bounded scheduling** — defaults to one loaded model and one parallel request on every hardware shape, derives context and queue limits from effective RAM, and uses Flash Attention plus `q8_0` KV cache
@@ -309,7 +309,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | Request queue | 8, 16, or 64 according to effective RAM |
 | Idle retention | 5 minutes rather than indefinitely |
 | KV cache | Flash Attention plus `q8_0`, reducing cache growth compared with `f16` |
-| Start preflight | Refuses startup below the host-memory reserve or at/above 20% full memory PSI over 10 seconds |
+| Start preflight | Refuses startup when `MemAvailable` is below the service `MemoryMax` budget or at/above 20% full memory PSI over 10 seconds |
 | CPU and I/O | 400% CPU quota (capped to host capacity), CPU weight 10, I/O weight 10, and nice level 10 |
 | systemd containment | Version-gated `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `OOMPolicy`, `ManagedOOMMemoryPressure`, and `ManagedOOMSwap` |
 | Failure behavior | `Restart=on-success` by default: unexpected clean daemon exits recover, while an OOM, driver failure, or refused preflight remains stopped until the cause is resolved and `systemctl start ollama` is run |
