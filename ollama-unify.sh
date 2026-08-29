@@ -1028,6 +1028,9 @@ NATIVE_MODEL_PATHS = (
 INFERENCE_PATHS = NATIVE_MODEL_PATHS + (
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
 )
+SAFE_METADATA_PATHS = (
+    "/api/ps", "/api/tags", "/api/version", "/api/show", "/v1/models",
+)
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 
 
@@ -1869,7 +1872,8 @@ class Broker:
 
     def proxy_enter(self, model: str, routable: bool,
                     connected: Callable[[], bool] = lambda: True,
-                    request_id: str = "") -> Admission:
+                    request_id: str = "",
+                    allow_during_drain: bool = False) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         enqueued_at = time.monotonic()
@@ -1880,7 +1884,7 @@ class Broker:
                 if not connected():
                     raise ClientDisconnected("client disconnected before broker admission")
                 with self.cv:
-                    while self.draining:
+                    while self.draining and not allow_during_drain:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError("GPU negotiation is still draining Ollama")
@@ -2369,7 +2373,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             admission = None
             try:
                 admission = self.broker.proxy_enter(
-                    "", False, self._client_connected
+                    "", False, self._client_connected,
+                    allow_during_drain=True,
                 )
                 self._send_json(200, self.broker.aggregate_running_models())
             except ClientDisconnected:
@@ -2394,6 +2399,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
+                allow_during_drain=path in SAFE_METADATA_PATHS,
             )
         except ClientDisconnected:
             return

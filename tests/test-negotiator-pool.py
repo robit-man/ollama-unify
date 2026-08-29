@@ -369,6 +369,16 @@ def test_existing_pool_contract(helper, fixture_bin):
             ]["lanes"]
             assert len(remaining_lanes) == 1
             assert remaining_lanes[0]["kind"] == "system"
+            metadata_started = time.monotonic()
+            tags_status, tags, _ = http_json(proxy_port, "GET", "/api/tags")
+            assert tags_status == 200
+            assert tags["models"][0]["name"] == MODEL
+            pending_ps_status, pending_models, _ = http_json(
+                proxy_port, "GET", "/api/ps"
+            )
+            assert pending_ps_status == 200
+            assert pending_models == {"models": []}
+            assert time.monotonic() - metadata_started < 1
             control(socket_path, {"action": "ready", "token": token})
             control(socket_path, {"action": "release", "token": token})
 
