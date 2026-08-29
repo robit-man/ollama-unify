@@ -1014,7 +1014,7 @@ POOL_ENABLED = env_bool(
     "OLLAMA_UNIFY_POOL_ENABLED", BACKEND_TYPE == "cuda" and bool(SELECTED_GPUS)
 )
 POOL_MAX_SERVERS = env_int(
-    "OLLAMA_UNIFY_POOL_MAX_SERVERS", len(SELECTED_GPUS)
+    "OLLAMA_UNIFY_POOL_MAX_SERVERS", max(1, len(SELECTED_GPUS) * 2)
 )
 POOL_PORT_START = env_int("OLLAMA_UNIFY_POOL_PORT_START", BACKEND_PORT + 1)
 POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1))
@@ -2015,35 +2015,72 @@ class Broker:
                         f"{missing} new lane(s) reserve {required_host} MiB host memory, "
                         f"but only {available_host} MiB is available"
                     )
-                devices = [device for device in gpu_snapshot()
-                           if device.get("uuid") in SELECTED_GPUS
-                           and device.get("uuid") not in reserved]
-                virtual_free = {
-                    str(device.get("uuid") or ""):
-                        int(device.get("free_mib") or 0)
-                    for device in devices
-                }
                 placements: list[str] = []
-                for _ in range(missing):
-                    candidates = [
-                        (free_mib, gpu_uuid)
-                        for gpu_uuid, free_mib in virtual_free.items()
-                        if free_mib >= required_mib
-                    ]
-                    if not candidates:
-                        break
-                    _, chosen_uuid = max(candidates)
-                    placements.append(chosen_uuid)
-                    virtual_free[chosen_uuid] -= required_mib
-                if len(placements) < missing:
-                    free = sorted(
-                        (int(device.get("free_mib") or 0), str(device.get("uuid") or ""))
+                devices: list[dict[str, Any]] = []
+                while True:
+                    devices = [device for device in gpu_snapshot()
+                               if device.get("uuid") in SELECTED_GPUS
+                               and device.get("uuid") not in reserved]
+                    virtual_free = {
+                        str(device.get("uuid") or ""):
+                            int(device.get("free_mib") or 0)
                         for device in devices
-                    )
-                    raise CapacityError(
-                        f"model {model!r} requires {required_mib} MiB per lane; "
-                        f"only {len(placements)} of {missing} required lane placements fit "
-                        f"(free={free})"
+                    }
+                    placements = []
+                    for _ in range(missing):
+                        candidates = [
+                            (free_mib, gpu_uuid)
+                            for gpu_uuid, free_mib in virtual_free.items()
+                            if free_mib >= required_mib
+                        ]
+                        if not candidates:
+                            break
+                        _, chosen_uuid = max(candidates)
+                        placements.append(chosen_uuid)
+                        virtual_free[chosen_uuid] -= required_mib
+                    if len(placements) == missing:
+                        break
+
+                    device_uuids = set(virtual_free)
+                    with self.cv:
+                        self._prune_dead_lanes_locked()
+                        queued_models = {
+                            waiter.model for waiter in self.waiters
+                            if waiter.model != model
+                        }
+                        replaceable = sorted(
+                            (
+                                lane for lane in self.lanes.values()
+                                if lane.kind == "managed"
+                                and lane.model != model
+                                and lane.in_flight == 0
+                                and lane.gpu_uuid in device_uuids
+                            ),
+                            key=lambda lane: (
+                                lane.model in queued_models,
+                                lane.last_used,
+                                lane.created_at,
+                            ),
+                        )
+                        victim = replaceable[0] if replaceable else None
+                        if victim is not None:
+                            victim.retiring = True
+                            self.lanes.pop(victim.lane_id, None)
+                            self.cv.notify_all()
+                    if victim is None:
+                        free = sorted(
+                            (int(device.get("free_mib") or 0),
+                             str(device.get("uuid") or ""))
+                            for device in devices
+                        )
+                        raise CapacityError(
+                            f"model {model!r} requires {required_mib} MiB per lane; "
+                            f"only {len(placements)} of {missing} required lane "
+                            f"placements fit and no idle lane can be reclaimed "
+                            f"(free={free})"
+                        )
+                    self._stop_lanes(
+                        [victim], f"live VRAM reclamation for {model}",
                     )
                 created: list[Lane] = []
                 try:
@@ -3489,7 +3526,7 @@ install_gpu_negotiator() {
   ollama_binary="${OLLAMA_SAFE_POOL_OLLAMA_BINARY:-$(command -v ollama || true)}"
   [ -n "$ollama_binary" ] || ollama_binary="/usr/local/bin/ollama"
   pool_enabled="${OLLAMA_SAFE_POOL_ENABLED:-$([ "$SAFETY_BACKEND" = cuda ] && printf 1 || printf 0)}"
-  pool_max_servers="${OLLAMA_SAFE_POOL_MAX_SERVERS:-${#SAFETY_DEVICE_IDS[@]}}"
+  pool_max_servers="${OLLAMA_SAFE_POOL_MAX_SERVERS:-$(( ${#SAFETY_DEVICE_IDS[@]} * 2 ))}"
   backend_port="${SAFETY_OLLAMA_BACKEND##*:}"
   pool_port_start="${OLLAMA_SAFE_POOL_PORT_START:-$((backend_port + 1))}"
   pool_instance_parallel="${OLLAMA_SAFE_POOL_INSTANCE_PARALLEL:-1}"

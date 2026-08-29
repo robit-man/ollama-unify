@@ -204,11 +204,13 @@ def reset_connection(connection):
 
 
 class PoolHarness:
-    def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None):
+    def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
+                 runner_vram_mib=2048):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
         self.tags = tags or [MODEL]
+        self.runner_vram_mib = runner_vram_mib
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -216,6 +218,8 @@ class PoolHarness:
         self.socket_path = os.path.join(self.temp_dir, "control.sock")
         self.event_log = os.path.join(self.temp_dir, "events.jsonl")
         self.compute_apps = os.path.join(self.temp_dir, "compute-apps.csv")
+        self.gpu_usage_dir = os.path.join(self.temp_dir, "gpu-usage")
+        os.mkdir(self.gpu_usage_dir)
         write_compute_apps(self.compute_apps, [])
         self.backend = Backend(self.tags)
         threading.Thread(target=self.backend.serve_forever, daemon=True).start()
@@ -227,6 +231,8 @@ class PoolHarness:
             "MOCK_PROFILE": "cuda_triple",
             "MOCK_OLLAMA_EVENT_LOG": self.event_log,
             "MOCK_NVIDIA_COMPUTE_APPS_FILE": self.compute_apps,
+            "MOCK_OLLAMA_GPU_USAGE_DIR": self.gpu_usage_dir,
+            "MOCK_OLLAMA_VRAM_MIB": str(self.runner_vram_mib),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{self.backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{self.proxy_port}",
             "OLLAMA_UNIFY_SOCKET": self.socket_path,
@@ -611,6 +617,36 @@ def test_idle_lane_replacement(helper, fixture_bin):
         assert lanes[0]["model"] == OTHER_MODEL
 
 
+def test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin):
+    model_size = 60 * 1024**3
+    tags = [
+        {"name": MODEL, "model": MODEL, "size": model_size,
+         "capabilities": ["completion"]},
+        {"name": OTHER_MODEL, "model": OTHER_MODEL, "size": model_size,
+         "capabilities": ["completion"]},
+    ]
+    required_mib = (model_size // (1024 * 1024)) + 1024
+    with PoolHarness(
+        helper, fixture_bin, max_servers=6, tags=tags,
+        runner_vram_mib=required_mib,
+    ) as harness:
+        status, first_capacity, _ = harness.capacity(MODEL, parallel=3)
+        assert status == 200, first_capacity
+        assert len(first_capacity["lanes"]) == 3
+
+        status, payload, _ = chat(
+            harness.proxy_port, OTHER_MODEL, "vram-reclamation", timeout=10
+        )
+        assert status == 200, payload
+        observed = events(harness.event_log)
+        assert len([event for event in observed if event["kind"] == "start"]) == 4
+        assert len([event for event in observed if event["kind"] == "stop"]) == 1
+        lanes = managed_lanes(harness.status())
+        assert len(lanes) == 3
+        assert [lane["model"] for lane in lanes].count(MODEL) == 2
+        assert [lane["model"] for lane in lanes].count(OTHER_MODEL) == 1
+
+
 def test_lazy_parallel_scaling(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=3) as harness:
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
@@ -806,6 +842,7 @@ def main():
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
+    test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
     test_queued_disconnect_is_cancelled(helper, fixture_bin)

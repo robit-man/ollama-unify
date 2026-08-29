@@ -22,6 +22,27 @@ if sys.argv[1:] != ["serve"]:
 
 host, port = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434").rsplit(":", 1)
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+gpu_usage_dir = os.environ.get("MOCK_OLLAMA_GPU_USAGE_DIR", "")
+gpu_usage_mib = int(os.environ.get("MOCK_OLLAMA_VRAM_MIB", "2048"))
+gpu_usage_path = (
+    os.path.join(gpu_usage_dir, f"{os.getpid()}.csv") if gpu_usage_dir else ""
+)
+
+
+def set_gpu_usage(loaded):
+    if not gpu_usage_path:
+        return
+    os.makedirs(gpu_usage_dir, exist_ok=True)
+    if loaded:
+        replacement = gpu_usage_path + ".new"
+        with open(replacement, "w", encoding="utf-8") as stream:
+            stream.write(f"{gpu},{gpu_usage_mib}\n")
+        os.replace(replacement, gpu_usage_path)
+    else:
+        try:
+            os.unlink(gpu_usage_path)
+        except FileNotFoundError:
+            pass
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -94,8 +115,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             if payload.get("keep_alive") == 0:
                 self.server.models = []
+                set_gpu_usage(False)
             elif model:
                 self.server.models = [{"name": model, "size_vram": 1024}]
+                set_gpu_usage(True)
         self.send_json({"done": True, "model": model, "gpu": gpu, "pid": os.getpid()})
 
     def log_message(self, _fmt, *_args):
@@ -116,4 +139,5 @@ try:
     server.serve_forever()
 finally:
     server.server_close()
+    set_gpu_usage(False)
     emit("stop", host=f"{host}:{port}", gpu=gpu)

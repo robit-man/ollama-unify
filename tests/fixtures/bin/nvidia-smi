@@ -8,10 +8,24 @@ fi
 case "$*" in
   *--query-gpu=uuid,memory.total,memory.used,memory.free*)
     if [ "$MOCK_PROFILE" = "cuda_triple" ]; then
-      printf '%s\n' \
-        'GPU-large-0, 81920, 1024, 80896' \
-        'GPU-large-1, 81920, 2048, 79872' \
-        'GPU-large-2, 81920, 3072, 78848'
+      for row in \
+        'GPU-large-0,81920,1024,80896' \
+        'GPU-large-1,81920,2048,79872' \
+        'GPU-large-2,81920,3072,78848'; do
+        IFS=, read -r gpu_uuid total_mib base_used_mib base_free_mib <<<"$row"
+        runner_used_mib=0
+        if [ -n "${MOCK_OLLAMA_GPU_USAGE_DIR:-}" ] \
+          && [ -d "$MOCK_OLLAMA_GPU_USAGE_DIR" ]; then
+          runner_used_mib=$(awk -F, -v wanted="$gpu_uuid" \
+            '$1 == wanted { total += $2 } END { print total + 0 }' \
+            "$MOCK_OLLAMA_GPU_USAGE_DIR"/*.csv 2>/dev/null || printf 0)
+        fi
+        used_mib=$((base_used_mib + runner_used_mib))
+        free_mib=$((base_free_mib - runner_used_mib))
+        [ "$free_mib" -ge 0 ] || free_mib=0
+        printf '%s, %s, %s, %s\n' \
+          "$gpu_uuid" "$total_mib" "$used_mib" "$free_mib"
+      done
     else
       printf '%s\n' 'GPU-dedicated, 24576, 1024, 23552'
     fi
