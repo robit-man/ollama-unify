@@ -1979,12 +1979,25 @@ class Broker:
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 required_mib, capabilities = self._model_profile(model)
+                inventory = gpu_snapshot()
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
                                if lane.kind == "managed"]
                     missing = desired_servers - len(existing)
-                    overflow = max(0, len(managed) + missing - POOL_MAX_SERVERS)
+                    reserved = self._reserved_gpus_locked()
+                    usable_gpu_count = sum(
+                        1 for device in inventory
+                        if device.get("uuid") in SELECTED_GPUS
+                        and device.get("uuid") not in reserved
+                    )
+                    configured_overflow = max(
+                        0, len(managed) + missing - POOL_MAX_SERVERS,
+                    )
+                    hardware_overflow = max(
+                        0, len(managed) + missing - usable_gpu_count,
+                    )
+                    overflow = max(configured_overflow, hardware_overflow)
                     replaceable = sorted(
                         (lane for lane in managed
                          if lane.model != model and lane.in_flight == 0),
@@ -1992,7 +2005,7 @@ class Broker:
                     )
                     if len(replaceable) < overflow:
                         raise CapacityError(
-                            "managed Ollama lane limit reached; no idle lane can be replaced"
+                            "managed Ollama lane capacity reached; no idle lane can be replaced"
                         )
                     retired = replaceable[:overflow]
                     for lane in retired:

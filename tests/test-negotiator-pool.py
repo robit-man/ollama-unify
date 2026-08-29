@@ -431,7 +431,9 @@ def test_existing_pool_contract(helper, fixture_bin):
 
 
 def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin):
-    with PoolHarness(helper, fixture_bin, max_servers=3) as harness:
+    with PoolHarness(
+        helper, fixture_bin, max_servers=3, tags=[MODEL, OTHER_MODEL],
+    ) as harness:
         acquired = control(harness.socket_path, {
             "action": "acquire",
             "owner": "scoped-fixture",
@@ -459,6 +461,21 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
                   if event["kind"] == "start"]
         assert starts
         assert all(event["gpu"] == "GPU-large-2" for event in starts)
+
+        status, payload, headers = chat(
+            harness.proxy_port, OTHER_MODEL, "replace-on-only-free-gpu", timeout=10
+        )
+        assert status == 200, payload
+        assert headers["X-Ollama-Unify-Lane"].startswith("lane-")
+        replacement = managed_lanes(harness.status())
+        assert len(replacement) == 1
+        assert replacement[0]["model"] == OTHER_MODEL
+        assert replacement[0]["gpu_uuid"] == "GPU-large-2"
+        lifecycle = events(harness.event_log)
+        assert any(event["kind"] == "stop" for event in lifecycle)
+        assert [
+            event["gpu"] for event in lifecycle if event["kind"] == "start"
+        ] == ["GPU-large-2", "GPU-large-2"]
 
         control(harness.socket_path, {"action": "ready", "token": token})
         released = control(
