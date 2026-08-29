@@ -322,6 +322,13 @@ def test_existing_pool_contract(helper, fixture_bin):
         )
         try:
             wait_ready(daemon, socket_path, proxy_port)
+            discovery_status, discovery, _ = http_json(
+                proxy_port, "GET",
+                "/.well-known/ollama-unify-gpu-negotiator",
+            )
+            assert discovery_status == 200, discovery
+            assert discovery["parallel_pool"]["private_port_start"] == pool_port
+            assert discovery["parallel_pool"]["private_port_end"] == pool_port + 31
             status, capacity, _ = http_json(
                 proxy_port, "POST",
                 "/.well-known/ollama-unify-gpu-negotiator/capacity",

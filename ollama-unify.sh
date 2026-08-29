@@ -1325,6 +1325,8 @@ def discovery_document() -> dict[str, Any]:
         "parallel_pool": {
             "enabled": POOL_ENABLED,
             "max_managed_servers": POOL_MAX_SERVERS,
+            "private_port_start": POOL_PORT_START,
+            "private_port_end": POOL_PORT_START + max(32, POOL_MAX_SERVERS + 4) - 1,
             "instance_parallel": POOL_INSTANCE_PARALLEL,
             "idle_timeout_seconds": POOL_IDLE_TIMEOUT,
             "load_timeout_seconds": POOL_LOAD_TIMEOUT,
