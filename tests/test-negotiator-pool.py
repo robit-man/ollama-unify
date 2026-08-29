@@ -468,11 +468,11 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
         assert status == 200, payload
         assert headers["X-Ollama-Unify-Lane"].startswith("lane-")
         replacement = managed_lanes(harness.status())
-        assert len(replacement) == 1
-        assert replacement[0]["model"] == OTHER_MODEL
-        assert replacement[0]["gpu_uuid"] == "GPU-large-2"
+        assert len(replacement) == 2
+        assert {lane["model"] for lane in replacement} == {MODEL, OTHER_MODEL}
+        assert {lane["gpu_uuid"] for lane in replacement} == {"GPU-large-2"}
         lifecycle = events(harness.event_log)
-        assert any(event["kind"] == "stop" for event in lifecycle)
+        assert not any(event["kind"] == "stop" for event in lifecycle)
         assert [
             event["gpu"] for event in lifecycle if event["kind"] == "start"
         ] == ["GPU-large-2", "GPU-large-2"]

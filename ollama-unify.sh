@@ -1979,25 +1979,14 @@ class Broker:
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 required_mib, capabilities = self._model_profile(model)
-                inventory = gpu_snapshot()
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
                                if lane.kind == "managed"]
                     missing = desired_servers - len(existing)
-                    reserved = self._reserved_gpus_locked()
-                    usable_gpu_count = sum(
-                        1 for device in inventory
-                        if device.get("uuid") in SELECTED_GPUS
-                        and device.get("uuid") not in reserved
-                    )
-                    configured_overflow = max(
+                    overflow = max(
                         0, len(managed) + missing - POOL_MAX_SERVERS,
                     )
-                    hardware_overflow = max(
-                        0, len(managed) + missing - usable_gpu_count,
-                    )
-                    overflow = max(configured_overflow, hardware_overflow)
                     replaceable = sorted(
                         (lane for lane in managed
                          if lane.model != model and lane.in_flight == 0),
@@ -2017,9 +2006,6 @@ class Broker:
                     self._stop_lanes(retired, f"idle lane replacement for {model}")
                 with self.cv:
                     self._prune_dead_lanes_locked()
-                    managed = [lane for lane in self.lanes.values()
-                               if lane.kind == "managed"]
-                    assigned = {lane.gpu_uuid for lane in managed if lane.gpu_uuid}
                     reserved = self._reserved_gpus_locked()
                 host = host_memory_snapshot()
                 available_host = int(host.get("memavailable_mib") or 0)
@@ -2031,28 +2017,39 @@ class Broker:
                     )
                 devices = [device for device in gpu_snapshot()
                            if device.get("uuid") in SELECTED_GPUS
-                           and device.get("uuid") not in assigned
                            and device.get("uuid") not in reserved]
-                fitting = sorted(
-                    (device for device in devices
-                     if int(device.get("free_mib") or 0) >= required_mib),
-                    key=lambda device: int(device["free_mib"]), reverse=True,
-                )
-                if len(fitting) < missing:
+                virtual_free = {
+                    str(device.get("uuid") or ""):
+                        int(device.get("free_mib") or 0)
+                    for device in devices
+                }
+                placements: list[str] = []
+                for _ in range(missing):
+                    candidates = [
+                        (free_mib, gpu_uuid)
+                        for gpu_uuid, free_mib in virtual_free.items()
+                        if free_mib >= required_mib
+                    ]
+                    if not candidates:
+                        break
+                    _, chosen_uuid = max(candidates)
+                    placements.append(chosen_uuid)
+                    virtual_free[chosen_uuid] -= required_mib
+                if len(placements) < missing:
                     free = sorted(
                         (int(device.get("free_mib") or 0), str(device.get("uuid") or ""))
                         for device in devices
                     )
                     raise CapacityError(
                         f"model {model!r} requires {required_mib} MiB per lane; "
-                        f"only {len(fitting)} of {missing} required unassigned selected GPUs fit "
+                        f"only {len(placements)} of {missing} required lane placements fit "
                         f"(free={free})"
                     )
                 created: list[Lane] = []
                 try:
-                    for chosen in fitting[:missing]:
+                    for chosen_uuid in placements:
                         created.append(self._spawn_lane(
-                            model, str(chosen["uuid"]), required_mib,
+                            model, chosen_uuid, required_mib,
                             capabilities, request_path,
                         ))
                 except Exception:
