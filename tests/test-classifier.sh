@@ -42,12 +42,12 @@ triple_cuda_output=$(PATH="$test_path" MOCK_PROFILE=cuda_triple OLLAMA_SAFE_EFFE
 assert_contains "$triple_cuda_output" 'Aggregate dedicated device memory: 245760 MiB across 3 accelerator(s); 84% of host RAM'
 assert_contains "$triple_cuda_output" 'Model scan: largest installed inference payload 106217 MiB (explicit override)'
 assert_contains "$triple_cuda_output" 'Ollama history: largest observed host projection 50434 MiB'
-assert_contains "$triple_cuda_output" 'Host memory: throttle at 50434 MiB; hard cap at 106217 MiB; 183251 MiB remains outside the cgroup'
+assert_contains "$triple_cuda_output" 'Host memory: 2048 MiB startup headroom; throttle at 50434 MiB; hard cap at 106217 MiB; 183251 MiB remains outside the cgroup'
 assert_contains "$triple_cuda_output" 'MemoryHigh=50434M'
 assert_contains "$triple_cuda_output" 'MemoryMax=106217M'
 assert_contains "$triple_cuda_output" 'MemorySwapMax=0'
-assert_contains "$triple_cuda_output" 'ExecCondition=/usr/local/libexec/ollama-unify-memory-preflight 106217 20'
-assert_not_contains "$triple_cuda_output" 'ollama-unify-memory-preflight 183251 20'
+assert_contains "$triple_cuda_output" 'ExecCondition=/usr/local/libexec/ollama-unify-memory-preflight 2048 20'
+assert_not_contains "$triple_cuda_output" 'ollama-unify-memory-preflight 106217 20'
 assert_contains "$triple_cuda_output" 'GPU policy: native live-VRAM placement; forced spread disabled'
 assert_contains "$triple_cuda_output" 'GPU negotiator: cooperative leases plus anonymous-process rebalance'
 assert_contains "$triple_cuda_output" 'OLLAMA_SCHED_SPREAD=0'
@@ -65,7 +65,7 @@ mixed_cuda_output=$(PATH="$test_path" MOCK_PROFILE=cuda_mixed OLLAMA_SAFE_EFFECT
   OLLAMA_SAFE_LARGEST_MODEL_MIB=106217 OLLAMA_SAFE_OBSERVED_HOST_MIB=50434 \
   "$script" --safety-preview)
 assert_contains "$mixed_cuda_output" 'Aggregate dedicated device memory: 131072 MiB across 2 accelerator(s); 66% of host RAM'
-assert_contains "$mixed_cuda_output" 'Host memory: throttle at 50434 MiB; hard cap at 106217 MiB; 90391 MiB remains outside the cgroup'
+assert_contains "$mixed_cuda_output" 'Host memory: 2048 MiB startup headroom; throttle at 50434 MiB; hard cap at 106217 MiB; 90391 MiB remains outside the cgroup'
 
 display_output=$(PATH="$test_path" MOCK_PROFILE=cuda_display OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=32768 "$script" --safety-preview)
 assert_contains "$display_output" 'Backend: cuda (shared-display)'
@@ -114,7 +114,7 @@ legacy_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY
 assert_not_contains "$legacy_systemd" 'MemoryMax='
 assert_not_contains "$legacy_systemd" 'OOMPolicy='
 assert_not_contains "$legacy_systemd" 'ManagedOOMMemoryPressure='
-assert_contains "$legacy_systemd" 'ExecStartPre=/usr/local/libexec/ollama-unify-memory-preflight 4096 20'
+assert_contains "$legacy_systemd" 'ExecStartPre=/usr/local/libexec/ollama-unify-memory-preflight 2048 20'
 assert_not_contains "$legacy_systemd" 'ollama-unify-memory-preflight 12288 20'
 
 modern_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=16384 \
@@ -161,7 +161,7 @@ measured_output=$(env -u OLLAMA_SAFE_LARGEST_MODEL_MIB PATH="$test_path" MOCK_PR
   OLLAMA_SAFE_MODEL_STORE="$model_fixture" OLLAMA_SAFE_OBSERVED_HOST_MIB=512 \
   OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=8192 "$script" --classify)
 assert_contains "$measured_output" 'Model scan: largest installed inference payload 3072 MiB'
-assert_contains "$measured_output" 'Host memory: throttle at 512 MiB; hard cap at 3072 MiB; 5120 MiB remains outside the cgroup'
+assert_contains "$measured_output" 'Host memory: 2048 MiB startup headroom; throttle at 512 MiB; hard cap at 3072 MiB; 5120 MiB remains outside the cgroup'
 
 empty_fixture=$(mktemp -d)
 mkdir -p "$empty_fixture/manifests"
@@ -177,7 +177,7 @@ trap 'rm -f "$preflight_script"; rm -rf "$model_fixture" "$empty_fixture"' EXIT
 bash -c 'source "$1"; render_safety_preflight_script' _ "$script" > "$preflight_script"
 chmod +x "$preflight_script"
 if "$preflight_script" 999999999 20 >/dev/null 2>&1; then
-  printf 'FAIL: memory preflight accepted an impossible MemoryMax budget\n' >&2
+  printf 'FAIL: memory preflight accepted impossible startup headroom\n' >&2
   exit 1
 else
   preflight_status=$?
@@ -185,6 +185,10 @@ else
     printf 'FAIL: memory preflight returned %s instead of 75\n' "$preflight_status" >&2
     exit 1
   fi
+fi
+if ! "$preflight_script" 1 100 >/dev/null 2>&1; then
+  printf 'FAIL: memory preflight rejected bounded empty-daemon headroom\n' >&2
+  exit 1
 fi
 
 printf 'classifier fixtures: PASS (CUDA dedicated/display, ROCm, Vulkan, Metal, CPU)\n'
