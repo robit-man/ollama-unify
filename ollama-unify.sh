@@ -1026,6 +1026,7 @@ HOP_HEADERS = {
 NATIVE_MODEL_PATHS = (
     "/api/generate", "/api/chat", "/api/embed", "/api/embeddings", "/api/rerank",
 )
+EMBEDDING_PATHS = ("/api/embed", "/api/embeddings", "/v1/embeddings")
 INFERENCE_PATHS = NATIVE_MODEL_PATHS + (
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
 )
@@ -1042,6 +1043,17 @@ def canonical_model_tag(model: str) -> str:
         return ""
     leaf = model.rsplit("/", 1)[-1]
     return model if ":" in leaf else f"{model}:latest"
+
+
+class BackendHTTPError(RuntimeError):
+    def __init__(self, method: str, path: str, status: int, data: bytes) -> None:
+        self.method = method
+        self.path = path
+        self.status = status
+        self.data = data
+        super().__init__(
+            f"Ollama backend {method} {path} returned {status}: {data[:300]!r}"
+        )
 
 
 def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
@@ -1081,7 +1093,7 @@ def backend_json_at(host: str, port: int, method: str, path: str,
         response = conn.getresponse()
         data = response.read()
         if response.status >= 400:
-            raise RuntimeError(f"Ollama backend {method} {path} returned {response.status}: {data[:300]!r}")
+            raise BackendHTTPError(method, path, response.status, data)
         return json.loads(data or b"{}")
     finally:
         conn.close()
@@ -1128,12 +1140,25 @@ def unload_models_at(host: str, port: int, timeout: float = UNLOAD_TIMEOUT,
     names = [str(model.get("name") or model.get("model") or "") for model in models]
     names = [name for name in names if name]
     for name in names:
-        try:
-            backend_json_at(host, port, "POST", "/api/generate", {
-                "model": name, "keep_alive": 0, "stream": False,
-            }, timeout=min(timeout, 30.0))
-        except (OSError, RuntimeError, ValueError) as exc:
-            LOG.warning("unload request failed for %s: %s", name, exc)
+        attempts = (
+            ("/api/generate", {"model": name, "keep_alive": 0, "stream": False}),
+            ("/api/embed", {"model": name, "input": "", "keep_alive": 0}),
+            ("/api/embeddings", {"model": name, "prompt": "", "keep_alive": 0}),
+        )
+        for attempt, (path, payload) in enumerate(attempts, 1):
+            try:
+                backend_json_at(
+                    host, port, "POST", path, payload, timeout=min(timeout, 30.0)
+                )
+                break
+            except BackendHTTPError as exc:
+                if exc.status in (400, 404, 405) and attempt < len(attempts):
+                    continue
+                LOG.warning("unload request failed for %s: %s", name, exc)
+                break
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.warning("unload request failed for %s: %s", name, exc)
+                break
 
     deadline = time.monotonic() + timeout
     while names and time.monotonic() < deadline:
@@ -1401,6 +1426,12 @@ class CapacityError(RuntimeError):
     pass
 
 
+class PermanentCapacityError(CapacityError):
+    def __init__(self, message: str, status: int = 503) -> None:
+        self.status = status
+        super().__init__(message)
+
+
 class ClientDisconnected(ConnectionError):
     pass
 
@@ -1412,14 +1443,18 @@ class QueuedRequest:
     enqueued_at: float
     deadline: float
     connected: Callable[[], bool]
+    request_path: str = ""
     phase: str = "queued"
     initial_position: int = 1
     last_error: str | None = None
+    terminal_error: str | None = None
+    terminal_status: int | None = None
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
             "model": self.model,
+            "request_path": self.request_path or None,
             "position": position,
             "phase": self.phase,
             "wait_ms": max(0, int((now - self.enqueued_at) * 1000)),
@@ -1453,6 +1488,7 @@ class Broker:
         self.queue_admitted_total = 0
         self.queue_cancelled_total = 0
         self.queue_timed_out_total = 0
+        self.queue_rejected_total = 0
         self.queue_wait_ms_total = 0
         self.queue_wait_ms_max = 0
         self.queue_peak = 0
@@ -1544,6 +1580,7 @@ class Broker:
             "admitted_total": self.queue_admitted_total,
             "cancelled_total": self.queue_cancelled_total,
             "timed_out_total": self.queue_timed_out_total,
+            "rejected_total": self.queue_rejected_total,
             "wait_ms_total": self.queue_wait_ms_total,
             "wait_ms_max": self.queue_wait_ms_max,
             "wait_ms_mean": (
@@ -1579,7 +1616,7 @@ class Broker:
             return None
         return base if base.in_flight < base.parallel else None
 
-    def _model_requirement_mib(self, model: str) -> int:
+    def _model_profile(self, model: str) -> tuple[int, set[str]]:
         model = canonical_model_tag(model)
         tags = backend_json("GET", "/api/tags", timeout=10.0).get("models", [])
         if not isinstance(tags, list):
@@ -1594,15 +1631,55 @@ class Broker:
                 match = item
                 break
         if match is None:
-            raise CapacityError(f"model {model!r} is not installed on the managed Ollama store")
+            raise PermanentCapacityError(
+                f"model {model!r} is not installed on the managed Ollama store", 404
+            )
         try:
             size_bytes = int(match.get("size") or 0)
         except (TypeError, ValueError):
             size_bytes = 0
         if size_bytes <= 0:
-            raise CapacityError(f"model {model!r} has no local size metadata")
+            raise PermanentCapacityError(
+                f"model {model!r} has no local size metadata", 422
+            )
         model_mib = math.ceil(size_bytes / (1024 * 1024))
-        return math.ceil(model_mib * POOL_MODEL_OVERHEAD_PERCENT / 100) + POOL_VRAM_RESERVE_MIB
+        capabilities = match.get("capabilities")
+        if not isinstance(capabilities, list):
+            capabilities = []
+        return (
+            math.ceil(model_mib * POOL_MODEL_OVERHEAD_PERCENT / 100)
+            + POOL_VRAM_RESERVE_MIB,
+            {str(capability).lower() for capability in capabilities},
+        )
+
+    @staticmethod
+    def _warm_request(model: str, capabilities: set[str], request_path: str
+                      ) -> tuple[str, dict[str, Any]]:
+        keep_alive = f"{max(1, int(POOL_IDLE_TIMEOUT))}s"
+        if request_path in EMBEDDING_PATHS or (
+            not request_path and "embedding" in capabilities
+            and "completion" not in capabilities
+        ):
+            return "/api/embed", {
+                "model": model, "input": "warmup", "keep_alive": keep_alive,
+            }
+        if request_path == "/api/rerank" or (
+            not request_path and "reranking" in capabilities
+            and "completion" not in capabilities
+        ):
+            return "/api/rerank", {
+                "model": model,
+                "query": "warmup",
+                "documents": ["warmup"],
+                "keep_alive": keep_alive,
+            }
+        return "/api/generate", {
+            "model": model,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": keep_alive,
+            "options": {"num_predict": 0},
+        }
 
     def _available_port_locked(self) -> int:
         used = {lane.port for lane in self.lanes.values()}
@@ -1640,7 +1717,8 @@ class Broker:
             except subprocess.TimeoutExpired:
                 pass
 
-    def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int) -> Lane:
+    def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int,
+                    capabilities: set[str], request_path: str) -> Lane:
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise CapacityError(f"managed Ollama binary is not executable: {OLLAMA_BINARY}")
@@ -1701,13 +1779,13 @@ class Broker:
                         waiter.phase = "loading-model"
                         break
                 self.cv.notify_all()
-            backend_json_at("127.0.0.1", port, "POST", "/api/generate", {
-                "model": model,
-                "prompt": "",
-                "stream": False,
-                "keep_alive": f"{max(1, int(POOL_IDLE_TIMEOUT))}s",
-                "options": {"num_predict": 0},
-            }, timeout=POOL_LOAD_TIMEOUT)
+            warm_path, warm_payload = self._warm_request(
+                model, capabilities, request_path
+            )
+            backend_json_at(
+                "127.0.0.1", port, "POST", warm_path, warm_payload,
+                timeout=POOL_LOAD_TIMEOUT,
+            )
             resident = backend_json_at(
                 "127.0.0.1", port, "GET", "/api/ps", timeout=3.0
             ).get("models", [])
@@ -1720,8 +1798,12 @@ class Broker:
                 raise CapacityError(
                     f"managed Ollama lane did not make model {model!r} resident"
                 )
-        except Exception:
+        except Exception as exc:
             self._terminate_process(process)
+            if (isinstance(exc, BackendHTTPError)
+                    and 400 <= exc.status < 500
+                    and exc.status not in (408, 409, 425, 429)):
+                raise PermanentCapacityError(str(exc), exc.status) from exc
             raise
         now = time.time()
         lane = Lane(
@@ -1756,7 +1838,8 @@ class Broker:
         self._stop_lanes(lanes, reason)
         return [lane.lane_id for lane in lanes]
 
-    def ensure_capacity(self, model: str, parallel: int) -> dict[str, Any]:
+    def ensure_capacity(self, model: str, parallel: int,
+                        request_path: str = "") -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
             raise CapacityError("capacity request requires a model tag")
@@ -1778,7 +1861,7 @@ class Broker:
                             if lane.kind == "managed" and lane.model == model]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
-                required_mib = self._model_requirement_mib(model)
+                required_mib, capabilities = self._model_profile(model)
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
@@ -1837,7 +1920,8 @@ class Broker:
                 try:
                     for chosen in fitting[:missing]:
                         created.append(self._spawn_lane(
-                            model, str(chosen["uuid"]), required_mib
+                            model, str(chosen["uuid"]), required_mib,
+                            capabilities, request_path,
                         ))
                 except Exception:
                     with self.cv:
@@ -1874,7 +1958,8 @@ class Broker:
     def proxy_enter(self, model: str, routable: bool,
                     connected: Callable[[], bool] = lambda: True,
                     request_id: str = "",
-                    allow_during_drain: bool = False) -> Admission:
+                    allow_during_drain: bool = False,
+                    request_path: str = "") -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         enqueued_at = time.monotonic()
@@ -1907,6 +1992,7 @@ class Broker:
         with self.cv:
             waiter = QueuedRequest(
                 request_id, model, enqueued_at, deadline, connected,
+                request_path=request_path,
                 initial_position=len(self.waiters) + 1,
             )
             self.waiters.append(waiter)
@@ -1916,11 +2002,21 @@ class Broker:
         while True:
             if not connected():
                 with self.cv:
+                    if waiter.terminal_error:
+                        raise PermanentCapacityError(
+                            waiter.terminal_error, waiter.terminal_status or 503
+                        )
+                    if waiter not in self.waiters:
+                        continue
                     waiter.phase = "cancelled"
                     self.queue_cancelled_total += 1
                     self._remove_waiter_locked(waiter)
                 raise ClientDisconnected("client disconnected while queued")
             with self.cv:
+                if waiter.terminal_error:
+                    raise PermanentCapacityError(
+                        waiter.terminal_error, waiter.terminal_status or 503
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     waiter.phase = "timed-out"
@@ -1984,7 +2080,7 @@ class Broker:
                 self.reconciling_model = model
                 self.cv.notify_all()
             try:
-                self.ensure_capacity(model, desired_parallel)
+                self.ensure_capacity(model, desired_parallel, waiter.request_path)
                 with self.cv:
                     self.reconcile_retry_at = 0.0
                     self.reconcile_last_error = ""
@@ -1992,6 +2088,21 @@ class Broker:
                     if waiter in self.waiters:
                         waiter.phase = "ready"
                     self.cv.notify_all()
+            except PermanentCapacityError as exc:
+                message = str(exc)
+                with self.cv:
+                    if waiter in self.waiters:
+                        waiter.phase = "failed"
+                        waiter.last_error = message
+                        waiter.terminal_error = message
+                        waiter.terminal_status = exc.status
+                        self.queue_rejected_total += 1
+                        self._remove_waiter_locked(waiter)
+                    self.reconcile_retry_at = 0.0
+                    self.reconcile_last_error = ""
+                    self.reconciling_model = None
+                    self.cv.notify_all()
+                LOG.error("managed capacity rejected model=%s: %s", model, message)
             except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
                 message = str(exc)
                 with self.cv:
@@ -2361,10 +2472,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 parallel = payload.get("parallel", 1)
                 if isinstance(parallel, bool) or not isinstance(parallel, int):
                     raise ValueError("parallel must be an integer")
+                endpoint = str(payload.get("endpoint") or "")
+                if endpoint and endpoint not in INFERENCE_PATHS:
+                    raise ValueError(
+                        "endpoint must be a supported Ollama inference path"
+                    )
                 result = self.broker.ensure_capacity(
-                    str(payload.get("model") or ""), parallel,
+                    str(payload.get("model") or ""), parallel, endpoint,
                 )
                 self._send_json(200, result)
+            except PermanentCapacityError as exc:
+                self._send_json(exc.status, {"ok": False, "error": str(exc)})
             except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
                 self._send_json(503, {"ok": False, "error": str(exc)})
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -2401,10 +2519,32 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
                 allow_during_drain=path in SAFE_METADATA_PATHS,
+                request_path=path,
             )
         except ClientDisconnected:
             return
         except TimeoutError as exc:
+            with self.broker.cv:
+                queue = self.broker._queue_summary_locked()
+            self._send_json(503, {
+                "error": str(exc),
+                "request_id": request_id,
+                "queue": queue,
+            }, {
+                "Retry-After": "2",
+                "X-Ollama-Unify-Request-Id": request_id,
+            })
+            return
+        except PermanentCapacityError as exc:
+            with self.broker.cv:
+                queue = self.broker._queue_summary_locked()
+            self._send_json(exc.status, {
+                "error": str(exc),
+                "request_id": request_id,
+                "queue": queue,
+            }, {"X-Ollama-Unify-Request-Id": request_id})
+            return
+        except (CapacityError, OSError, RuntimeError) as exc:
             with self.broker.cv:
                 queue = self.broker._queue_summary_locked()
             self._send_json(503, {

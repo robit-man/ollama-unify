@@ -16,6 +16,9 @@ import time
 MODEL = "fixture-small:latest"
 MODEL_WITHOUT_TAG = "fixture-small"
 OTHER_MODEL = "fixture-other:latest"
+EMBED_MODEL = "fixture-embed:latest"
+REJECT_MODEL = "fixture-reject:latest"
+RETRY_MODEL = "fixture-retry:latest"
 
 
 class Backend(http.server.ThreadingHTTPServer):
@@ -25,11 +28,18 @@ class Backend(http.server.ThreadingHTTPServer):
     def __init__(self, tags=None):
         super().__init__(("127.0.0.1", 0), Handler)
         self.models = []
-        names = tags or [MODEL]
-        self.tags = [
-            {"name": name, "model": name, "size": 1024**3}
-            for name in names
-        ]
+        names = tags if tags is not None else [MODEL]
+        self.tags = []
+        for item in names:
+            if isinstance(item, dict):
+                self.tags.append(dict(item))
+            else:
+                self.tags.append({
+                    "name": item,
+                    "model": item,
+                    "size": 1024**3,
+                    "capabilities": ["completion"],
+                })
         self.lock = threading.Lock()
 
 
@@ -160,6 +170,14 @@ def chat(port, model, request_id, delay=0, timeout=10):
     }, timeout=timeout)
 
 
+def embed(port, model, request_id, timeout=10):
+    return http_json(port, "POST", "/api/embed", {
+        "model": model,
+        "input": "fixture input",
+        "mock_request_id": request_id,
+    }, timeout=timeout)
+
+
 def open_abandonable_chat(port, model, request_id):
     payload = json.dumps({
         "model": model,
@@ -252,11 +270,14 @@ class PoolHarness:
     def status(self):
         return control(self.socket_path, {"action": "status"})
 
-    def capacity(self, model, parallel=1):
+    def capacity(self, model, parallel=1, endpoint=None):
+        payload = {"model": model, "parallel": parallel}
+        if endpoint is not None:
+            payload["endpoint"] = endpoint
         return http_json(
             self.proxy_port, "POST",
             "/.well-known/ollama-unify-gpu-negotiator/capacity",
-            {"model": model, "parallel": parallel},
+            payload,
         )
 
 
@@ -636,6 +657,84 @@ def test_queued_disconnect_is_cancelled(helper, fixture_bin):
         assert all(lane["in_flight"] == 0 for lane in managed_lanes(status))
 
 
+def test_embedding_model_uses_embedding_warmup(helper, fixture_bin):
+    tags = [{
+        "name": EMBED_MODEL,
+        "model": EMBED_MODEL,
+        "size": 1024**3,
+        "capabilities": ["embedding"],
+    }]
+    with PoolHarness(helper, fixture_bin, max_servers=1, tags=tags) as harness:
+        capacity_status, capacity, _ = harness.capacity(
+            EMBED_MODEL, endpoint="/api/embed"
+        )
+        assert capacity_status == 200, capacity
+        status, payload, headers = embed(
+            harness.proxy_port, EMBED_MODEL, "embedding-request", timeout=8
+        )
+        assert status == 200, payload
+        assert headers["X-Ollama-Unify-Lane"].startswith("lane-")
+        observed = [event for event in events(harness.event_log)
+                    if event["kind"] == "request"
+                    and event["model"] == EMBED_MODEL]
+        assert [event["path"] for event in observed] == [
+            "/api/embed", "/api/embed",
+        ]
+        assert observed[-1]["request_id"] == "embedding-request"
+
+
+def test_permanent_failure_does_not_block_fifo(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1, tags=[MODEL, REJECT_MODEL]
+    ) as harness:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            rejected = executor.submit(
+                chat, harness.proxy_port, REJECT_MODEL, "rejected-model", 0, 8
+            )
+            wait_until(
+                lambda: queue_with_depth(harness, 1),
+                "rejected model queue admission",
+            )
+            accepted = executor.submit(
+                chat, harness.proxy_port, MODEL, "after-missing", 0, 8
+            )
+            rejected_result = rejected.result(timeout=8)
+            accepted_result = accepted.result(timeout=8)
+        assert rejected_result[0] == 400, rejected_result
+        assert "does not support requested operation" in rejected_result[1]["error"]
+        assert accepted_result[0] == 200, accepted_result
+        queue = harness.status()["parallel_pool"]["queue"]
+        assert queue["depth"] == 0
+        assert queue["rejected_total"] == 1
+        assert queue["admitted_total"] == 1
+        assert queue["timed_out_total"] == 0
+
+
+def test_retryable_warm_failure_stays_queued(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1, tags=[RETRY_MODEL]) as harness:
+        status, payload, _ = chat(
+            harness.proxy_port, RETRY_MODEL, "after-retry", 0, 10
+        )
+        assert status == 200, payload
+        warm_attempts = [
+            event for event in events(harness.event_log)
+            if event["kind"] == "request"
+            and event["model"] == RETRY_MODEL
+            and event["request_id"] is None
+        ]
+        assert len(warm_attempts) == 2, warm_attempts
+        queue = harness.status()["parallel_pool"]["queue"]
+        assert queue["rejected_total"] == 0
+        assert queue["admitted_total"] == 1
+
+
+def test_capacity_rejects_unknown_endpoint(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        status, payload, _ = harness.capacity(MODEL, endpoint="/api/unknown")
+        assert status == 400, payload
+        assert "supported Ollama inference path" in payload["error"]
+
+
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
@@ -646,9 +745,14 @@ def main():
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
     test_queued_disconnect_is_cancelled(helper, fixture_bin)
+    test_embedding_model_uses_embedding_warmup(helper, fixture_bin)
+    test_permanent_failure_does_not_block_fifo(helper, fixture_bin)
+    test_retryable_warm_failure_stays_queued(helper, fixture_bin)
+    test_capacity_rejects_unknown_endpoint(helper, fixture_bin)
     print(
         "negotiator pool integration: PASS "
-        "(fit, warm lanes, stable watcher, aliases, replacement, FIFO, cancellation)"
+        "(fit, endpoint-aware warm lanes, stable watcher, aliases, replacement, "
+        "FIFO, cancellation, terminal admission failures)"
     )
 
 

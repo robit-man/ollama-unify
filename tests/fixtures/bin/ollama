@@ -61,6 +61,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         model = str(payload.get("model") or "")
         emit("request", host=f"{host}:{port}", gpu=gpu, path=self.path,
              model=model, request_id=payload.get("mock_request_id"))
+        if self.path == "/api/generate" and model.startswith("fixture-embed:"):
+            self.send_json({"error": f"{model!r} does not support generate"}, 400)
+            return
+        if (self.path == "/api/generate"
+                and model.startswith("fixture-reject:")
+                and payload.get("mock_request_id") is None):
+            time.sleep(0.15)
+            self.send_json(
+                {"error": f"{model!r} does not support requested operation"}, 400
+            )
+            return
+        if (self.path == "/api/generate"
+                and model.startswith("fixture-retry:")
+                and payload.get("mock_request_id") is None):
+            log_path = os.environ.get("MOCK_OLLAMA_EVENT_LOG")
+            warm_count = 0
+            if log_path and os.path.exists(log_path):
+                with open(log_path, encoding="utf-8") as stream:
+                    for line in stream:
+                        event = json.loads(line)
+                        if (event.get("kind") == "request"
+                                and event.get("model") == model
+                                and event.get("request_id") is None):
+                            warm_count += 1
+            if warm_count == 1:
+                self.send_json({"error": "retry later"}, 429)
+                return
         delay = float(payload.get("mock_delay") or 0)
         if delay > 0:
             time.sleep(delay)

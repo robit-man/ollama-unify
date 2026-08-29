@@ -114,7 +114,8 @@ legacy_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY
 assert_not_contains "$legacy_systemd" 'MemoryMax='
 assert_not_contains "$legacy_systemd" 'OOMPolicy='
 assert_not_contains "$legacy_systemd" 'ManagedOOMMemoryPressure='
-assert_contains "$legacy_systemd" 'ExecStartPre=/usr/local/libexec/ollama-unify-memory-preflight'
+assert_contains "$legacy_systemd" 'ExecStartPre=/usr/local/libexec/ollama-unify-memory-preflight 4096 20'
+assert_not_contains "$legacy_systemd" 'ollama-unify-memory-preflight 12288 20'
 
 modern_systemd=$(PATH="$test_path" MOCK_PROFILE=cpu OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=16384 \
   bash -c 'source "$1"; build_safety_profile; SYSTEMD_VERSION=255; render_safety_service_directives' _ "$script")
@@ -176,7 +177,7 @@ trap 'rm -f "$preflight_script"; rm -rf "$model_fixture" "$empty_fixture"' EXIT
 bash -c 'source "$1"; render_safety_preflight_script' _ "$script" > "$preflight_script"
 chmod +x "$preflight_script"
 if "$preflight_script" 999999999 20 >/dev/null 2>&1; then
-  printf 'FAIL: memory preflight accepted an impossible reserve\n' >&2
+  printf 'FAIL: memory preflight accepted an impossible MemoryMax budget\n' >&2
   exit 1
 else
   preflight_status=$?
