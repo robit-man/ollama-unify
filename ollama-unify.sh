@@ -948,6 +948,16 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_owner_gpu_scopes(name: str) -> dict[str, list[str]]:
+    scopes: dict[str, list[str]] = {}
+    for item in os.environ.get(name, "").split(";"):
+        owner, separator, values = item.partition("=")
+        gpu_uuids = [value.strip() for value in values.split(",") if value.strip()]
+        if separator and owner.strip() and gpu_uuids:
+            scopes[owner.strip()] = list(dict.fromkeys(gpu_uuids))
+    return scopes
+
+
 def load_environment_file(path: str) -> None:
     """Load the installer's simple quoted KEY=VALUE file for standalone CLI calls."""
     try:
@@ -996,6 +1006,7 @@ ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
 ANON_MAX_DRAIN = env_float("OLLAMA_UNIFY_ANON_MAX_DRAIN", 15.0)
 BACKEND_TYPE = os.environ.get("OLLAMA_UNIFY_BACKEND_TYPE", "unknown")
 SELECTED_GPUS = [value for value in os.environ.get("OLLAMA_UNIFY_SELECTED_GPUS", "").split(",") if value]
+OWNER_GPU_SCOPES = env_owner_gpu_scopes("OLLAMA_UNIFY_OWNER_GPU_SCOPES")
 LEASE_STATE_PATH = Path(os.environ.get(
     "OLLAMA_UNIFY_LEASE_STATE", "/var/lib/ollama-unify/leases.json"
 ))
@@ -1341,9 +1352,12 @@ def discovery_document() -> dict[str, Any]:
             "status": "docker gpu status",
             "cooperative_run": (
                 "docker gpu run --owner NAME --vram-mib MIB "
+                "--gpu GPU_UUID "
                 "--ready-command 'READINESS_CHECK' -- COMMAND"
             ),
-            "manual": ["acquire", "ready", "prepare", "release", "heartbeat"],
+            "manual": [
+                "acquire", "scope", "ready", "prepare", "release", "heartbeat",
+            ],
             "request_capacity": (
                 f"POST {CAPACITY_PATH} with JSON {{\"model\":\"TAG\",\"parallel\":N}}"
             ),
@@ -1351,6 +1365,9 @@ def discovery_document() -> dict[str, Any]:
         "requirements": {
             "cuda_deployments": (
                 "Acquire a lease before loading CUDA models; signal ready only after GPU allocation is resident."
+            ),
+            "scoped_leases": (
+                "Use repeated --gpu UUID options and give the child exactly those UUIDs in CUDA_VISIBLE_DEVICES; unreserved GPUs remain available to Ollama."
             ),
             "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
             "release": "Free external CUDA allocations before releasing the lease.",
@@ -1368,7 +1385,7 @@ def discovery_document() -> dict[str, Any]:
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --ready-command 'CHECK' -- COMMAND`. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use `acquire`, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n5. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`); every selected GPU remains available to the scheduler.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. A scoped lease keeps unreserved GPUs available to broker-owned Ollama lanes. An unscoped lease uses a host-wide drain because placement cannot be proven.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_at_or_below(baseline: dict[str, int],
@@ -1408,6 +1425,7 @@ class Lease:
     transition_started_at: float
     ttl: int
     foreign_baseline: dict[str, int] | None
+    gpu_uuids: list[str]
 
 
 @dataclass
@@ -1498,7 +1516,7 @@ class Broker:
         self.transition = threading.Lock()
         self.leases = self._load_leases()
         self.draining = any(
-            lease.state in ("pending", "revoking")
+            lease.state in ("pending", "revoking") and not lease.gpu_uuids
             for lease in self.leases.values()
         )
         self.active_requests = 0
@@ -1562,6 +1580,10 @@ class Broker:
                     created_at=created_at, heartbeat_at=float(raw["heartbeat_at"]),
                     transition_started_at=transition_started_at,
                     ttl=max(0, int(raw["ttl"])), foreign_baseline=baseline,
+                    gpu_uuids=[
+                        str(value) for value in raw.get("gpu_uuids", [])
+                        if isinstance(value, str)
+                    ] if isinstance(raw.get("gpu_uuids", []), list) else [],
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1596,6 +1618,55 @@ class Broker:
         for lane_id in dead:
             lane = self.lanes.pop(lane_id)
             LOG.warning("managed Ollama lane stopped unexpectedly: %s", lane.lane_id)
+
+    def _reserved_gpus_locked(self) -> set[str]:
+        return {
+            gpu_uuid
+            for lease in self.leases.values()
+            for gpu_uuid in lease.gpu_uuids
+            if lease.state in ("pending", "active", "revoking")
+        }
+
+    def _global_transition_lease_locked(self) -> Lease | None:
+        return next(
+            (
+                lease for lease in self.leases.values()
+                if lease.state in ("pending", "revoking")
+                and not lease.gpu_uuids
+            ),
+            None,
+        )
+
+    def _plan_lease_gpus(
+        self, requested_mib: int, requested_gpu_uuids: list[str],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Return an exclusive whole-GPU reservation for one scoped lease."""
+        inventory = [
+            device for device in gpu_snapshot()
+            if not SELECTED_GPUS or device.get("uuid") in SELECTED_GPUS
+        ]
+        by_uuid = {str(device.get("uuid") or ""): device for device in inventory}
+        requested = list(dict.fromkeys(requested_gpu_uuids))
+        if not requested:
+            return [], inventory
+        unknown = [gpu_uuid for gpu_uuid in requested if gpu_uuid not in by_uuid]
+        if unknown:
+            raise RuntimeError(
+                f"requested GPU UUIDs are not selected and available: {unknown}"
+            )
+        with self.cv:
+            reserved = self._reserved_gpus_locked()
+        conflicts = [gpu_uuid for gpu_uuid in requested if gpu_uuid in reserved]
+        if conflicts:
+            raise RuntimeError(f"requested GPU UUIDs are already leased: {conflicts}")
+        devices = [by_uuid[gpu_uuid] for gpu_uuid in requested]
+        aggregate_free = sum(int(device.get("free_mib") or 0) for device in devices)
+        if requested_mib > 0 and requested_mib > aggregate_free:
+            raise RuntimeError(
+                f"requested {requested_mib} MiB but scoped GPUs have only "
+                f"{aggregate_free} MiB free after Ollama unload"
+            )
+        return requested, devices
 
     def _lane_summaries_locked(self) -> list[dict[str, Any]]:
         self._prune_dead_lanes_locked()
@@ -1640,10 +1711,12 @@ class Broker:
     def _select_lane_locked(self, model: str, routable: bool) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
+        reserved_gpus = self._reserved_gpus_locked()
         if not routable:
             return base if base.in_flight < base.parallel else None
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
+                    and lane.gpu_uuid not in reserved_gpus
                     and not lane.retiring
                     and lane.in_flight < lane.parallel]
         managed_model_exists = any(
@@ -1898,7 +1971,7 @@ class Broker:
             raise CapacityError("managed Ollama parallel pool is disabled")
         with self.transition:
             with self.cv:
-                if self.draining or self.pending_lease():
+                if self.draining or self._global_transition_lease_locked():
                     raise CapacityError("GPU lease transition is in progress")
                 self._prune_dead_lanes_locked()
                 existing = [lane for lane in self.lanes.values()
@@ -1934,6 +2007,7 @@ class Broker:
                     managed = [lane for lane in self.lanes.values()
                                if lane.kind == "managed"]
                     assigned = {lane.gpu_uuid for lane in managed if lane.gpu_uuid}
+                    reserved = self._reserved_gpus_locked()
                 host = host_memory_snapshot()
                 available_host = int(host.get("memavailable_mib") or 0)
                 required_host = missing * POOL_HOST_RESERVE_MIB
@@ -1944,7 +2018,8 @@ class Broker:
                     )
                 devices = [device for device in gpu_snapshot()
                            if device.get("uuid") in SELECTED_GPUS
-                           and device.get("uuid") not in assigned]
+                           and device.get("uuid") not in assigned
+                           and device.get("uuid") not in reserved]
                 fitting = sorted(
                     (device for device in devices
                      if int(device.get("free_mib") or 0) >= required_mib),
@@ -2018,7 +2093,7 @@ class Broker:
                 if not connected():
                     raise ClientDisconnected("client disconnected before broker admission")
                 with self.cv:
-                    revoked = self.revoking_lease()
+                    revoked = self.blocking_revoking_lease()
                     if revoked is not None and not allow_during_drain:
                         raise PermanentCapacityError(
                             f"GPU lease transition for {revoked.owner} was revoked; "
@@ -2045,7 +2120,7 @@ class Broker:
                     self.cv.wait(min(remaining, 0.25))
 
         with self.cv:
-            revoked = self.revoking_lease()
+            revoked = self.blocking_revoking_lease()
             if revoked is not None and not allow_during_drain:
                 raise PermanentCapacityError(
                     f"GPU lease transition for {revoked.owner} was revoked; "
@@ -2115,7 +2190,8 @@ class Broker:
         """One scheduler owns managed-lane creation and replacement."""
         while not self.stopping.is_set():
             with self.cv:
-                if self.draining or self.pending_lease() or not self.waiters:
+                if (self.draining or self._global_transition_lease_locked()
+                        or not self.waiters):
                     self.cv.wait(0.5)
                     continue
                 waiter = self.waiters[0]
@@ -2220,23 +2296,35 @@ class Broker:
             None,
         )
 
+    def blocking_revoking_lease(self) -> Lease | None:
+        return next(
+            (lease for lease in self.leases.values()
+             if lease.state == "revoking" and not lease.gpu_uuids),
+            None,
+        )
+
     def _revoke_locked(self, lease: Lease, reason: str) -> None:
         if lease.state == "revoking":
             return
         lease.state = "revoking"
-        self.draining = True
         self.last_reason = reason
         message = (
             f"GPU lease transition revoked for {lease.owner}: {reason}; "
-            "the broker remains drained until the owner frees CUDA memory and releases"
+            "reserved GPUs remain unavailable until the owner frees CUDA memory and releases"
         )
-        for waiter in list(self.waiters):
-            waiter.phase = "failed"
-            waiter.last_error = message
-            waiter.terminal_error = message
-            waiter.terminal_status = 503
-            self.queue_rejected_total += 1
-            self._remove_waiter_locked(waiter)
+        if not lease.gpu_uuids:
+            self.draining = True
+            message = (
+                f"GPU lease transition revoked for {lease.owner}: {reason}; "
+                "the broker remains drained until the owner frees CUDA memory and releases"
+            )
+            for waiter in list(self.waiters):
+                waiter.phase = "failed"
+                waiter.last_error = message
+                waiter.terminal_error = message
+                waiter.terminal_status = 503
+                self.queue_rejected_total += 1
+                self._remove_waiter_locked(waiter)
         self._persist_leases_locked()
         self.cv.notify_all()
         LOG.error(message)
@@ -2254,7 +2342,10 @@ class Broker:
             return True
         return lease.state == "revoking"
 
-    def acquire(self, owner: str, requested_mib: int, ttl: int) -> dict[str, Any]:
+    def acquire(
+        self, owner: str, requested_mib: int, ttl: int,
+        requested_gpu_uuids: list[str] | None = None,
+    ) -> dict[str, Any]:
         with self.transition:
             with self.cv:
                 if self.pending_lease():
@@ -2263,8 +2354,10 @@ class Broker:
             try:
                 stopped = self.stop_pool_lanes("lease acquire")
                 unloaded = unload_all_models()
-                devices = [device for device in gpu_snapshot()
-                           if not SELECTED_GPUS or device.get("uuid") in SELECTED_GPUS]
+                gpu_uuids, devices = self._plan_lease_gpus(
+                    requested_mib,
+                    requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, []),
+                )
                 aggregate_free = sum(int(device["free_mib"]) for device in devices)
                 if requested_mib > 0 and devices and requested_mib > aggregate_free:
                     raise RuntimeError(
@@ -2274,7 +2367,7 @@ class Broker:
                 token = "lease_" + secrets.token_urlsafe(24)
                 lease = Lease(
                     token, owner, "pending", requested_mib, now, now, now, ttl,
-                    foreign_gpu_usage(),
+                    foreign_gpu_usage(), gpu_uuids,
                 )
                 with self.cv:
                     self.leases[token] = lease
@@ -2284,6 +2377,8 @@ class Broker:
                         self.leases.pop(token, None)
                         raise
                 LOG.info("lease acquired owner=%s requested_mib=%s unloaded=%s", owner, requested_mib, unloaded)
+                if gpu_uuids:
+                    self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
                         "stopped_lanes": stopped,
                         "gpus": devices, "host_memory": host_memory_snapshot()}
@@ -2312,6 +2407,93 @@ class Broker:
             return {"ok": True, "lease": asdict(lease), "gpus": devices,
                     "host_memory": host_memory_snapshot()}
 
+    def scope(self, token: str, requested_gpu_uuids: list[str]) -> dict[str, Any]:
+        """Convert a live legacy lease to an exclusive whole-GPU scope.
+
+        This transition does not stop the external workload. It is safe only
+        when every foreign allocation that grew after acquire is contained in
+        the requested scope. The anonymous watcher continues to protect every
+        unreserved GPU from later growth.
+        """
+        with self.transition:
+            requested = list(dict.fromkeys(requested_gpu_uuids))
+            if not requested:
+                raise RuntimeError("scope requires at least one GPU UUID")
+            inventory = [
+                device for device in gpu_snapshot()
+                if not SELECTED_GPUS or device.get("uuid") in SELECTED_GPUS
+            ]
+            by_uuid = {
+                str(device.get("uuid") or ""): device for device in inventory
+            }
+            unknown = [gpu_uuid for gpu_uuid in requested if gpu_uuid not in by_uuid]
+            if unknown:
+                raise RuntimeError(
+                    f"requested GPU UUIDs are not selected and available: {unknown}"
+                )
+            current_foreign = foreign_gpu_usage()
+            with self.cv:
+                lease = self.leases.get(token)
+                if lease is None:
+                    raise KeyError("unknown lease")
+                if lease.state not in ("pending", "active"):
+                    raise RuntimeError("only a pending or active lease can change scope")
+                conflicts = {
+                    gpu_uuid
+                    for other_token, other in self.leases.items()
+                    if other_token != token
+                    for gpu_uuid in other.gpu_uuids
+                    if other.state in ("pending", "active", "revoking")
+                } & set(requested)
+                if conflicts:
+                    raise RuntimeError(
+                        f"requested GPU UUIDs are already leased: {sorted(conflicts)}"
+                    )
+                baseline = lease.foreign_baseline or {}
+                outside_growth = {
+                    key: used - baseline.get(key, 0)
+                    for key, used in current_foreign.items()
+                    if used > baseline.get(key, 0)
+                    and key.rsplit("@", 1)[-1] not in requested
+                }
+                if outside_growth:
+                    raise RuntimeError(
+                        "cannot narrow live lease scope; foreign CUDA allocation "
+                        f"grew outside the requested GPUs: {outside_growth}"
+                    )
+                aggregate_total = sum(
+                    int(by_uuid[gpu_uuid].get("total_mib") or 0)
+                    for gpu_uuid in requested
+                )
+                if lease.requested_mib > aggregate_total:
+                    raise RuntimeError(
+                        f"lease requests {lease.requested_mib} MiB but scoped GPUs "
+                        f"provide only {aggregate_total} MiB"
+                    )
+                previous_scope = list(lease.gpu_uuids)
+                lease.gpu_uuids = requested
+                lease.heartbeat_at = time.time()
+                self._persist_leases_locked()
+                state = lease.state
+                result = asdict(lease)
+            if state == "pending":
+                self.end_drain()
+            LOG.warning(
+                "lease scope changed live owner=%s previous=%s current=%s",
+                lease.owner, previous_scope, requested,
+            )
+            return {
+                "ok": True,
+                "lease": result,
+                "previous_gpu_uuids": previous_scope,
+                "verified_foreign_growth": {
+                    key: used - (lease.foreign_baseline or {}).get(key, 0)
+                    for key, used in current_foreign.items()
+                    if used > (lease.foreign_baseline or {}).get(key, 0)
+                },
+                "gpus": [by_uuid[gpu_uuid] for gpu_uuid in requested],
+            }
+
     def prepare(self, token: str) -> dict[str, Any]:
         with self.transition:
             with self.cv:
@@ -2332,6 +2514,8 @@ class Broker:
                     lease.heartbeat_at = now
                     lease.transition_started_at = now
                     self._persist_leases_locked()
+                if lease.gpu_uuids:
+                    self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
                         "stopped_lanes": stopped,
                         "gpus": gpu_snapshot()}
@@ -2497,13 +2681,19 @@ class Broker:
                 stable_since = 0.0
             stable = bool(candidate) and time.monotonic() - stable_since >= ANON_SETTLE
             with self.cv:
-                pending = self.pending_lease()
-                can_start = stable and not pending and not self.anonymous_running
+                reserved = self._reserved_gpus_locked()
+                affected = {
+                    key.split("@", 1)[1] for key in candidate if "@" in key
+                } - reserved
+                can_start = (
+                    stable and bool(affected) and not self.draining
+                    and self._global_transition_lease_locked() is None
+                    and not self.anonymous_running
+                )
                 if can_start:
                     self.anonymous_running = True
             previous = current
             if can_start:
-                affected = {key.split("@", 1)[1] for key in candidate if "@" in key}
                 reason = "stable foreign CUDA allocation increased on selected GPU"
                 candidate = {}
                 stable_since = 0.0
@@ -2640,9 +2830,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
-                self._send_json(exc.status, {"ok": False, "error": str(exc)})
+                retryable = exc.status == 503
+                self._send_json(exc.status, {
+                    "ok": False,
+                    "error": str(exc),
+                    "retryable": retryable,
+                    "reason_code": (
+                        "gpu_admission_unavailable" if retryable
+                        else "permanent_capacity_error"
+                    ),
+                }, ({
+                    "Retry-After": "2",
+                    "X-Ollama-Unify-Retryable": "true",
+                } if retryable else None))
             except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
-                self._send_json(503, {"ok": False, "error": str(exc)})
+                self._send_json(503, {
+                    "ok": False,
+                    "error": str(exc),
+                    "retryable": True,
+                    "reason_code": "gpu_admission_unavailable",
+                }, {
+                    "Retry-After": "2",
+                    "X-Ollama-Unify-Retryable": "true",
+                })
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -2689,8 +2899,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "error": str(exc),
                 "request_id": request_id,
                 "queue": queue,
+                "retryable": True,
+                "reason_code": "gpu_admission_unavailable",
             }, {
                 "Retry-After": "2",
+                "X-Ollama-Unify-Retryable": "true",
                 "X-Ollama-Unify-Request-Id": request_id,
             })
             return
@@ -2701,7 +2914,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "error": str(exc),
                 "request_id": request_id,
                 "queue": queue,
-            }, {"X-Ollama-Unify-Request-Id": request_id})
+                "retryable": exc.status == 503,
+                "reason_code": (
+                    "gpu_admission_unavailable" if exc.status == 503
+                    else "permanent_capacity_error"
+                ),
+            }, ({
+                "Retry-After": "2",
+                "X-Ollama-Unify-Retryable": "true",
+                "X-Ollama-Unify-Request-Id": request_id,
+            } if exc.status == 503 else {
+                "X-Ollama-Unify-Request-Id": request_id,
+            }))
             return
         except (CapacityError, OSError, RuntimeError) as exc:
             with self.broker.cv:
@@ -2710,8 +2934,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "error": str(exc),
                 "request_id": request_id,
                 "queue": queue,
+                "retryable": True,
+                "reason_code": "gpu_admission_unavailable",
             }, {
                 "Retry-After": "2",
+                "X-Ollama-Unify-Retryable": "true",
                 "X-Ollama-Unify-Request-Id": request_id,
             })
             return
@@ -2794,13 +3021,25 @@ class ControlHandler(socketserver.StreamRequestHandler):
                 persistent = request.get("persistent") is True
                 action = request.get("action")
                 if action == "acquire":
+                    requested_gpu_uuids = request.get("gpu_uuids")
+                    if not isinstance(requested_gpu_uuids, list):
+                        requested_gpu_uuids = []
                     result = self.broker.acquire(
                         str(request.get("owner") or "unknown"),
                         max(0, int(request.get("requested_mib") or 0)),
                         max(0, int(request.get("ttl", DEFAULT_LEASE_TTL))),
+                        [str(value) for value in requested_gpu_uuids],
                     )
                 elif action == "ready":
                     result = self.broker.ready(str(request.get("token") or ""))
+                elif action == "scope":
+                    requested_gpu_uuids = request.get("gpu_uuids")
+                    if not isinstance(requested_gpu_uuids, list):
+                        requested_gpu_uuids = []
+                    result = self.broker.scope(
+                        str(request.get("token") or ""),
+                        [str(value) for value in requested_gpu_uuids],
+                    )
                 elif action == "prepare":
                     result = self.broker.prepare(str(request.get("token") or ""))
                 elif action == "release":
@@ -2947,10 +3186,16 @@ def lease_run(args: argparse.Namespace) -> int:
         raise RuntimeError("run requires --ready-command so Ollama cannot reload before external CUDA allocation")
     owner = args.owner or f"{os.environ.get('USER', 'user')}:{os.getpid()}"
     acquired = send_control({"action": "acquire", "owner": owner,
-                             "requested_mib": args.vram_mib, "ttl": args.ttl})
+                             "requested_mib": args.vram_mib, "ttl": args.ttl,
+                             "gpu_uuids": args.gpu})
     token = acquired["lease"]["token"]
     env = os.environ.copy()
     env["OLLAMA_UNIFY_GPU_LEASE"] = token
+    assigned_gpus = acquired["lease"].get("gpu_uuids") or []
+    if assigned_gpus:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned_gpus)
+        env["HIP_VISIBLE_DEVICES"] = "-1"
+        env["ROCR_VISIBLE_DEVICES"] = "-1"
     child = None
     stop_heartbeat = threading.Event()
     heartbeat_failed = threading.Event()
@@ -3048,7 +3293,11 @@ def main() -> int:
     acquire.add_argument("--owner", default="")
     acquire.add_argument("--vram-mib", type=int, default=0)
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
+    acquire.add_argument("--gpu", action="append", default=[])
     acquire.add_argument("--token-only", action="store_true")
+    scope = sub.add_parser("scope")
+    scope.add_argument("token")
+    scope.add_argument("--gpu", action="append", required=True)
     for name in ("ready", "prepare", "release"):
         command = sub.add_parser(name)
         command.add_argument("token")
@@ -3060,6 +3309,7 @@ def main() -> int:
     run.add_argument("--owner", default="")
     run.add_argument("--vram-mib", type=int, default=0)
     run.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
+    run.add_argument("--gpu", action="append", default=[])
     run.add_argument("--ready-command", required=True)
     run.add_argument("--ready-timeout", type=float, default=300.0)
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -3079,11 +3329,16 @@ def main() -> int:
         result = send_control({"action": "status"})
     elif args.command_name == "acquire":
         result = send_control({"action": "acquire", "owner": args.owner,
-                               "requested_mib": args.vram_mib, "ttl": args.ttl})
+                               "requested_mib": args.vram_mib, "ttl": args.ttl,
+                               "gpu_uuids": args.gpu})
     elif args.command_name == "heartbeat" and args.watch:
         if args.interval < 0:
             parser.error("heartbeat --interval must be zero (automatic) or positive")
         return watch_heartbeat(args.token, args.interval)
+    elif args.command_name == "scope":
+        result = send_control({
+            "action": "scope", "token": args.token, "gpu_uuids": args.gpu,
+        })
     elif args.command_name in ("ready", "prepare", "release", "heartbeat"):
         result = send_control({"action": args.command_name, "token": args.token})
     elif args.command_name == "run":
@@ -3138,10 +3393,11 @@ render_gpu_agent_instructions() {
 This host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:
 
 1. Run `docker gpu discover` and inspect the selected GPUs and current policy.
-2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --ready-command 'CHECK' -- COMMAND`. The readiness check must pass only after CUDA models are resident.
-3. For an independently supervised service, use `acquire`, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
-4. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
-5. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`); every selected GPU remains available to the scheduler.
+2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.
+3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
+4. A scoped lease keeps unreserved GPUs available to broker-owned Ollama lanes. An unscoped lease uses a host-wide drain because placement cannot be proven.
+5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
+6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
 
 Machine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.
 AGENT_INSTRUCTIONS
@@ -3152,7 +3408,7 @@ render_global_codex_gpu_block() {
 <!-- BEGIN ollama-unify GPU negotiator -->
 ## CUDA deployment policy
 
-Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover`. Use `docker gpu run` for foreground deployments or the acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must allocate first so Ollama can refit from remaining live VRAM. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
+Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover`. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Unreserved GPUs remain available to broker-owned Ollama lanes. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
 <!-- END ollama-unify GPU negotiator -->
 CODEX_BLOCK
 }

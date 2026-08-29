@@ -429,6 +429,45 @@ def test_existing_pool_contract(helper, fixture_bin):
             backend.shutdown()
             backend.server_close()
 
+
+def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=3) as harness:
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "scoped-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1"],
+        })
+        token = acquired["lease"]["token"]
+        assert acquired["lease"]["gpu_uuids"] == [
+            "GPU-large-0", "GPU-large-1",
+        ]
+        pending = harness.status()
+        assert pending["draining"] is False
+        assert pending["leases"][0]["state"] == "pending"
+
+        status, payload, headers = chat(
+            harness.proxy_port, MODEL, "during-scoped-pending", timeout=10
+        )
+        assert status == 200, payload
+        assert headers["X-Ollama-Unify-Lane"].startswith("lane-")
+        managed = managed_lanes(harness.status())
+        assert len(managed) == 1
+        assert managed[0]["gpu_uuid"] == "GPU-large-2"
+        starts = [event for event in events(harness.event_log)
+                  if event["kind"] == "start"]
+        assert starts
+        assert all(event["gpu"] == "GPU-large-2" for event in starts)
+
+        control(harness.socket_path, {"action": "ready", "token": token})
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+        assert harness.status()["draining"] is False
+
+
 def capacity_when_ready(harness, model, parallel=1):
     status, payload, headers = harness.capacity(model, parallel)
     return (status, payload, headers) if status == 200 else None
@@ -746,6 +785,7 @@ def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
+    test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)

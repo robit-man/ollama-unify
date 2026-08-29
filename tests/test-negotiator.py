@@ -164,6 +164,7 @@ def main():
         assert discovery["schema"] == "io.ollama-unify.gpu-negotiator.discovery.v1"
         assert discovery["selected_gpu_count"] == 3
         assert discovery["commands"]["discover"] == "docker gpu discover"
+        assert "scope" in discovery["commands"]["manual"]
         instructions = subprocess.run(
             [helper, "agent-instructions"],
             env=env,
@@ -249,9 +250,12 @@ def main():
             assert bounded_status == 503, (bounded_status, bounded_body)
             assert time.monotonic() - bounded_started < 1
             assert bounded_headers["Retry-After"] == "2"
+            assert bounded_headers["X-Ollama-Unify-Retryable"] == "true"
             bounded_payload = json.loads(bounded_body)
             assert bounded_payload["request_id"]
             assert "queue" in bounded_payload
+            assert bounded_payload["retryable"] is True
+            assert bounded_payload["reason_code"] == "gpu_admission_unavailable"
 
             ready = control(socket_path, {"action": "ready", "token": token})
             assert ready["lease"]["state"] == "active"
@@ -316,12 +320,17 @@ def main():
             assert revoked_status["leases"][0]["state"] == "revoking"
             assert revoked_status["draining"] is True
             revoked_started = time.monotonic()
-            revoked_code, revoked_body, _ = proxy_generate(
+            revoked_code, revoked_body, revoked_headers = proxy_generate(
                 proxy_port, 4096, admission_wait_ms=1000,
             )
             assert revoked_code == 503
             assert time.monotonic() - revoked_started < 0.5
-            assert "revoked" in json.loads(revoked_body)["error"].lower()
+            revoked_payload = json.loads(revoked_body)
+            assert "revoked" in revoked_payload["error"].lower()
+            assert revoked_payload["retryable"] is True
+            assert revoked_payload["reason_code"] == "gpu_admission_unavailable"
+            assert revoked_headers["Retry-After"] == "2"
+            assert revoked_headers["X-Ollama-Unify-Retryable"] == "true"
             released = control(socket_path, {"action": "release", "token": token})
             assert released["released"] == token
             status = control(socket_path, {"action": "status"})
@@ -329,6 +338,55 @@ def main():
             assert status["draining"] is False
             assert status["backend_available"] is True
             assert len(status["gpus"]) == 3
+
+            live_acquired = subprocess.run(
+                [
+                    helper,
+                    "acquire",
+                    "--owner",
+                    "live-scope-fixture",
+                    "--vram-mib",
+                    "4096",
+                    "--ttl",
+                    "30",
+                    "--token-only",
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            live_token = live_acquired.stdout.strip()
+            blocked_code, _, _ = proxy_generate(
+                proxy_port, 4096, admission_wait_ms=100,
+            )
+            assert blocked_code == 503
+            scoped = subprocess.run(
+                [
+                    helper,
+                    "scope",
+                    live_token,
+                    "--gpu",
+                    "GPU-large-0",
+                    "--gpu",
+                    "GPU-large-1",
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            scoped_payload = json.loads(scoped.stdout)
+            assert scoped_payload["lease"]["state"] == "pending"
+            assert scoped_payload["lease"]["gpu_uuids"] == [
+                "GPU-large-0", "GPU-large-1",
+            ]
+            live_status = control(socket_path, {"action": "status"})
+            assert live_status["draining"] is False
+            proxy_generate(proxy_port, 4096)
+            control(socket_path, {"action": "release", "token": live_token})
 
             backend_port = backend.server_port
             backend.shutdown()
