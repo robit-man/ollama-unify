@@ -986,6 +986,7 @@ BACKEND_HOST, BACKEND_PORT = split_address(os.environ.get("OLLAMA_UNIFY_BACKEND"
 LISTEN_HOST, LISTEN_PORT = split_address(os.environ.get("OLLAMA_UNIFY_LISTEN", "127.0.0.1:11434"))
 CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-negotiator.sock")
 DRAIN_TIMEOUT = env_float("OLLAMA_UNIFY_DRAIN_TIMEOUT", 300.0)
+PENDING_TIMEOUT = env_float("OLLAMA_UNIFY_PENDING_TIMEOUT", 300.0)
 UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
 HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
@@ -1322,6 +1323,7 @@ def discovery_document() -> dict[str, Any]:
         "agent_instructions": "/usr/local/share/ollama-unify/AGENTS.md",
         "well_known": f"http://127.0.0.1:{LISTEN_PORT}/.well-known/ollama-unify-gpu-negotiator",
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
+        "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "parallel_pool": {
             "enabled": POOL_ENABLED,
             "max_managed_servers": POOL_MAX_SERVERS,
@@ -1352,6 +1354,11 @@ def discovery_document() -> dict[str, Any]:
             ),
             "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
             "release": "Free external CUDA allocations before releasing the lease.",
+            "pending_timeout": (
+                "Pending transitions have an absolute, non-renewable deadline. "
+                "After it expires, the broker revokes heartbeats and remains drained "
+                "until the owner frees CUDA memory and releases the lease."
+            ),
             "num_gpu_semantics": (
                 "Ollama num_gpu is the number of GPU-offloaded layers, not the physical GPU count; -1 is automatic."
             ),
@@ -1364,7 +1371,12 @@ def agent_instructions_text() -> str:
     return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --ready-command 'CHECK' -- COMMAND`. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use `acquire`, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n5. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`); every selected GPU remains available to the scheduler.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
-def wait_for_foreign_settle() -> None:
+def foreign_usage_at_or_below(baseline: dict[str, int],
+                              current: dict[str, int]) -> bool:
+    return all(used <= baseline.get(key, 0) for key, used in current.items())
+
+
+def wait_for_foreign_settle(baseline: dict[str, int] | None = None) -> None:
     deadline = time.monotonic() + ANON_MAX_DRAIN
     last = foreign_gpu_usage()
     stable_since = time.monotonic()
@@ -1372,11 +1384,17 @@ def wait_for_foreign_settle() -> None:
         time.sleep(ANON_POLL)
         current = foreign_gpu_usage()
         if current == last:
-            if time.monotonic() - stable_since >= ANON_SETTLE:
+            if (time.monotonic() - stable_since >= ANON_SETTLE
+                    and (baseline is None
+                         or foreign_usage_at_or_below(baseline, current))):
                 return
         else:
             last = current
             stable_since = time.monotonic()
+    if baseline is not None:
+        raise TimeoutError(
+            "foreign GPU allocation did not return to its pre-lease baseline"
+        )
 
 
 @dataclass
@@ -1387,7 +1405,9 @@ class Lease:
     requested_mib: int
     created_at: float
     heartbeat_at: float
+    transition_started_at: float
     ttl: int
+    foreign_baseline: dict[str, int] | None
 
 
 @dataclass
@@ -1477,9 +1497,12 @@ class Broker:
         self.cv = threading.Condition()
         self.transition = threading.Lock()
         self.leases = self._load_leases()
-        self.draining = any(lease.state == "pending" for lease in self.leases.values())
+        self.draining = any(
+            lease.state in ("pending", "revoking")
+            for lease in self.leases.values()
+        )
         self.active_requests = 0
-        self.last_reason = "restored pending lease" if self.draining else "startup"
+        self.last_reason = "restored lease transition" if self.draining else "startup"
         self.stopping = threading.Event()
         self.anonymous_running = False
         self.waiters: list[QueuedRequest] = []
@@ -1502,6 +1525,9 @@ class Broker:
             )
         }
         self.next_lane_id = 1
+        if any(lease.state == "revoking" for lease in self.leases.values()):
+            with self.cv:
+                self._persist_leases_locked()
 
     def _load_leases(self) -> dict[str, Lease]:
         try:
@@ -1516,18 +1542,34 @@ class Broker:
         leases: dict[str, Lease] = {}
         for raw in raw_leases:
             try:
+                created_at = float(raw["created_at"])
+                state = str(raw["state"])
+                transition_started_at = float(
+                    raw.get("transition_started_at", created_at)
+                )
+                if (state == "pending" and PENDING_TIMEOUT > 0
+                        and now - transition_started_at >= PENDING_TIMEOUT):
+                    state = "revoking"
+                baseline_raw = raw.get("foreign_baseline")
+                baseline = (
+                    {str(key): max(0, int(value))
+                     for key, value in baseline_raw.items()}
+                    if isinstance(baseline_raw, dict) else None
+                )
                 lease = Lease(
                     token=str(raw["token"]), owner=str(raw["owner"]),
-                    state=str(raw["state"]), requested_mib=max(0, int(raw["requested_mib"])),
-                    created_at=float(raw["created_at"]), heartbeat_at=float(raw["heartbeat_at"]),
-                    ttl=max(0, int(raw["ttl"])),
+                    state=state, requested_mib=max(0, int(raw["requested_mib"])),
+                    created_at=created_at, heartbeat_at=float(raw["heartbeat_at"]),
+                    transition_started_at=transition_started_at,
+                    ttl=max(0, int(raw["ttl"])), foreign_baseline=baseline,
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-            if lease.state not in ("pending", "active"):
+            if lease.state not in ("pending", "active", "revoking"):
                 continue
-            if lease.ttl > 0 and now - lease.heartbeat_at > lease.ttl:
-                continue
+            if (lease.ttl > 0 and now - lease.heartbeat_at > lease.ttl
+                    and lease.state != "revoking"):
+                lease.state = "revoking"
             leases[lease.token] = lease
         if leases:
             LOG.warning("restored %s persisted GPU lease(s)", len(leases))
@@ -1961,17 +2003,28 @@ class Broker:
                     connected: Callable[[], bool] = lambda: True,
                     request_id: str = "",
                     allow_during_drain: bool = False,
-                    request_path: str = "") -> Admission:
+                    request_path: str = "",
+                    admission_wait: float | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         enqueued_at = time.monotonic()
-        deadline = enqueued_at + DRAIN_TIMEOUT
+        wait_seconds = DRAIN_TIMEOUT
+        if admission_wait is not None:
+            wait_seconds = max(0.1, min(DRAIN_TIMEOUT, admission_wait))
+        deadline = enqueued_at + wait_seconds
 
         if not routable or not model or not POOL_ENABLED:
             while True:
                 if not connected():
                     raise ClientDisconnected("client disconnected before broker admission")
                 with self.cv:
+                    revoked = self.revoking_lease()
+                    if revoked is not None and not allow_during_drain:
+                        raise PermanentCapacityError(
+                            f"GPU lease transition for {revoked.owner} was revoked; "
+                            "waiting for verified CUDA release",
+                            503,
+                        )
                     while self.draining and not allow_during_drain:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -1992,6 +2045,13 @@ class Broker:
                     self.cv.wait(min(remaining, 0.25))
 
         with self.cv:
+            revoked = self.revoking_lease()
+            if revoked is not None and not allow_during_drain:
+                raise PermanentCapacityError(
+                    f"GPU lease transition for {revoked.owner} was revoked; "
+                    "waiting for verified CUDA release",
+                    503,
+                )
             waiter = QueuedRequest(
                 request_id, model, enqueued_at, deadline, connected,
                 request_path=request_path,
@@ -2148,7 +2208,51 @@ class Broker:
             self.cv.notify_all()
 
     def pending_lease(self) -> bool:
-        return any(lease.state == "pending" for lease in self.leases.values())
+        return any(
+            lease.state in ("pending", "revoking")
+            for lease in self.leases.values()
+        )
+
+    def revoking_lease(self) -> Lease | None:
+        return next(
+            (lease for lease in self.leases.values()
+             if lease.state == "revoking"),
+            None,
+        )
+
+    def _revoke_locked(self, lease: Lease, reason: str) -> None:
+        if lease.state == "revoking":
+            return
+        lease.state = "revoking"
+        self.draining = True
+        self.last_reason = reason
+        message = (
+            f"GPU lease transition revoked for {lease.owner}: {reason}; "
+            "the broker remains drained until the owner frees CUDA memory and releases"
+        )
+        for waiter in list(self.waiters):
+            waiter.phase = "failed"
+            waiter.last_error = message
+            waiter.terminal_error = message
+            waiter.terminal_status = 503
+            self.queue_rejected_total += 1
+            self._remove_waiter_locked(waiter)
+        self._persist_leases_locked()
+        self.cv.notify_all()
+        LOG.error(message)
+
+    def _revoke_if_pending_deadline_expired_locked(
+        self, lease: Lease, now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else now
+        if (lease.state == "pending" and PENDING_TIMEOUT > 0
+                and current - lease.transition_started_at >= PENDING_TIMEOUT):
+            self._revoke_locked(
+                lease,
+                f"pending deadline of {PENDING_TIMEOUT:g}s expired",
+            )
+            return True
+        return lease.state == "revoking"
 
     def acquire(self, owner: str, requested_mib: int, ttl: int) -> dict[str, Any]:
         with self.transition:
@@ -2168,7 +2272,10 @@ class Broker:
                     )
                 now = time.time()
                 token = "lease_" + secrets.token_urlsafe(24)
-                lease = Lease(token, owner, "pending", requested_mib, now, now, ttl)
+                lease = Lease(
+                    token, owner, "pending", requested_mib, now, now, now, ttl,
+                    foreign_gpu_usage(),
+                )
                 with self.cv:
                     self.leases[token] = lease
                     try:
@@ -2190,6 +2297,10 @@ class Broker:
                 lease = self.leases.get(token)
                 if lease is None:
                     raise KeyError("unknown lease")
+                if self._revoke_if_pending_deadline_expired_locked(lease):
+                    raise RuntimeError(
+                        "lease transition was revoked; free CUDA memory and release the lease"
+                    )
                 if lease.state != "pending":
                     raise RuntimeError("lease is not pending")
                 lease.state = "active"
@@ -2209,13 +2320,17 @@ class Broker:
                     raise KeyError("unknown lease")
                 if self.pending_lease():
                     raise RuntimeError("a lease transition is already pending")
+                if lease.state != "active":
+                    raise RuntimeError("only an active lease can prepare a resize")
             self.begin_drain(f"lease resize by {lease.owner}")
             try:
                 stopped = self.stop_pool_lanes("lease prepare")
                 unloaded = unload_all_models()
                 with self.cv:
+                    now = time.time()
                     lease.state = "pending"
-                    lease.heartbeat_at = time.time()
+                    lease.heartbeat_at = now
+                    lease.transition_started_at = now
                     self._persist_leases_locked()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
                         "stopped_lanes": stopped,
@@ -2230,28 +2345,45 @@ class Broker:
                 lease = self.leases.get(token)
                 if lease is None:
                     raise KeyError("unknown lease")
-                already_drained = lease.state == "pending" and self.draining
+                already_drained = (
+                    lease.state in ("pending", "revoking") and self.draining
+                )
             if not already_drained:
                 self.begin_drain(f"{reason} by {lease.owner}")
+            completed = False
             try:
                 stopped = self.stop_pool_lanes(reason)
                 unloaded = unload_all_models()
-                wait_for_foreign_settle()
+                wait_for_foreign_settle(lease.foreign_baseline)
                 with self.cv:
                     self.leases.pop(token, None)
                     self._persist_leases_locked()
+                completed = True
                 LOG.info("lease released owner=%s reason=%s", lease.owner, reason)
                 return {"ok": True, "released": token, "unloaded": unloaded,
                         "stopped_lanes": stopped,
                         "gpus": gpu_snapshot(), "host_memory": host_memory_snapshot()}
             finally:
-                self.end_drain()
+                if completed:
+                    self.end_drain()
+                else:
+                    with self.cv:
+                        self.draining = True
+                        self.last_reason = (
+                            f"{reason} incomplete for {lease.owner}; "
+                            "foreign CUDA release is not verified"
+                        )
+                        self.cv.notify_all()
 
     def heartbeat(self, token: str) -> dict[str, Any]:
         with self.cv:
             lease = self.leases.get(token)
             if lease is None:
                 raise KeyError("unknown lease")
+            if self._revoke_if_pending_deadline_expired_locked(lease):
+                raise RuntimeError(
+                    "lease transition was revoked; free CUDA memory and release the lease"
+                )
             lease.heartbeat_at = time.time()
             self._persist_leases_locked()
             return {"ok": True, "lease": asdict(lease)}
@@ -2296,7 +2428,9 @@ class Broker:
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
                 "draining": draining, "active_requests": active,
-                "last_reason": reason, "leases": leases, "gpus": gpu_snapshot(),
+                "last_reason": reason, "leases": leases,
+                "pending_transition_timeout_seconds": PENDING_TIMEOUT,
+                "gpus": gpu_snapshot(),
                 "parallel_pool": {
                     "enabled": POOL_ENABLED,
                     "max_managed_servers": POOL_MAX_SERVERS,
@@ -2382,13 +2516,15 @@ class Broker:
         while not self.stopping.wait(5.0):
             now = time.time()
             with self.cv:
-                expired = [lease.token for lease in self.leases.values()
-                           if lease.ttl > 0 and now - lease.heartbeat_at > lease.ttl]
-            for token in expired:
-                try:
-                    self.release(token, "expired lease")
-                except Exception as exc:
-                    LOG.error("failed to expire lease %s: %s", token, exc)
+                for lease in list(self.leases.values()):
+                    if self._revoke_if_pending_deadline_expired_locked(lease, now):
+                        continue
+                    if (lease.ttl > 0
+                            and now - lease.heartbeat_at > lease.ttl):
+                        self._revoke_locked(
+                            lease,
+                            f"heartbeat lease TTL of {lease.ttl}s expired",
+                        )
 
     def pool_reaper(self) -> None:
         interval = max(1.0, min(30.0, POOL_IDLE_TIMEOUT / 3))
@@ -2450,6 +2586,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return True
         except OSError:
             return False
+
+    def _requested_admission_wait(self) -> float | None:
+        """Return a bounded broker-admission wait requested by the client.
+
+        Inference clients need a short, observable admission cycle when a GPU
+        lease is pending. Without this hint, the HTTP request remains silent
+        for the broker's full drain timeout and the client cannot distinguish
+        queueing from a dead model server. Direct Ollama ignores this private
+        header, so clients can send it without endpoint-specific branching.
+        """
+        raw = self.headers.get("X-Ollama-Unify-Admission-Wait-Ms", "").strip()
+        if not raw:
+            return None
+        try:
+            milliseconds = int(raw)
+        except ValueError:
+            return None
+        if milliseconds <= 0:
+            return None
+        return max(0.1, min(DRAIN_TIMEOUT, milliseconds / 1000.0))
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -2522,6 +2678,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
                 allow_during_drain=path in SAFE_METADATA_PATHS,
                 request_path=path,
+                admission_wait=self._requested_admission_wait(),
             )
         except ClientDisconnected:
             return
@@ -2796,20 +2953,10 @@ def lease_run(args: argparse.Namespace) -> int:
     env["OLLAMA_UNIFY_GPU_LEASE"] = token
     child = None
     stop_heartbeat = threading.Event()
+    heartbeat_failed = threading.Event()
+    heartbeat_errors: list[str] = []
     try:
         child = subprocess.Popen(args.command, env=env)
-        deadline = time.monotonic() + args.ready_timeout
-        while child.poll() is None and time.monotonic() < deadline:
-            ready = subprocess.run(args.ready_command, shell=True, env=env,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if ready.returncode == 0:
-                break
-            time.sleep(1.0)
-        if child.poll() is not None:
-            raise RuntimeError("external command exited before its readiness check passed")
-        if time.monotonic() >= deadline:
-            raise TimeoutError("external workload did not become ready before timeout")
-        send_control({"action": "ready", "token": token})
 
         def heartbeat() -> None:
             interval = max(2.0, min(30.0, args.ttl / 3 if args.ttl else 30.0))
@@ -2817,11 +2964,39 @@ def lease_run(args: argparse.Namespace) -> int:
                 try:
                     send_control({"action": "heartbeat", "token": token})
                 except Exception as exc:
-                    print(f"ollama-unify lease heartbeat failed: {exc}", file=sys.stderr)
+                    heartbeat_errors.append(str(exc))
+                    heartbeat_failed.set()
+                    if child is not None and child.poll() is None:
+                        child.terminate()
+                    return
 
         threading.Thread(target=heartbeat, daemon=True).start()
+        deadline = time.monotonic() + args.ready_timeout
+        while (child.poll() is None and not heartbeat_failed.is_set()
+               and time.monotonic() < deadline):
+            ready = subprocess.run(args.ready_command, shell=True, env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if ready.returncode == 0:
+                break
+            time.sleep(1.0)
+        if heartbeat_failed.is_set():
+            raise RuntimeError(
+                "lease heartbeat failed during startup: "
+                + (heartbeat_errors[-1] if heartbeat_errors else "unknown error")
+            )
+        if child.poll() is not None:
+            raise RuntimeError("external command exited before its readiness check passed")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("external workload did not become ready before timeout")
+        send_control({"action": "ready", "token": token})
         try:
-            return child.wait()
+            return_code = child.wait()
+            if heartbeat_failed.is_set():
+                raise RuntimeError(
+                    "lease heartbeat failed: "
+                    + (heartbeat_errors[-1] if heartbeat_errors else "unknown error")
+                )
+            return return_code
         except KeyboardInterrupt:
             if child.poll() is None:
                 child.send_signal(signal.SIGINT)
@@ -3013,7 +3188,7 @@ install_gpu_negotiator() {
 
   local proxy_listen service_user service_group access_group unit_dir config_dir helper_dir cli_dir
   local plugin_dir selected_ids model_store ollama_binary configured_environment backend_port
-  local drain_timeout unload_timeout lease_ttl anon_poll anon_settle anon_max_drain
+  local drain_timeout pending_timeout unload_timeout lease_ttl anon_poll anon_settle anon_max_drain
   local pool_enabled pool_max_servers pool_port_start pool_instance_parallel
   local pool_idle_timeout pool_ready_timeout pool_load_timeout
   local pool_vram_reserve pool_host_reserve pool_model_overhead
@@ -3032,6 +3207,7 @@ install_gpu_negotiator() {
     || { err "cannot install negotiator for unsafe access group value: $access_group"; exit 2; }
 
   drain_timeout="${OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT:-300}"
+  pending_timeout="${OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT:-300}"
   unload_timeout="${OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT:-120}"
   lease_ttl="${OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL:-300}"
   anon_poll="${OLLAMA_SAFE_NEGOTIATOR_ANON_POLL:-0.5}"
@@ -3059,6 +3235,8 @@ install_gpu_negotiator() {
   pool_model_overhead="${OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT:-110}"
   [[ "$drain_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT must be numeric"; exit 2; }
+  [[ "$pending_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT must be numeric"; exit 2; }
   [[ "$unload_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT must be numeric"; exit 2; }
   [[ "$lease_ttl" =~ ^[0-9]+$ ]] \
@@ -3120,6 +3298,7 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_SOCKET="%s"\n' "$SAFETY_NEGOTIATOR_SOCKET"
     printf 'OLLAMA_UNIFY_MAX_CONTEXT="%s"\n' "$SAFETY_CONTEXT_LENGTH"
     printf 'OLLAMA_UNIFY_DRAIN_TIMEOUT="%s"\n' "$drain_timeout"
+    printf 'OLLAMA_UNIFY_PENDING_TIMEOUT="%s"\n' "$pending_timeout"
     printf 'OLLAMA_UNIFY_UNLOAD_TIMEOUT="%s"\n' "$unload_timeout"
     printf 'OLLAMA_UNIFY_LEASE_TTL="%s"\n' "$lease_ttl"
     printf 'OLLAMA_UNIFY_ANON_POLL="%s"\n' "$anon_poll"

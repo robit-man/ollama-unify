@@ -92,7 +92,7 @@ def control(path, payload):
     return response
 
 
-def proxy_generate(port, context=262144):
+def proxy_generate(port, context=262144, admission_wait_ms=None):
     body = json.dumps(
         {
             "model": "fixture",
@@ -101,11 +101,18 @@ def proxy_generate(port, context=262144):
         }
     ).encode()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("POST", "/api/generate", body, {"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if admission_wait_ms is not None:
+        headers["X-Ollama-Unify-Admission-Wait-Ms"] = str(admission_wait_ms)
+    conn.request("POST", "/api/generate", body, headers)
     response = conn.getresponse()
-    response.read()
+    payload = response.read()
+    status = response.status
+    response_headers = dict(response.getheaders())
     conn.close()
-    assert response.status == 200, response.status
+    if admission_wait_ms is None:
+        assert status == 200, status
+    return status, payload, response_headers
 
 
 def well_known(port):
@@ -142,6 +149,7 @@ def main():
                 "OLLAMA_UNIFY_POOL_ENABLED": "0",
                 "OLLAMA_UNIFY_MAX_CONTEXT": "8192",
                 "OLLAMA_UNIFY_DRAIN_TIMEOUT": "3",
+                "OLLAMA_UNIFY_PENDING_TIMEOUT": "2",
                 "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
                 "OLLAMA_UNIFY_LEASE_TTL": "30",
                 "OLLAMA_UNIFY_ANON_POLL": "0.1",
@@ -233,6 +241,18 @@ def main():
             blocked.start()
             time.sleep(0.25)
             assert blocked.is_alive(), "proxy request was not held during pending lease"
+
+            bounded_started = time.monotonic()
+            bounded_status, bounded_body, bounded_headers = proxy_generate(
+                proxy_port, 4096, admission_wait_ms=150,
+            )
+            assert bounded_status == 503, (bounded_status, bounded_body)
+            assert time.monotonic() - bounded_started < 1
+            assert bounded_headers["Retry-After"] == "2"
+            bounded_payload = json.loads(bounded_body)
+            assert bounded_payload["request_id"]
+            assert "queue" in bounded_payload
+
             ready = control(socket_path, {"action": "ready", "token": token})
             assert ready["lease"]["state"] == "active"
             blocked.join(5)
@@ -280,7 +300,28 @@ def main():
 
             prepared = control(socket_path, {"action": "prepare", "token": token})
             assert prepared["lease"]["state"] == "pending"
-            control(socket_path, {"action": "ready", "token": token})
+            pending_watcher = subprocess.Popen(
+                [helper, "heartbeat", token, "--watch", "--interval", "0.1"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            pending_watching = json.loads(pending_watcher.stdout.readline())
+            assert pending_watching["watching"] is True
+            pending_watcher.wait(timeout=4)
+            assert pending_watcher.returncode != 0
+            assert "revoked" in pending_watcher.stderr.read().lower()
+            revoked_status = control(socket_path, {"action": "status"})
+            assert revoked_status["leases"][0]["state"] == "revoking"
+            assert revoked_status["draining"] is True
+            revoked_started = time.monotonic()
+            revoked_code, revoked_body, _ = proxy_generate(
+                proxy_port, 4096, admission_wait_ms=1000,
+            )
+            assert revoked_code == 503
+            assert time.monotonic() - revoked_started < 0.5
+            assert "revoked" in json.loads(revoked_body)["error"].lower()
             released = control(socket_path, {"action": "release", "token": token})
             assert released["released"] == token
             status = control(socket_path, {"action": "status"})
