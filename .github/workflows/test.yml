@@ -15,10 +15,20 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq rsync shellcheck
       - name: Check shell syntax
-        run: bash -n ollama-unify.sh tests/test-classifier.sh tests/test-transfer.sh tests/fixtures/bin/*
+        run: >-
+          bash -n ollama-unify.sh tests/test-classifier.sh tests/test-negotiator.sh
+          tests/test-transfer.sh tests/fixtures/bin/amd-smi tests/fixtures/bin/lspci
+          tests/fixtures/bin/nvidia-smi tests/fixtures/bin/system_profiler
+          tests/fixtures/bin/sw_vers tests/fixtures/bin/uname tests/fixtures/bin/vulkaninfo
       - name: Run ShellCheck
-        run: shellcheck -x ollama-unify.sh tests/test-classifier.sh tests/test-transfer.sh tests/fixtures/bin/*
+        run: >-
+          shellcheck -x ollama-unify.sh tests/test-classifier.sh tests/test-negotiator.sh
+          tests/test-transfer.sh tests/fixtures/bin/amd-smi tests/fixtures/bin/lspci
+          tests/fixtures/bin/nvidia-smi tests/fixtures/bin/system_profiler
+          tests/fixtures/bin/sw_vers tests/fixtures/bin/uname tests/fixtures/bin/vulkaninfo
       - name: Exercise hardware classifiers
         run: ./tests/test-classifier.sh
+      - name: Exercise GPU negotiator and parallel pool
+        run: ./tests/test-negotiator.sh
       - name: Exercise transfer strategies
         run: ./tests/test-transfer.sh

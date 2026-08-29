@@ -911,6 +911,7 @@ import logging
 import math
 import os
 import secrets
+import select
 import signal
 import socket
 import socketserver
@@ -920,7 +921,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def env_float(name: str, default: float) -> float:
@@ -1006,6 +1007,7 @@ POOL_PORT_START = env_int("OLLAMA_UNIFY_POOL_PORT_START", BACKEND_PORT + 1)
 POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1))
 POOL_IDLE_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_IDLE_TIMEOUT", 300.0)
 POOL_READY_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_READY_TIMEOUT", 30.0)
+POOL_LOAD_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_LOAD_TIMEOUT", DRAIN_TIMEOUT)
 POOL_VRAM_RESERVE_MIB = env_int("OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB", 8192)
 POOL_HOST_RESERVE_MIB = env_int("OLLAMA_UNIFY_POOL_HOST_RESERVE_MIB", 2048)
 POOL_MODEL_OVERHEAD_PERCENT = max(
@@ -1027,6 +1029,15 @@ INFERENCE_PATHS = NATIVE_MODEL_PATHS + (
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
 )
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
+
+
+def canonical_model_tag(model: str) -> str:
+    """Use Ollama's implicit latest tag without conflating distinct model aliases."""
+    model = model.strip()
+    if not model:
+        return ""
+    leaf = model.rsplit("/", 1)[-1]
+    return model if ":" in leaf else f"{model}:latest"
 
 
 def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
@@ -1172,7 +1183,30 @@ def managed_cgroup_pids() -> set[int]:
             pids.update(int(line) for line in path.read_text().splitlines() if line.isdigit())
         except (FileNotFoundError, OSError, subprocess.SubprocessError, ValueError):
             continue
-    return pids
+    roots = set(pids)
+    roots.add(os.getpid())
+    descendants = set(roots)
+    parent_by_pid: dict[int, int] = {}
+    try:
+        candidates = [item for item in Path("/proc").iterdir()
+                      if item.name.isdigit()]
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        try:
+            fields = candidate.joinpath("status").read_text().splitlines()
+            parent_by_pid[int(candidate.name)] = next(
+                int(line.split()[1]) for line in fields if line.startswith("PPid:")
+            )
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
+    frontier = set(roots)
+    while frontier:
+        children = {pid for pid, parent in parent_by_pid.items()
+                    if parent in frontier and pid not in descendants}
+        descendants.update(children)
+        frontier = children
+    return descendants
 
 
 def foreign_gpu_usage() -> dict[str, int]:
@@ -1194,9 +1228,20 @@ def foreign_gpu_usage() -> dict[str, int]:
             used = int(fields[2])
         except ValueError:
             continue
+        if SELECTED_GPUS and fields[1] not in SELECTED_GPUS:
+            continue
         if pid not in ollama_pids:
             usage[f"{pid}@{fields[1]}"] = used
     return usage
+
+
+def increased_foreign_gpu_usage(previous: dict[str, int],
+                                current: dict[str, int]) -> dict[str, int]:
+    """Return only new or larger foreign allocations on selected GPUs."""
+    return {
+        key: used for key, used in current.items()
+        if used > previous.get(key, 0)
+    }
 
 
 def host_memory_snapshot() -> dict[str, int | str]:
@@ -1253,6 +1298,7 @@ def discovery_document() -> dict[str, Any]:
             "max_managed_servers": POOL_MAX_SERVERS,
             "instance_parallel": POOL_INSTANCE_PARALLEL,
             "idle_timeout_seconds": POOL_IDLE_TIMEOUT,
+            "load_timeout_seconds": POOL_LOAD_TIMEOUT,
             "model_overhead_percent": POOL_MODEL_OVERHEAD_PERCENT,
             "vram_reserve_mib": POOL_VRAM_RESERVE_MIB,
             "host_reserve_mib_per_lane": POOL_HOST_RESERVE_MIB,
@@ -1327,6 +1373,7 @@ class Lane:
     last_used: float
     process: Any = None
     in_flight: int = 0
+    retiring: bool = False
 
     def public_summary(self) -> dict[str, Any]:
         alive = self.kind == "system" or (
@@ -1336,7 +1383,9 @@ class Lane:
             "id": self.lane_id,
             "kind": self.kind,
             "gpu_uuid": self.gpu_uuid,
-            "state": "ready" if alive else "stopped",
+            "state": "retiring" if alive and self.retiring else (
+                "ready" if alive else "stopped"
+            ),
             "model": self.model or None,
             "parallel": self.parallel,
             "in_flight": self.in_flight,
@@ -1346,6 +1395,40 @@ class Lane:
 
 class CapacityError(RuntimeError):
     pass
+
+
+class ClientDisconnected(ConnectionError):
+    pass
+
+
+@dataclass
+class QueuedRequest:
+    request_id: str
+    model: str
+    enqueued_at: float
+    deadline: float
+    connected: Callable[[], bool]
+    phase: str = "queued"
+    initial_position: int = 1
+    last_error: str | None = None
+
+    def public_summary(self, position: int, now: float) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "model": self.model,
+            "position": position,
+            "phase": self.phase,
+            "wait_ms": max(0, int((now - self.enqueued_at) * 1000)),
+            "last_error": self.last_error,
+        }
+
+
+@dataclass(frozen=True)
+class Admission:
+    lane: Lane
+    request_id: str
+    queue_ms: int
+    initial_position: int
 
 
 class Broker:
@@ -1358,6 +1441,17 @@ class Broker:
         self.last_reason = "restored pending lease" if self.draining else "startup"
         self.stopping = threading.Event()
         self.anonymous_running = False
+        self.waiters: list[QueuedRequest] = []
+        self.reconcile_retry_at = 0.0
+        self.reconcile_last_error = ""
+        self.reconciling_model: str | None = None
+        self.queue_enqueued_total = 0
+        self.queue_admitted_total = 0
+        self.queue_cancelled_total = 0
+        self.queue_timed_out_total = 0
+        self.queue_wait_ms_total = 0
+        self.queue_wait_ms_max = 0
+        self.queue_peak = 0
         now = time.time()
         self.lanes: dict[str, Lane] = {
             "base": Lane(
@@ -1423,13 +1517,49 @@ class Broker:
         self._prune_dead_lanes_locked()
         return [lane.public_summary() for lane in self.lanes.values()]
 
+    def _queue_summary_locked(self, include_requests: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        by_model: dict[str, int] = {}
+        phase_counts: dict[str, int] = {}
+        requests = []
+        for position, waiter in enumerate(self.waiters, 1):
+            by_model[waiter.model] = by_model.get(waiter.model, 0) + 1
+            phase_counts[waiter.phase] = phase_counts.get(waiter.phase, 0) + 1
+            if include_requests:
+                requests.append(waiter.public_summary(position, now))
+        result: dict[str, Any] = {
+            "depth": len(self.waiters),
+            "peak": self.queue_peak,
+            "oldest_wait_ms": max(
+                (max(0, int((now - item.enqueued_at) * 1000))
+                 for item in self.waiters), default=0,
+            ),
+            "by_model": by_model,
+            "phase_counts": phase_counts,
+            "enqueued_total": self.queue_enqueued_total,
+            "admitted_total": self.queue_admitted_total,
+            "cancelled_total": self.queue_cancelled_total,
+            "timed_out_total": self.queue_timed_out_total,
+            "wait_ms_total": self.queue_wait_ms_total,
+            "wait_ms_max": self.queue_wait_ms_max,
+            "wait_ms_mean": (
+                self.queue_wait_ms_total // self.queue_admitted_total
+                if self.queue_admitted_total else 0
+            ),
+            "reconciling_model": self.reconciling_model,
+        }
+        if include_requests:
+            result["requests"] = requests
+        return result
+
     def _select_lane_locked(self, model: str, routable: bool) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
         if not routable:
-            return base
+            return base if base.in_flight < base.parallel else None
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
+                    and not lane.retiring
                     and lane.in_flight < lane.parallel]
         managed_model_exists = any(
             lane.kind == "managed" and lane.model == model
@@ -1439,11 +1569,14 @@ class Broker:
             return min(matching, key=lambda lane: (lane.in_flight, lane.created_at))
         if managed_model_exists:
             return None
+        if POOL_ENABLED:
+            return None
         if any(lane.kind == "managed" for lane in self.lanes.values()):
             return None
         return base if base.in_flight < base.parallel else None
 
     def _model_requirement_mib(self, model: str) -> int:
+        model = canonical_model_tag(model)
         tags = backend_json("GET", "/api/tags", timeout=10.0).get("models", [])
         if not isinstance(tags, list):
             tags = []
@@ -1453,7 +1586,7 @@ class Broker:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or item.get("model") or "")
-            if name == model or name.removesuffix(":latest") == wanted:
+            if canonical_model_tag(name) == model or name.removesuffix(":latest") == wanted:
                 match = item
                 break
         if match is None:
@@ -1504,6 +1637,7 @@ class Broker:
                 pass
 
     def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int) -> Lane:
+        model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise CapacityError(f"managed Ollama binary is not executable: {OLLAMA_BINARY}")
         with self.cv:
@@ -1557,6 +1691,31 @@ class Broker:
                 raise CapacityError(
                     f"managed Ollama lane did not become ready within {POOL_READY_TIMEOUT:.0f}s"
                 )
+            with self.cv:
+                for waiter in self.waiters:
+                    if waiter.model == model:
+                        waiter.phase = "loading-model"
+                        break
+                self.cv.notify_all()
+            backend_json_at("127.0.0.1", port, "POST", "/api/generate", {
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": f"{max(1, int(POOL_IDLE_TIMEOUT))}s",
+                "options": {"num_predict": 0},
+            }, timeout=POOL_LOAD_TIMEOUT)
+            resident = backend_json_at(
+                "127.0.0.1", port, "GET", "/api/ps", timeout=3.0
+            ).get("models", [])
+            if not any(
+                isinstance(item, dict) and canonical_model_tag(str(
+                    item.get("name") or item.get("model") or ""
+                )) == model
+                for item in resident if isinstance(resident, list)
+            ):
+                raise CapacityError(
+                    f"managed Ollama lane did not make model {model!r} resident"
+                )
         except Exception:
             self._terminate_process(process)
             raise
@@ -1569,7 +1728,7 @@ class Broker:
             self.lanes[lane_id] = lane
             self.cv.notify_all()
         LOG.info(
-            "managed Ollama lane ready id=%s gpu=%s model=%s reserved_mib=%s",
+            "managed Ollama lane warm and ready id=%s gpu=%s model=%s reserved_mib=%s",
             lane_id, gpu_uuid, model, required_mib,
         )
         return lane
@@ -1594,7 +1753,7 @@ class Broker:
         return [lane.lane_id for lane in lanes]
 
     def ensure_capacity(self, model: str, parallel: int) -> dict[str, Any]:
-        model = model.strip()
+        model = canonical_model_tag(model)
         if not model:
             raise CapacityError("capacity request requires a model tag")
         if parallel < 1:
@@ -1615,20 +1774,34 @@ class Broker:
                             if lane.kind == "managed" and lane.model == model]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
-                with self.cv:
-                    if self.lanes["base"].in_flight:
-                        raise CapacityError(
-                            "capacity expansion is blocked while the system Ollama lane is active"
-                        )
                 required_mib = self._model_requirement_mib(model)
-                unload_all_models()
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
                                if lane.kind == "managed"]
                     missing = desired_servers - len(existing)
-                    if len(managed) + missing > POOL_MAX_SERVERS:
-                        raise CapacityError("managed Ollama lane limit reached")
+                    overflow = max(0, len(managed) + missing - POOL_MAX_SERVERS)
+                    replaceable = sorted(
+                        (lane for lane in managed
+                         if lane.model != model and lane.in_flight == 0),
+                        key=lambda lane: (lane.last_used, lane.created_at),
+                    )
+                    if len(replaceable) < overflow:
+                        raise CapacityError(
+                            "managed Ollama lane limit reached; no idle lane can be replaced"
+                        )
+                    retired = replaceable[:overflow]
+                    for lane in retired:
+                        lane.retiring = True
+                        self.lanes.pop(lane.lane_id, None)
+                    if retired:
+                        self.cv.notify_all()
+                if retired:
+                    self._stop_lanes(retired, f"idle lane replacement for {model}")
+                with self.cv:
+                    self._prune_dead_lanes_locked()
+                    managed = [lane for lane in self.lanes.values()
+                               if lane.kind == "managed"]
                     assigned = {lane.gpu_uuid for lane in managed if lane.gpu_uuid}
                 host = host_memory_snapshot()
                 available_host = int(host.get("memavailable_mib") or 0)
@@ -1680,53 +1853,153 @@ class Broker:
                 "ok": True,
                 "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
                 "requested_model": model,
+                "canonical_model": model,
                 "requested_parallel": parallel,
                 "admitted_parallel": admitted,
                 "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
                 "lanes": lanes,
             }
 
-    def proxy_enter(self, model: str, routable: bool) -> Lane:
-        deadline = time.monotonic() + DRAIN_TIMEOUT
-        attempted_spawn = False
-        while True:
-            with self.cv:
-                while self.draining:
+    def _remove_waiter_locked(self, waiter: QueuedRequest) -> None:
+        try:
+            self.waiters.remove(waiter)
+        except ValueError:
+            pass
+        self.cv.notify_all()
+
+    def proxy_enter(self, model: str, routable: bool,
+                    connected: Callable[[], bool] = lambda: True,
+                    request_id: str = "") -> Admission:
+        model = canonical_model_tag(model)
+        request_id = request_id or secrets.token_hex(8)
+        enqueued_at = time.monotonic()
+        deadline = enqueued_at + DRAIN_TIMEOUT
+
+        if not routable or not model or not POOL_ENABLED:
+            while True:
+                if not connected():
+                    raise ClientDisconnected("client disconnected before broker admission")
+                with self.cv:
+                    while self.draining:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("GPU negotiation is still draining Ollama")
+                        self.cv.wait(min(remaining, 0.25))
+                    lane = self._select_lane_locked(model, routable)
+                    if lane is not None:
+                        lane.in_flight += 1
+                        lane.last_used = time.time()
+                        self.active_requests += 1
+                        return Admission(
+                            lane, request_id,
+                            max(0, int((time.monotonic() - enqueued_at) * 1000)), 1,
+                        )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("GPU negotiation is still draining Ollama")
-                    self.cv.wait(min(remaining, 1.0))
-                self._prune_dead_lanes_locked()
-                matching = [item for item in self.lanes.values()
-                            if item.kind == "managed" and item.model == model]
-                managed_count = len([item for item in self.lanes.values()
-                                     if item.kind == "managed"])
-                can_spawn = (
-                    routable and bool(model) and POOL_ENABLED and not attempted_spawn
-                    and managed_count < POOL_MAX_SERVERS
-                    and (not matching or all(
-                        item.in_flight >= item.parallel for item in matching
-                    ))
-                )
-                lane = None if can_spawn else self._select_lane_locked(model, routable)
-                if lane is not None:
-                    lane.in_flight += 1
-                    lane.last_used = time.time()
-                    self.active_requests += 1
-                    return lane
-                requested_parallel = sum(item.parallel for item in matching) + 1
+                        raise TimeoutError("Ollama system lane is busy")
+                    self.cv.wait(min(remaining, 0.25))
+
+        with self.cv:
+            waiter = QueuedRequest(
+                request_id, model, enqueued_at, deadline, connected,
+                initial_position=len(self.waiters) + 1,
+            )
+            self.waiters.append(waiter)
+            self.queue_enqueued_total += 1
+            self.queue_peak = max(self.queue_peak, len(self.waiters))
+            self.cv.notify_all()
+        while True:
+            if not connected():
+                with self.cv:
+                    waiter.phase = "cancelled"
+                    self.queue_cancelled_total += 1
+                    self._remove_waiter_locked(waiter)
+                raise ClientDisconnected("client disconnected while queued")
+            with self.cv:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("all managed Ollama lanes are busy")
-            if can_spawn:
-                attempted_spawn = True
-                try:
-                    self.ensure_capacity(model, requested_parallel)
-                    continue
-                except CapacityError as exc:
-                    LOG.warning("managed capacity stayed queued model=%s: %s", model, exc)
+                    waiter.phase = "timed-out"
+                    self.queue_timed_out_total += 1
+                    self._remove_waiter_locked(waiter)
+                    detail = f": {waiter.last_error}" if waiter.last_error else ""
+                    raise TimeoutError(f"broker queue deadline expired{detail}")
+                self._prune_dead_lanes_locked()
+                if not self.draining and self.waiters and self.waiters[0] is waiter:
+                    lane = self._select_lane_locked(model, True)
+                    if lane is not None:
+                        waiter.phase = "generating"
+                        self.waiters.pop(0)
+                        queue_ms = max(
+                            0, int((time.monotonic() - enqueued_at) * 1000)
+                        )
+                        self.queue_admitted_total += 1
+                        self.queue_wait_ms_total += queue_ms
+                        self.queue_wait_ms_max = max(
+                            self.queue_wait_ms_max, queue_ms
+                        )
+                        lane.in_flight += 1
+                        lane.last_used = time.time()
+                        self.active_requests += 1
+                        self.cv.notify_all()
+                        return Admission(
+                            lane, request_id,
+                            queue_ms,
+                            waiter.initial_position,
+                        )
+                self.cv.wait(min(remaining, 0.25))
+
+    def capacity_reconciler(self) -> None:
+        """One scheduler owns managed-lane creation and replacement."""
+        while not self.stopping.is_set():
             with self.cv:
-                self.cv.wait(min(max(0.0, remaining), 1.0))
+                if self.draining or self.pending_lease() or not self.waiters:
+                    self.cv.wait(0.5)
+                    continue
+                waiter = self.waiters[0]
+                model = waiter.model
+                matching = [lane for lane in self.lanes.values()
+                            if lane.kind == "managed" and lane.model == model
+                            and not lane.retiring]
+                if any(lane.in_flight < lane.parallel for lane in matching):
+                    waiter.phase = "ready"
+                    self.cv.notify_all()
+                    self.cv.wait(0.05)
+                    continue
+                desired_parallel = sum(lane.parallel for lane in matching) + 1
+                maximum = POOL_MAX_SERVERS * POOL_INSTANCE_PARALLEL
+                if desired_parallel > maximum:
+                    waiter.phase = "queued"
+                    self.cv.wait(0.25)
+                    continue
+                now = time.monotonic()
+                if now < self.reconcile_retry_at:
+                    self.cv.wait(min(0.5, self.reconcile_retry_at - now))
+                    continue
+                waiter.phase = "starting-server"
+                self.reconciling_model = model
+                self.cv.notify_all()
+            try:
+                self.ensure_capacity(model, desired_parallel)
+                with self.cv:
+                    self.reconcile_retry_at = 0.0
+                    self.reconcile_last_error = ""
+                    self.reconciling_model = None
+                    if waiter in self.waiters:
+                        waiter.phase = "ready"
+                    self.cv.notify_all()
+            except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
+                message = str(exc)
+                with self.cv:
+                    if waiter in self.waiters:
+                        waiter.phase = "queued"
+                        waiter.last_error = message
+                    changed = message != self.reconcile_last_error
+                    self.reconcile_last_error = message
+                    self.reconcile_retry_at = time.monotonic() + 2.0
+                    self.reconciling_model = None
+                    self.cv.notify_all()
+                if changed:
+                    LOG.warning("managed capacity queued model=%s: %s", model, message)
 
     def proxy_exit(self, lane: Lane, model: str, succeeded: bool) -> None:
         with self.cv:
@@ -1900,6 +2173,7 @@ class Broker:
             active = self.active_requests
             reason = self.last_reason
             lanes = self._lane_summaries_locked()
+            queue = self._queue_summary_locked(include_requests=True)
         backend = probe_backend()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
@@ -1910,43 +2184,81 @@ class Broker:
                     "max_managed_servers": POOL_MAX_SERVERS,
                     "instance_parallel": POOL_INSTANCE_PARALLEL,
                     "lanes": lanes,
+                    "queue": queue,
                 },
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
-    def anonymous_rebalance(self, reason: str) -> None:
+    def anonymous_rebalance(self, reason: str, affected_gpus: set[str]) -> None:
         if not self.transition.acquire(blocking=False):
             with self.cv:
                 self.anonymous_running = False
             return
         try:
-            self.begin_drain(reason)
-            self.stop_pool_lanes(reason)
-            unload_all_models()
+            deadline = time.monotonic() + ANON_MAX_DRAIN
+            with self.cv:
+                affected = [lane for lane in self.lanes.values()
+                            if lane.kind == "managed"
+                            and lane.gpu_uuid in affected_gpus]
+                for lane in affected:
+                    lane.retiring = True
+                self.cv.notify_all()
+                while any(lane.in_flight for lane in affected):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.cv.wait(min(remaining, 0.25))
+                for lane in affected:
+                    self.lanes.pop(lane.lane_id, None)
+                base_idle = self.lanes["base"].in_flight == 0
+                self.cv.notify_all()
+            self._stop_lanes(affected, reason)
+            if not affected and base_idle:
+                unload_all_models()
             wait_for_foreign_settle()
-            LOG.warning("reactive anonymous GPU rebalance completed: %s", reason)
+            LOG.warning(
+                "reactive anonymous GPU rebalance completed: %s; retired=%s",
+                reason, [lane.lane_id for lane in affected],
+            )
         except Exception as exc:
             LOG.error("anonymous GPU rebalance failed: %s", exc)
         finally:
-            self.end_drain()
             self.transition.release()
             with self.cv:
                 self.anonymous_running = False
+                self.cv.notify_all()
 
     def anonymous_watcher(self) -> None:
         previous = foreign_gpu_usage()
+        candidate: dict[str, int] = {}
+        stable_since = 0.0
         while not self.stopping.wait(ANON_POLL):
             current = foreign_gpu_usage()
-            changed = set(current) != set(previous)
+            increased = increased_foreign_gpu_usage(previous, current)
+            if increased:
+                candidate.update(increased)
+                stable_since = time.monotonic()
+            elif candidate and any(
+                current.get(key, 0) < used for key, used in candidate.items()
+            ):
+                candidate = {}
+                stable_since = 0.0
+            stable = bool(candidate) and time.monotonic() - stable_since >= ANON_SETTLE
             with self.cv:
                 pending = self.pending_lease()
-                can_start = changed and not pending and not self.anonymous_running
+                can_start = stable and not pending and not self.anonymous_running
                 if can_start:
                     self.anonymous_running = True
             previous = current
             if can_start:
-                reason = "anonymous CUDA process set changed"
-                threading.Thread(target=self.anonymous_rebalance, args=(reason,), daemon=True).start()
+                affected = {key.split("@", 1)[1] for key in candidate if "@" in key}
+                reason = "stable foreign CUDA allocation increased on selected GPU"
+                candidate = {}
+                stable_since = 0.0
+                threading.Thread(
+                    target=self.anonymous_rebalance,
+                    args=(reason, affected), daemon=True,
+                ).start()
 
     def lease_reaper(self) -> None:
         while not self.stopping.wait(5.0):
@@ -1963,16 +2275,22 @@ class Broker:
     def pool_reaper(self) -> None:
         interval = max(1.0, min(30.0, POOL_IDLE_TIMEOUT / 3))
         while not self.stopping.wait(interval):
+            if not self.transition.acquire(blocking=False):
+                continue
             cutoff = time.time() - POOL_IDLE_TIMEOUT
-            with self.cv:
-                lanes = [lane for lane in self.lanes.values()
-                         if lane.kind == "managed" and lane.in_flight == 0
-                         and lane.last_used < cutoff]
-                for lane in lanes:
-                    self.lanes.pop(lane.lane_id, None)
-                if lanes:
-                    self.cv.notify_all()
-            self._stop_lanes(lanes, "idle timeout")
+            try:
+                with self.cv:
+                    lanes = [lane for lane in self.lanes.values()
+                             if lane.kind == "managed" and lane.in_flight == 0
+                             and lane.last_used < cutoff]
+                    for lane in lanes:
+                        lane.retiring = True
+                        self.lanes.pop(lane.lane_id, None)
+                    if lanes:
+                        self.cv.notify_all()
+                self._stop_lanes(lanes, "idle timeout")
+            finally:
+                self.transition.release()
 
     def shutdown(self) -> None:
         self.stopping.set()
@@ -1983,17 +2301,37 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     broker: Broker
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _send_json(self, status: int, payload: dict[str, Any],
+                   headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _client_connected(self) -> bool:
+        try:
+            readable, _, exceptional = select.select(
+                [self.connection], [], [self.connection], 0
+            )
+            if exceptional:
+                return False
+            if not readable:
+                return True
+            return bool(self.connection.recv(
+                1, socket.MSG_PEEK | socket.MSG_DONTWAIT
+            ))
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -2001,11 +2339,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             document = discovery_document()
             with self.broker.cv:
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
+                document["parallel_pool"]["queue"] = self.broker._queue_summary_locked()
             self._send_json(200, document)
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length > 16 * 1024 * 1024:
-            self.send_error(413, "request body exceeds broker limit")
+            self._send_json(413, {"error": "request body exceeds broker limit"})
             return
         body = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
@@ -2027,15 +2366,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": str(exc)})
             return
         if self.command == "GET" and path == "/api/ps":
-            lane = None
+            admission = None
             try:
-                lane = self.broker.proxy_enter("", False)
+                admission = self.broker.proxy_enter(
+                    "", False, self._client_connected
+                )
                 self._send_json(200, self.broker.aggregate_running_models())
+            except ClientDisconnected:
+                return
             except (OSError, RuntimeError, TimeoutError) as exc:
                 self._send_json(503, {"error": str(exc)})
             finally:
-                if lane is not None:
-                    self.broker.proxy_exit(lane, "", True)
+                if admission is not None:
+                    self.broker.proxy_exit(admission.lane, "", True)
             return
         body = clamp_request(self.path, content_type, body)
         model = ""
@@ -2043,15 +2386,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 payload = json.loads(body)
                 if isinstance(payload, dict):
-                    model = str(payload.get("model") or "")
+                    model = canonical_model_tag(str(payload.get("model") or ""))
             except (TypeError, ValueError):
                 pass
-        lane = None
-        queued_at = time.monotonic()
+        admission = None
+        request_id = secrets.token_hex(8)
         try:
-            lane = self.broker.proxy_enter(model, path in INFERENCE_PATHS)
+            admission = self.broker.proxy_enter(
+                model, path in INFERENCE_PATHS, self._client_connected, request_id,
+            )
+        except ClientDisconnected:
+            return
         except TimeoutError as exc:
-            self.send_error(503, str(exc))
+            with self.broker.cv:
+                queue = self.broker._queue_summary_locked()
+            self._send_json(503, {
+                "error": str(exc),
+                "request_id": request_id,
+                "queue": queue,
+            }, {
+                "Retry-After": "2",
+                "X-Ollama-Unify-Request-Id": request_id,
+            })
+            return
+        lane = admission.lane
+        if not self._client_connected():
+            self.broker.proxy_exit(lane, model, False)
+            admission = None
             return
         response_started = False
         succeeded = False
@@ -2067,9 +2428,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if key.lower() not in HOP_HEADERS and key.lower() != "content-length":
                     self.send_header(key, value)
             self.send_header("X-Ollama-Unify-Lane", lane.lane_id)
+            self.send_header("X-Ollama-Unify-Request-Id", admission.request_id)
+            self.send_header("X-Ollama-Unify-Queue-Ms", str(admission.queue_ms))
             self.send_header(
-                "X-Ollama-Unify-Queue-Ms",
-                str(max(0, int((time.monotonic() - queued_at) * 1000))),
+                "X-Ollama-Unify-Queue-Position", str(admission.initial_position)
             )
             content_length = response.getheader("Content-Length")
             if content_length is not None:
@@ -2092,11 +2454,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             LOG.error("proxy error %s %s: %s", self.command, self.path, exc)
             if not response_started:
-                self.send_error(503, f"Ollama backend unavailable: {exc}")
+                self._send_json(503, {"error": f"Ollama backend unavailable: {exc}"})
         finally:
             if backend is not None:
                 backend.close()
-            if lane is not None:
+            if admission is not None:
                 self.broker.proxy_exit(lane, model, succeeded)
 
     do_GET = _handle
@@ -2251,6 +2613,7 @@ def serve() -> int:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     threading.Thread(target=control.serve_forever, daemon=True).start()
+    threading.Thread(target=broker.capacity_reconciler, daemon=True).start()
     threading.Thread(target=broker.anonymous_watcher, daemon=True).start()
     threading.Thread(target=broker.lease_reaper, daemon=True).start()
     threading.Thread(target=broker.pool_reaper, daemon=True).start()
@@ -2503,7 +2866,8 @@ install_gpu_negotiator() {
   local plugin_dir selected_ids model_store ollama_binary configured_environment backend_port
   local drain_timeout unload_timeout lease_ttl anon_poll anon_settle anon_max_drain
   local pool_enabled pool_max_servers pool_port_start pool_instance_parallel
-  local pool_idle_timeout pool_ready_timeout pool_vram_reserve pool_host_reserve pool_model_overhead
+  local pool_idle_timeout pool_ready_timeout pool_load_timeout
+  local pool_vram_reserve pool_host_reserve pool_model_overhead
   proxy_listen=$(detect_ollama_proxy_listen)
   service_user=$(systemctl show ollama.service -p User --value 2>/dev/null || true)
   service_group=$(systemctl show ollama.service -p Group --value 2>/dev/null || true)
@@ -2540,6 +2904,7 @@ install_gpu_negotiator() {
   pool_instance_parallel="${OLLAMA_SAFE_POOL_INSTANCE_PARALLEL:-1}"
   pool_idle_timeout="${OLLAMA_SAFE_POOL_IDLE_TIMEOUT:-300}"
   pool_ready_timeout="${OLLAMA_SAFE_POOL_READY_TIMEOUT:-30}"
+  pool_load_timeout="${OLLAMA_SAFE_POOL_LOAD_TIMEOUT:-$drain_timeout}"
   pool_vram_reserve="${OLLAMA_SAFE_POOL_VRAM_RESERVE_MIB:-8192}"
   pool_host_reserve="${OLLAMA_SAFE_POOL_HOST_RESERVE_MIB:-2048}"
   pool_model_overhead="${OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT:-110}"
@@ -2569,6 +2934,8 @@ install_gpu_negotiator() {
     || { err "OLLAMA_SAFE_POOL_IDLE_TIMEOUT must be numeric"; exit 2; }
   [[ "$pool_ready_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_POOL_READY_TIMEOUT must be numeric"; exit 2; }
+  [[ "$pool_load_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_POOL_LOAD_TIMEOUT must be numeric"; exit 2; }
   [ -x "$ollama_binary" ] \
     || { err "managed pool Ollama binary is not executable: $ollama_binary"; exit 2; }
   [[ "$model_store" != *'"'* ]] \
@@ -2615,6 +2982,7 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL="%s"\n' "$pool_instance_parallel"
     printf 'OLLAMA_UNIFY_POOL_IDLE_TIMEOUT="%s"\n' "$pool_idle_timeout"
     printf 'OLLAMA_UNIFY_POOL_READY_TIMEOUT="%s"\n' "$pool_ready_timeout"
+    printf 'OLLAMA_UNIFY_POOL_LOAD_TIMEOUT="%s"\n' "$pool_load_timeout"
     printf 'OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB="%s"\n' "$pool_vram_reserve"
     printf 'OLLAMA_UNIFY_POOL_HOST_RESERVE_MIB="%s"\n' "$pool_host_reserve"
     printf 'OLLAMA_UNIFY_POOL_MODEL_OVERHEAD_PERCENT="%s"\n' "$pool_model_overhead"

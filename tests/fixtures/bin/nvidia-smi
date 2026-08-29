@@ -17,7 +17,12 @@ case "$*" in
     fi
     ;;
   *--query-compute-apps=pid,gpu_uuid,used_gpu_memory*)
-    # No foreign CUDA processes in the deterministic fixture.
+    # Tests can atomically replace this file to model process arrival,
+    # allocation growth, and process departure while the broker is running.
+    if [ -n "${MOCK_NVIDIA_COMPUTE_APPS_FILE:-}" ] \
+      && [ -r "$MOCK_NVIDIA_COMPUTE_APPS_FILE" ]; then
+      sed -n '/[^[:space:]]/p' "$MOCK_NVIDIA_COMPUTE_APPS_FILE"
+    fi
     ;;
   *--query-gpu=index,uuid,name,display_active,memory.total,compute_cap*)
     if [ "$MOCK_PROFILE" = "cuda_display" ]; then
