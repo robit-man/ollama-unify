@@ -491,6 +491,45 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
         assert harness.status()["draining"] is False
 
 
+def test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
+    helper, fixture_bin,
+):
+    with PoolHarness(helper, fixture_bin, max_servers=2, tags=[MODEL]) as harness:
+        # A long-running external service can replace a worker PID while its
+        # stable CUDA allocation remains identical. The lease baseline must be
+        # compared by scoped GPU usage, not by process identity.
+        write_compute_apps(harness.compute_apps, [
+            (910101, "GPU-large-0", 1024),
+        ])
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "scoped-pid-churn-fixture",
+            "requested_mib": 4096,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        token = acquired["lease"]["token"]
+        control(harness.socket_path, {"action": "ready", "token": token})
+
+        capacity_status, capacity, _ = harness.capacity(MODEL)
+        assert capacity_status == 200, capacity
+        lane_ids = [lane["id"] for lane in managed_lanes(harness.status())]
+        assert lane_ids
+
+        write_compute_apps(harness.compute_apps, [
+            (910202, "GPU-large-0", 1024),
+        ])
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+        assert released["stopped_lanes"] == []
+        status = harness.status()
+        assert status["draining"] is False
+        assert status["leases"] == []
+        assert [lane["id"] for lane in managed_lanes(status)] == lane_ids
+
+
 def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin):
     with PoolHarness(
         helper, fixture_bin, max_servers=2, tags=[MODEL],
@@ -983,6 +1022,9 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
+    test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
+        helper, fixture_bin,
+    )
     test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
     test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
         helper, fixture_bin,

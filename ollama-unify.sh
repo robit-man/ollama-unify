@@ -1401,22 +1401,58 @@ def agent_instructions_text() -> str:
     return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
-def foreign_usage_at_or_below(baseline: dict[str, int],
-                              current: dict[str, int]) -> bool:
-    return all(used <= baseline.get(key, 0) for key, used in current.items())
+def foreign_usage_by_gpu(
+    usage: dict[str, int], gpu_uuids: set[str] | None = None,
+) -> dict[str, int]:
+    """Aggregate foreign CUDA use by GPU instead of unstable process ID.
+
+    CUDA clients can replace a worker process without changing their resident
+    allocation. A PID-keyed release check treats that harmless process churn
+    as new VRAM forever and can pin the negotiator in drain mode. Per-GPU
+    totals preserve the safety property that matters for placement: a lease
+    is releasable only after live foreign use on its scope returns to or below
+    the pre-lease amount.
+    """
+    totals: dict[str, int] = {}
+    for key, used in usage.items():
+        _pid, separator, gpu_uuid = key.rpartition("@")
+        if not separator or not gpu_uuid:
+            continue
+        if gpu_uuids is not None and gpu_uuid not in gpu_uuids:
+            continue
+        totals[gpu_uuid] = totals.get(gpu_uuid, 0) + max(0, int(used))
+    return totals
 
 
-def wait_for_foreign_settle(baseline: dict[str, int] | None = None) -> None:
+def foreign_usage_at_or_below(
+    baseline: dict[str, int], current: dict[str, int],
+    gpu_uuids: set[str] | None = None,
+) -> bool:
+    baseline_by_gpu = foreign_usage_by_gpu(baseline, gpu_uuids)
+    current_by_gpu = foreign_usage_by_gpu(current, gpu_uuids)
+    return all(
+        used <= baseline_by_gpu.get(gpu_uuid, 0)
+        for gpu_uuid, used in current_by_gpu.items()
+    )
+
+
+def wait_for_foreign_settle(
+    baseline: dict[str, int] | None = None,
+    gpu_uuids: set[str] | None = None,
+) -> None:
     deadline = time.monotonic() + ANON_MAX_DRAIN
-    last = foreign_gpu_usage()
+    last = foreign_usage_by_gpu(foreign_gpu_usage(), gpu_uuids)
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(ANON_POLL)
-        current = foreign_gpu_usage()
+        current_raw = foreign_gpu_usage()
+        current = foreign_usage_by_gpu(current_raw, gpu_uuids)
         if current == last:
             if (time.monotonic() - stable_since >= ANON_SETTLE
                     and (baseline is None
-                         or foreign_usage_at_or_below(baseline, current))):
+                         or foreign_usage_at_or_below(
+                             baseline, current_raw, gpu_uuids,
+                         ))):
                 return
         else:
             last = current
@@ -2650,16 +2686,29 @@ class Broker:
                 lease = self.leases.get(token)
                 if lease is None:
                     raise KeyError("unknown lease")
+                scoped_gpus = set(lease.gpu_uuids)
+                scoped_release = bool(scoped_gpus)
                 already_drained = (
                     lease.state in ("pending", "revoking") and self.draining
                 )
-            if not already_drained:
+            # A scoped lease has never owned the host. Its release must not
+            # stop unrelated Ollama lanes or turn a failed owner-cleanup check
+            # into a host-wide drain. Live GPU telemetry remains authoritative
+            # for later lane placement on the released scope.
+            if not scoped_release and not already_drained:
                 self.begin_drain(f"{reason} by {lease.owner}")
             completed = False
             try:
-                stopped = self.stop_pool_lanes(reason)
-                unloaded = unload_all_models()
-                wait_for_foreign_settle(lease.foreign_baseline)
+                if scoped_release:
+                    stopped = []
+                    unloaded = []
+                else:
+                    stopped = self.stop_pool_lanes(reason)
+                    unloaded = unload_all_models()
+                wait_for_foreign_settle(
+                    lease.foreign_baseline,
+                    scoped_gpus if scoped_release else None,
+                )
                 with self.cv:
                     self.leases.pop(token, None)
                     self._persist_leases_locked()
@@ -2670,10 +2719,20 @@ class Broker:
                         "gpus": gpu_snapshot(), "host_memory": host_memory_snapshot()}
             finally:
                 if completed:
-                    self.end_drain()
+                    if not scoped_release:
+                        self.end_drain()
+                    else:
+                        # Repair a stale drain left by an older broker version
+                        # after this same scoped release failed. Do not clear a
+                        # real unscoped pending/revoking transition.
+                        with self.cv:
+                            if self._global_transition_lease_locked() is None:
+                                self.draining = False
+                                self.cv.notify_all()
                 else:
                     with self.cv:
-                        self.draining = True
+                        if not scoped_release:
+                            self.draining = True
                         self.last_reason = (
                             f"{reason} incomplete for {lease.owner}; "
                             "foreign CUDA release is not verified"
