@@ -1380,7 +1380,7 @@ def discovery_document() -> dict[str, Any]:
                 "Acquire a lease before loading CUDA models; signal ready only after GPU allocation is resident."
             ),
             "scoped_leases": (
-                "Use repeated --gpu UUID options and give the child exactly those UUIDs in CUDA_VISIBLE_DEVICES; unreserved GPUs remain available to Ollama."
+                "Use repeated --gpu UUID options and give the child exactly those UUIDs in CUDA_VISIBLE_DEVICES. Pending or revoking scopes block those GPUs; active scopes may share stable live VRAM with broker-owned Ollama lanes."
             ),
             "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
             "release": "Free external CUDA allocations before releasing the lease.",
@@ -1398,7 +1398,7 @@ def discovery_document() -> dict[str, Any]:
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. A scoped lease keeps unreserved GPUs available to broker-owned Ollama lanes. An unscoped lease uses a host-wide drain because placement cannot be proven.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_at_or_below(baseline: dict[str, int],
@@ -1640,6 +1640,25 @@ class Broker:
             if lease.state in ("pending", "active", "revoking")
         }
 
+    def _ollama_blocked_gpus_locked(self) -> set[str]:
+        """Return scoped GPUs whose external allocation is not stable.
+
+        A pending or revoking lease can still change its CUDA footprint, so an
+        Ollama lane must not use those GPUs. An active lease has completed its
+        readiness contract: its allocation is resident and it must call
+        prepare before any later VRAM growth. Active scoped GPUs can therefore
+        host managed Ollama lanes when the live free-VRAM admission check fits.
+
+        `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
+        set. Two external owners never share a scoped GPU.
+        """
+        return {
+            gpu_uuid
+            for lease in self.leases.values()
+            for gpu_uuid in lease.gpu_uuids
+            if lease.state in ("pending", "revoking")
+        }
+
     def _global_transition_lease_locked(self) -> Lease | None:
         return next(
             (
@@ -1653,7 +1672,7 @@ class Broker:
     def _plan_lease_gpus(
         self, requested_mib: int, requested_gpu_uuids: list[str],
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        """Return an exclusive whole-GPU reservation for one scoped lease."""
+        """Return a GPU scope reserved against other external leases."""
         inventory = [
             device for device in gpu_snapshot()
             if not SELECTED_GPUS or device.get("uuid") in SELECTED_GPUS
@@ -1724,12 +1743,12 @@ class Broker:
     def _select_lane_locked(self, model: str, routable: bool) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
-        reserved_gpus = self._reserved_gpus_locked()
+        blocked_gpus = self._ollama_blocked_gpus_locked()
         if not routable:
             return base if base.in_flight < base.parallel else None
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
-                    and lane.gpu_uuid not in reserved_gpus
+                    and lane.gpu_uuid not in blocked_gpus
                     and not lane.retiring
                     and lane.in_flight < lane.parallel]
         managed_model_exists = any(
@@ -1959,9 +1978,15 @@ class Broker:
             self._terminate_process(lane.process)
             LOG.info("managed Ollama lane stopped id=%s reason=%s", lane.lane_id, reason)
 
-    def stop_pool_lanes(self, reason: str) -> list[str]:
+    def stop_pool_lanes(
+        self, reason: str, gpu_uuids: set[str] | None = None,
+    ) -> list[str]:
         with self.cv:
-            lanes = [lane for lane in self.lanes.values() if lane.kind == "managed"]
+            lanes = [
+                lane for lane in self.lanes.values()
+                if lane.kind == "managed"
+                and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)
+            ]
             for lane in lanes:
                 self.lanes.pop(lane.lane_id, None)
             self.cv.notify_all()
@@ -2024,7 +2049,7 @@ class Broker:
                     self._stop_lanes(retired, f"idle lane replacement for {model}")
                 with self.cv:
                     self._prune_dead_lanes_locked()
-                    reserved = self._reserved_gpus_locked()
+                    blocked = self._ollama_blocked_gpus_locked()
                 host = host_memory_snapshot()
                 available_host = int(host.get("memavailable_mib") or 0)
                 required_host = missing * POOL_HOST_RESERVE_MIB
@@ -2038,7 +2063,7 @@ class Broker:
                 while True:
                     devices = [device for device in gpu_snapshot()
                                if device.get("uuid") in SELECTED_GPUS
-                               and device.get("uuid") not in reserved]
+                               and device.get("uuid") not in blocked]
                     virtual_free = {
                         str(device.get("uuid") or ""):
                             int(device.get("free_mib") or 0)
@@ -2422,12 +2447,38 @@ class Broker:
                     raise RuntimeError("another lease is waiting for its external workload to become ready")
             self.begin_drain(f"lease acquire by {owner}")
             try:
-                stopped = self.stop_pool_lanes("lease acquire")
-                unloaded = unload_all_models()
-                gpu_uuids, devices = self._plan_lease_gpus(
-                    requested_mib,
-                    requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, []),
+                requested_scope = (
+                    requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
                 )
+                stopped: list[str] = []
+                # The system lane is not GPU-scoped, so unload any model it
+                # holds before measuring a scoped reservation. Managed lanes
+                # have exact GPU UUIDs and may remain resident when the new
+                # external allocation already fits around them.
+                unloaded = unload_all_models()
+                if requested_scope:
+                    gpu_uuids, devices = self._plan_lease_gpus(
+                        0, requested_scope,
+                    )
+                    aggregate_free = sum(
+                        int(device["free_mib"]) for device in devices
+                    )
+                    if requested_mib > 0 and requested_mib > aggregate_free:
+                        stopped = self.stop_pool_lanes(
+                            "lease acquire capacity reclamation",
+                            set(gpu_uuids),
+                        )
+                    # Refresh telemetry after any base unload or managed-lane
+                    # retirement and enforce the reservation against the
+                    # resulting live capacity.
+                    gpu_uuids, devices = self._plan_lease_gpus(
+                        requested_mib, requested_scope,
+                    )
+                else:
+                    stopped = self.stop_pool_lanes("lease acquire")
+                    gpu_uuids, devices = self._plan_lease_gpus(
+                        requested_mib, [],
+                    )
                 aggregate_free = sum(int(device["free_mib"]) for device in devices)
                 if requested_mib > 0 and devices and requested_mib > aggregate_free:
                     raise RuntimeError(
@@ -2478,7 +2529,7 @@ class Broker:
                     "host_memory": host_memory_snapshot()}
 
     def scope(self, token: str, requested_gpu_uuids: list[str]) -> dict[str, Any]:
-        """Convert a live legacy lease to an exclusive whole-GPU scope.
+        """Convert a live legacy lease to an external-owner-exclusive scope.
 
         This transition does not stop the external workload. It is safe only
         when every foreign allocation that grew after acquire is contained in
@@ -3465,7 +3516,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 1. Run `docker gpu discover` and inspect the selected GPUs and current policy.
 2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.
 3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
-4. A scoped lease keeps unreserved GPUs available to broker-owned Ollama lanes. An unscoped lease uses a host-wide drain because placement cannot be proven.
+4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven.
 5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
 6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
 
@@ -3478,7 +3529,7 @@ render_global_codex_gpu_block() {
 <!-- BEGIN ollama-unify GPU negotiator -->
 ## CUDA deployment policy
 
-Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover`. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Unreserved GPUs remain available to broker-owned Ollama lanes. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
+Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover`. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Pending and revoking scopes block those GPUs. Active scopes may share measured free VRAM with broker-owned Ollama lanes, and must call `prepare` before growth. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
 <!-- END ollama-unify GPU negotiator -->
 CODEX_BLOCK
 }

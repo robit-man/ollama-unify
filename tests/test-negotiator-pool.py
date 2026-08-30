@@ -491,6 +491,97 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
         assert harness.status()["draining"] is False
 
 
+def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=2, tags=[MODEL],
+    ) as harness:
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "active-shared-fixture",
+            "requested_mib": 98304,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+        })
+        token = acquired["lease"]["token"]
+
+        pending_status, pending_payload, _ = harness.capacity(MODEL)
+        assert pending_status == 503, pending_payload
+        assert "free=[]" in pending_payload["error"]
+
+        ready = control(harness.socket_path, {"action": "ready", "token": token})
+        assert ready["lease"]["state"] == "active"
+
+        active_status, active_capacity, _ = harness.capacity(MODEL)
+        assert active_status == 200, active_capacity
+        assert active_capacity["admitted_parallel"] == 1
+        assert len(active_capacity["lanes"]) == 1
+        assert active_capacity["lanes"][0]["gpu_uuid"] in {
+            "GPU-large-0", "GPU-large-1", "GPU-large-2",
+        }
+
+        response = chat(
+            harness.proxy_port, MODEL, "during-active-scoped-lease", timeout=10
+        )
+        assert response[0] == 200, response[1]
+        assert response[2]["X-Ollama-Unify-Lane"].startswith("lane-")
+
+        prepared = control(
+            harness.socket_path, {"action": "prepare", "token": token}
+        )
+        assert prepared["lease"]["state"] == "pending"
+        assert prepared["stopped_lanes"]
+        assert managed_lanes(harness.status()) == []
+
+        control(harness.socket_path, {"action": "ready", "token": token})
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+
+
+def test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
+    helper, fixture_bin,
+):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=2, tags=[MODEL],
+    ) as harness:
+        initial_status, initial_capacity, _ = harness.capacity(MODEL)
+        assert initial_status == 200, initial_capacity
+        lane_id = initial_capacity["lanes"][0]["id"]
+        starts_before = len([
+            event for event in events(harness.event_log)
+            if event["kind"] == "start"
+        ])
+
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "fitting-scoped-fixture",
+            "requested_mib": 98304,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+        })
+        token = acquired["lease"]["token"]
+        assert acquired["stopped_lanes"] == []
+        pending_lanes = managed_lanes(harness.status())
+        assert [lane["id"] for lane in pending_lanes] == [lane_id]
+
+        control(harness.socket_path, {"action": "ready", "token": token})
+        response = chat(
+            harness.proxy_port, MODEL, "reuse-after-scoped-ready", timeout=10
+        )
+        assert response[0] == 200, response[1]
+        assert response[2]["X-Ollama-Unify-Lane"] == lane_id
+        assert len([
+            event for event in events(harness.event_log)
+            if event["kind"] == "start"
+        ]) == starts_before
+
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+
+
 def capacity_when_ready(harness, model, parallel=1):
     status, payload, headers = harness.capacity(model, parallel)
     return (status, payload, headers) if status == 200 else None
@@ -892,6 +983,10 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
+    test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
+    test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
+        helper, fixture_bin,
+    )
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
