@@ -1017,6 +1017,9 @@ MAX_CONTEXT = env_int("OLLAMA_UNIFY_MAX_CONTEXT", 0)
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
 ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
 ANON_MAX_DRAIN = env_float("OLLAMA_UNIFY_ANON_MAX_DRAIN", 15.0)
+FOREIGN_RELEASE_TOLERANCE_MIB = max(
+    0, env_int("OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB", 256)
+)
 BACKEND_TYPE = os.environ.get("OLLAMA_UNIFY_BACKEND_TYPE", "unknown")
 SELECTED_GPUS = [value for value in os.environ.get("OLLAMA_UNIFY_SELECTED_GPUS", "").split(",") if value]
 OWNER_GPU_SCOPES = env_owner_gpu_scopes("OLLAMA_UNIFY_OWNER_GPU_SCOPES")
@@ -1029,6 +1032,7 @@ POOL_ENABLED = env_bool(
 POOL_MAX_SERVERS = env_int(
     "OLLAMA_UNIFY_POOL_MAX_SERVERS", max(1, len(SELECTED_GPUS) * 2)
 )
+POOL_MAX_QUEUE = max(1, env_int("OLLAMA_UNIFY_POOL_MAX_QUEUE", 64))
 POOL_PORT_START = env_int("OLLAMA_UNIFY_POOL_PORT_START", BACKEND_PORT + 1)
 POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1))
 POOL_IDLE_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_IDLE_TIMEOUT", 300.0)
@@ -1351,6 +1355,7 @@ def discovery_document() -> dict[str, Any]:
         "parallel_pool": {
             "enabled": POOL_ENABLED,
             "max_managed_servers": POOL_MAX_SERVERS,
+            "max_queue": POOL_MAX_QUEUE,
             "private_port_start": POOL_PORT_START,
             "private_port_end": POOL_PORT_START + max(32, POOL_MAX_SERVERS + 4) - 1,
             "instance_parallel": POOL_INSTANCE_PARALLEL,
@@ -1427,11 +1432,12 @@ def foreign_usage_by_gpu(
 def foreign_usage_at_or_below(
     baseline: dict[str, int], current: dict[str, int],
     gpu_uuids: set[str] | None = None,
+    tolerance_mib: int = 0,
 ) -> bool:
     baseline_by_gpu = foreign_usage_by_gpu(baseline, gpu_uuids)
     current_by_gpu = foreign_usage_by_gpu(current, gpu_uuids)
     return all(
-        used <= baseline_by_gpu.get(gpu_uuid, 0)
+        used <= baseline_by_gpu.get(gpu_uuid, 0) + max(0, tolerance_mib)
         for gpu_uuid, used in current_by_gpu.items()
     )
 
@@ -1452,6 +1458,7 @@ def wait_for_foreign_settle(
                     and (baseline is None
                          or foreign_usage_at_or_below(
                              baseline, current_raw, gpu_uuids,
+                             FOREIGN_RELEASE_TOLERANCE_MIB,
                          ))):
                 return
         else:
@@ -1752,6 +1759,7 @@ class Broker:
                 requests.append(waiter.public_summary(position, now))
         result: dict[str, Any] = {
             "depth": len(self.waiters),
+            "limit": POOL_MAX_QUEUE,
             "peak": self.queue_peak,
             "oldest_wait_ms": max(
                 (max(0, int((now - item.enqueued_at) * 1000))
@@ -2250,6 +2258,12 @@ class Broker:
                     "waiting for verified CUDA release",
                     503,
                 )
+            if len(self.waiters) >= POOL_MAX_QUEUE:
+                self.queue_rejected_total += 1
+                raise PermanentCapacityError(
+                    f"broker queue is full ({len(self.waiters)}/{POOL_MAX_QUEUE}); retry after current admissions settle",
+                    503,
+                )
             waiter = QueuedRequest(
                 request_id, model, enqueued_at, deadline, connected,
                 request_path=request_path,
@@ -2326,6 +2340,23 @@ class Broker:
                     self.cv.wait(0.5)
                     continue
                 waiter = self.waiters[0]
+                blocked_gpus = self._ollama_blocked_gpus_locked()
+                selected_gpus = set(SELECTED_GPUS)
+                if selected_gpus and selected_gpus.issubset(blocked_gpus):
+                    # This state changes only when the lease changes. Repeated
+                    # ensure_capacity calls cannot create a lane and previously
+                    # retried every two seconds, adding noise and CPU churn
+                    # while clients accumulated. Park on the lease-state CV;
+                    # waiter deadlines/disconnects and lease transitions notify.
+                    waiter.phase = "waiting-lease"
+                    waiter.last_error = (
+                        "all selected GPUs are reserved by pending or revoking leases"
+                    )
+                    self.reconcile_retry_at = 0.0
+                    self.reconcile_last_error = waiter.last_error
+                    self.reconciling_model = None
+                    self.cv.wait(5.0)
+                    continue
                 model = waiter.model
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
@@ -2798,6 +2829,7 @@ class Broker:
                 "parallel_pool": {
                     "enabled": POOL_ENABLED,
                     "max_managed_servers": POOL_MAX_SERVERS,
+                    "max_queue": POOL_MAX_QUEUE,
                     "instance_parallel": POOL_INSTANCE_PARALLEL,
                     "lanes": lanes,
                     "queue": queue,
@@ -3740,8 +3772,10 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_ANON_POLL="%s"\n' "$anon_poll"
     printf 'OLLAMA_UNIFY_ANON_SETTLE="%s"\n' "$anon_settle"
     printf 'OLLAMA_UNIFY_ANON_MAX_DRAIN="%s"\n' "$anon_max_drain"
+    printf 'OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB="256"\n'
     printf 'OLLAMA_UNIFY_POOL_ENABLED="%s"\n' "$pool_enabled"
     printf 'OLLAMA_UNIFY_POOL_MAX_SERVERS="%s"\n' "$pool_max_servers"
+    printf 'OLLAMA_UNIFY_POOL_MAX_QUEUE="64"\n'
     printf 'OLLAMA_UNIFY_POOL_PORT_START="%s"\n' "$pool_port_start"
     printf 'OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL="%s"\n' "$pool_instance_parallel"
     printf 'OLLAMA_UNIFY_POOL_IDLE_TIMEOUT="%s"\n' "$pool_idle_timeout"

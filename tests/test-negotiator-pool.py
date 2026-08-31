@@ -205,12 +205,15 @@ def reset_connection(connection):
 
 class PoolHarness:
     def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
-                 runner_vram_mib=2048):
+                 runner_vram_mib=2048, max_queue=64,
+                 release_tolerance_mib=256):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
         self.tags = tags or [MODEL]
         self.runner_vram_mib = runner_vram_mib
+        self.max_queue = max_queue
+        self.release_tolerance_mib = release_tolerance_mib
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -241,6 +244,7 @@ class PoolHarness:
             "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
+            "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
             "OLLAMA_UNIFY_POOL_PORT_START": str(pool_port),
             "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": "1",
             "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
@@ -254,6 +258,9 @@ class PoolHarness:
             "OLLAMA_UNIFY_ANON_POLL": "0.05",
             "OLLAMA_UNIFY_ANON_SETTLE": "0.1",
             "OLLAMA_UNIFY_ANON_MAX_DRAIN": "0.3",
+            "OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB": str(
+                self.release_tolerance_mib
+            ),
         })
         self.daemon = subprocess.Popen(
             [self.helper, "serve"], env=env, stdout=subprocess.PIPE,
@@ -528,6 +535,89 @@ def test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         assert status["draining"] is False
         assert status["leases"] == []
         assert [lane["id"] for lane in managed_lanes(status)] == lane_ids
+
+
+def test_scoped_release_tolerates_small_foreign_accounting_drift(
+    helper, fixture_bin,
+):
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        write_compute_apps(harness.compute_apps, [
+            (920101, "GPU-large-0", 1024),
+        ])
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "scoped-accounting-drift-fixture",
+            "requested_mib": 4096,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        token = acquired["lease"]["token"]
+        control(harness.socket_path, {"action": "ready", "token": token})
+
+        # nvidia-smi accounting for an unrelated resident process can move by
+        # a small amount even when the leased workload has fully exited.
+        write_compute_apps(harness.compute_apps, [
+            (920202, "GPU-large-0", 1126),
+        ])
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+        assert harness.status()["leases"] == []
+
+
+def test_broker_queue_has_hard_ceiling_during_all_gpu_lease(
+    helper, fixture_bin,
+):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1, max_queue=2,
+    ) as harness:
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "all-gpu-queue-cap-fixture",
+            "requested_mib": 4096,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+        })
+        token = acquired["lease"]["token"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            first = executor.submit(
+                chat, harness.proxy_port, MODEL, "queue-cap-1", 0, 10
+            )
+            second = executor.submit(
+                chat, harness.proxy_port, MODEL, "queue-cap-2", 0, 10
+            )
+            queue = wait_until(
+                lambda: queue_with_depth(harness, 2),
+                "broker queue to reach its configured ceiling",
+            )
+            assert queue["limit"] == 2
+            assert sum(queue["phase_counts"].values()) == 2
+            assert queue["phase_counts"].get("waiting-lease") == 1
+
+            started = time.monotonic()
+            status, payload, headers = chat(
+                harness.proxy_port, MODEL, "queue-cap-rejected", timeout=3
+            )
+            assert status == 503, payload
+            assert time.monotonic() - started < 1
+            assert "broker queue is full (2/2)" in payload["error"]
+            assert payload["retryable"] is True
+            assert headers["X-Ollama-Unify-Retryable"] == "true"
+            assert harness.status()["parallel_pool"]["queue"]["depth"] == 2
+
+            released = control(
+                harness.socket_path, {"action": "release", "token": token}
+            )
+            assert released["released"] == token
+            assert first.result(timeout=10)[0] == 200
+            assert second.result(timeout=10)[0] == 200
+
+        final_queue = harness.status()["parallel_pool"]["queue"]
+        assert final_queue["depth"] == 0
+        assert final_queue["limit"] == 2
+        assert final_queue["rejected_total"] >= 1
 
 
 def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin):
@@ -1025,6 +1115,12 @@ def main():
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         helper, fixture_bin,
     )
+    test_scoped_release_tolerates_small_foreign_accounting_drift(
+        helper, fixture_bin,
+    )
+    test_broker_queue_has_hard_ceiling_during_all_gpu_lease(
+        helper, fixture_bin,
+    )
     test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
     test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
         helper, fixture_bin,
@@ -1043,8 +1139,9 @@ def main():
     test_capacity_rejects_unknown_endpoint(helper, fixture_bin)
     print(
         "negotiator pool integration: PASS "
-        "(fit, endpoint-aware warm lanes, stable watcher, aliases, replacement, "
-        "per-model FIFO, warm-lane bypass, cancellation, terminal admission failures)"
+        "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
+        "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
+        "cancellation, terminal admission failures)"
     )
 
 
