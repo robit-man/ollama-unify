@@ -1718,6 +1718,90 @@ def test_unknown_body_free_resume_never_enqueues(helper, fixture_bin):
         assert after["enqueued_total"] == before["enqueued_total"]
 
 
+def test_feasible_controlled_load_has_no_admission_loss_or_amplification(
+    helper, fixture_bin,
+):
+    """Quantify the broker's bounded behavior without a model or live service."""
+    request_count = 100
+    concurrent_count = 92
+    replay_count = request_count - concurrent_count
+    max_queue = 32
+    completed_max_entries = 16
+    completed_max_total_bytes = 16 * 1024
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=3,
+        max_queue=max_queue,
+        completed_ttl=10.0,
+        completed_max_entries=completed_max_entries,
+        completed_max_body_bytes=2 * 1024,
+        completed_max_total_bytes=completed_max_total_bytes,
+    ) as harness:
+        def submit(index):
+            return chat(
+                harness.proxy_port,
+                MODEL,
+                f"controlled-load-{index:03d}",
+                0.01,
+                10,
+                logical_request_id=f"turn:controlled-load:{index:03d}",
+                admission_wait_ms=5_000,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [
+                executor.submit(submit, index)
+                for index in range(concurrent_count)
+            ]
+            initial_results = [future.result(timeout=10) for future in futures]
+
+        # These final admissions become deterministic retained replay anchors.
+        anchor_results = [
+            submit(index)
+            for index in range(concurrent_count, request_count)
+        ]
+        all_results = initial_results + anchor_results
+        failed = [result for result in all_results if result[0] != 200]
+        assert len(failed) / request_count < 0.01, failed
+
+        replay_results = [
+            resume_chat(
+                harness.proxy_port,
+                f"turn:controlled-load:{index:03d}",
+                10,
+                admission_wait_ms=5_000,
+            )
+            for index in range(concurrent_count, request_count)
+        ]
+        assert all(result[0] == 200 for result in replay_results)
+        assert all(
+            result[2].get("X-Ollama-Unify-Response-Replayed") == "true"
+            for result in replay_results
+        )
+
+        generated = [
+            event["request_id"]
+            for event in request_events(harness.event_log)
+            if str(event["request_id"]).startswith("controlled-load-")
+        ]
+        assert len(generated) == request_count
+        assert len(set(generated)) == request_count
+
+        status = harness.status()["parallel_pool"]
+        queue = status["queue"]
+        completed = status["completed_responses"]
+        assert queue["depth"] == 0
+        assert queue["peak"] <= max_queue
+        assert queue["enqueued_total"] == request_count
+        assert queue["admitted_total"] == request_count
+        assert queue["rejected_total"] == 0
+        assert completed["entries"] <= completed_max_entries
+        assert completed["retained_entries"] <= completed_max_entries
+        assert completed["retained_bytes"] <= completed_max_total_bytes
+        assert completed["replayed_total"] == replay_count
+
+
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
@@ -1759,12 +1843,15 @@ def main():
     test_retryable_warm_failure_stays_queued(helper, fixture_bin)
     test_capacity_rejects_unknown_endpoint(helper, fixture_bin)
     test_unknown_body_free_resume_never_enqueues(helper, fixture_bin)
+    test_feasible_controlled_load_has_no_admission_loss_or_amplification(
+        helper, fixture_bin,
+    )
     print(
         "negotiator pool integration: PASS "
         "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
         "resumable logical admission, completed-response replay, cancellation, "
-        "terminal admission failures)"
+        "terminal admission failures, controlled-load admission and replay bounds)"
     )
 
 
