@@ -100,6 +100,19 @@ def http_json(port, method, path, payload=None, timeout=10, extra_headers=None):
     return result
 
 
+def http_raw(port, method, path, payload=None, timeout=10, extra_headers=None):
+    body = None if payload is None else json.dumps(payload).encode()
+    headers = {} if body is None else {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    data = response.read()
+    result = response.status, data, dict(response.getheaders())
+    conn.close()
+    return result
+
+
 def control(path, payload):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(10)
@@ -173,6 +186,7 @@ def chat(
     admission_wait_ms=None,
     workload_class="foreground",
     queue_policy="wait",
+    mock_body_size=None,
 ):
     headers = {
         "X-Ollama-Unify-Workload-Class": workload_class,
@@ -182,12 +196,18 @@ def chat(
         headers["X-Ollama-Unify-Logical-Request-Id"] = logical_request_id
     if admission_wait_ms is not None:
         headers["X-Ollama-Unify-Admission-Wait-Ms"] = str(admission_wait_ms)
-    return http_json(port, "POST", "/api/chat", {
+    payload = {
         "model": model,
         "stream": False,
         "mock_request_id": request_id,
         "mock_delay": delay,
-    }, timeout=timeout, extra_headers=headers)
+    }
+    if mock_body_size is not None:
+        payload["mock_body_size"] = mock_body_size
+    return http_json(
+        port, "POST", "/api/chat", payload,
+        timeout=timeout, extra_headers=headers,
+    )
 
 
 def embed(port, model, request_id, timeout=10):
@@ -198,11 +218,34 @@ def embed(port, model, request_id, timeout=10):
     }, timeout=timeout)
 
 
-def open_abandonable_chat(port, model, request_id, logical_request_id=None):
+def streaming_chat(port, model, request_id, logical_request_id, timeout=10):
+    return http_raw(
+        port,
+        "POST",
+        "/api/chat",
+        {
+            "model": model,
+            "stream": True,
+            "mock_stream": True,
+            "mock_request_id": request_id,
+        },
+        timeout=timeout,
+        extra_headers={
+            "X-Ollama-Unify-Logical-Request-Id": logical_request_id,
+            "X-Ollama-Unify-Workload-Class": "foreground",
+            "X-Ollama-Unify-Queue-Policy": "wait",
+        },
+    )
+
+
+def open_abandonable_chat(
+    port, model, request_id, logical_request_id=None, delay=0,
+):
     payload = json.dumps({
         "model": model,
         "stream": False,
         "mock_request_id": request_id,
+        "mock_delay": delay,
     }).encode()
     connection = socket.create_connection(("127.0.0.1", port), timeout=2)
     connection.sendall(
@@ -230,7 +273,10 @@ def reset_connection(connection):
 class PoolHarness:
     def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
                  runner_vram_mib=2048, max_queue=64,
-                 release_tolerance_mib=256, resume_ttl=1.0):
+                 release_tolerance_mib=256, resume_ttl=1.0,
+                 completed_ttl=2.0, completed_max_entries=8,
+                 completed_max_body_bytes=1024 * 1024,
+                 completed_max_total_bytes=4 * 1024 * 1024):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
@@ -239,6 +285,10 @@ class PoolHarness:
         self.max_queue = max_queue
         self.release_tolerance_mib = release_tolerance_mib
         self.resume_ttl = resume_ttl
+        self.completed_ttl = completed_ttl
+        self.completed_max_entries = completed_max_entries
+        self.completed_max_body_bytes = completed_max_body_bytes
+        self.completed_max_total_bytes = completed_max_total_bytes
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -271,6 +321,16 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
             "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
             "OLLAMA_UNIFY_POOL_RESUME_TTL": str(self.resume_ttl),
+            "OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL": str(self.completed_ttl),
+            "OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_ENTRIES": str(
+                self.completed_max_entries
+            ),
+            "OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_BODY_BYTES": str(
+                self.completed_max_body_bytes
+            ),
+            "OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_TOTAL_BYTES": str(
+                self.completed_max_total_bytes
+            ),
             "OLLAMA_UNIFY_POOL_PORT_START": str(pool_port),
             "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": "1",
             "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
@@ -374,6 +434,14 @@ def test_existing_pool_contract(helper, fixture_bin):
             )
             assert admission_protocol["queue_policies"] == ["wait", "yield"]
             assert admission_protocol["retry_after_json_field"] == "retry_after_ms"
+            replay_contract = admission_protocol["completed_response_replay"]
+            assert replay_contract["schema"] == (
+                "io.ollama-unify.completed-response-cache.v1"
+            )
+            assert replay_contract["content_exposed"] is False
+            assert replay_contract["max_entries"] >= 1
+            assert replay_contract["max_body_bytes"] >= 0
+            assert replay_contract["max_total_bytes"] >= 0
             status, capacity, _ = http_json(
                 proxy_port, "POST",
                 "/.well-known/ollama-unify-gpu-negotiator/capacity",
@@ -1093,6 +1161,217 @@ def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
         assert queue["stale_total"] == 0
 
 
+def test_completed_native_response_replays_without_generation(
+    helper, fixture_bin,
+):
+    logical_id = "turn:completed-native"
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        first = chat(
+            harness.proxy_port, MODEL, "completed-native", 0, 8,
+            logical_request_id=logical_id,
+        )
+        replay = chat(
+            harness.proxy_port, MODEL, "completed-native", 0, 8,
+            logical_request_id=logical_id,
+        )
+        assert first[0] == replay[0] == 200
+        assert first[1] == replay[1]
+        for header in (
+            "Content-Type",
+            "X-Mock-Response",
+            "X-Ollama-Unify-Lane",
+            "X-Ollama-Unify-Request-Id",
+            "X-Ollama-Unify-Logical-Request-Id",
+            "X-Ollama-Unify-Workload-Class",
+            "X-Ollama-Unify-Queue-Policy",
+            "X-Ollama-Unify-Queue-Ms",
+            "X-Ollama-Unify-Queue-Position",
+        ):
+            assert first[2][header] == replay[2][header]
+        assert "X-Ollama-Unify-Response-Replayed" not in first[2]
+        assert replay[2]["X-Ollama-Unify-Response-Replayed"] == "true"
+        assert len(replay[2]["X-Ollama-Unify-Completed-Response-Sha256"]) == 64
+
+        conflict = chat(
+            harness.proxy_port, MODEL, "completed-native-changed", 0, 8,
+            logical_request_id=logical_id,
+        )
+        assert conflict[0] == 409, conflict
+        assert conflict[1]["reason_code"] == "logical_request_conflict"
+        assert conflict[1]["retryable"] is False
+        assert "Retry-After" not in conflict[2]
+
+        generated = [
+            event["request_id"] for event in request_events(harness.event_log)
+            if event["request_id"].startswith("completed-native")
+        ]
+        assert generated == ["completed-native"]
+        discovery = http_json(
+            harness.proxy_port, "GET",
+            "/.well-known/ollama-unify-gpu-negotiator",
+        )[1]
+        completed = discovery["parallel_pool"]["completed_responses"]
+        assert completed["entries"] == 1
+        assert completed["retained_entries"] == 1
+        assert completed["recorded_total"] == 1
+        assert completed["replayed_total"] == 1
+        assert completed["conflict_total"] == 1
+        serialized = json.dumps(completed, sort_keys=True)
+        assert logical_id not in serialized
+        assert "completed-native" not in serialized
+        assert "fingerprint" not in serialized
+
+
+def test_completed_streaming_response_replays_exact_body(helper, fixture_bin):
+    logical_id = "turn:completed-stream"
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        first = streaming_chat(
+            harness.proxy_port, MODEL, "completed-stream", logical_id, 8,
+        )
+        replay = streaming_chat(
+            harness.proxy_port, MODEL, "completed-stream", logical_id, 8,
+        )
+        assert first[0] == replay[0] == 200
+        assert first[1] == replay[1]
+        assert first[1].count(b"\n") == 2
+        assert first[2]["Content-Type"] == "application/x-ndjson"
+        assert replay[2]["Content-Type"] == first[2]["Content-Type"]
+        assert replay[2]["X-Mock-Response"] == first[2]["X-Mock-Response"]
+        assert replay[2]["X-Ollama-Unify-Response-Replayed"] == "true"
+        assert int(replay[2]["Content-Length"]) == len(first[1])
+        generated = [
+            event["request_id"] for event in request_events(harness.event_log)
+            if event["request_id"] == "completed-stream"
+        ]
+        assert generated == ["completed-stream"]
+
+
+def test_completed_response_survives_delivery_disconnect(helper, fixture_bin):
+    logical_id = "turn:completed-after-disconnect"
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        abandoned = open_abandonable_chat(
+            harness.proxy_port,
+            MODEL,
+            "completed-after-disconnect",
+            logical_request_id=logical_id,
+            delay=0.25,
+        )
+        wait_until(
+            lambda: any(
+                event.get("request_id") == "completed-after-disconnect"
+                for event in request_events(harness.event_log)
+            ),
+            "logical request to reach the backend before disconnect",
+        )
+        reset_connection(abandoned)
+        wait_until(
+            lambda: harness.status()["parallel_pool"][
+                "completed_responses"
+            ]["retained_entries"] == 1,
+            "completed response to be retained after delivery disconnect",
+        )
+        replay = chat(
+            harness.proxy_port,
+            MODEL,
+            "completed-after-disconnect",
+            0.25,
+            8,
+            logical_request_id=logical_id,
+        )
+        assert replay[0] == 200, replay
+        assert replay[2]["X-Ollama-Unify-Response-Replayed"] == "true"
+        generated = [
+            event["request_id"] for event in request_events(harness.event_log)
+            if event["request_id"] == "completed-after-disconnect"
+        ]
+        assert generated == ["completed-after-disconnect"]
+
+
+def test_completed_oversize_response_fails_closed_without_regeneration(
+    helper, fixture_bin,
+):
+    logical_id = "turn:completed-oversize"
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        completed_max_body_bytes=128,
+        completed_max_total_bytes=512,
+    ) as harness:
+        first = chat(
+            harness.proxy_port, MODEL, "completed-oversize", 0, 8,
+            logical_request_id=logical_id,
+            mock_body_size=1024,
+        )
+        assert first[0] == 200, first
+        replay = chat(
+            harness.proxy_port, MODEL, "completed-oversize", 0, 8,
+            logical_request_id=logical_id,
+            mock_body_size=1024,
+        )
+        assert replay[0] == 409, replay
+        assert replay[1]["reason_code"] == "completed_response_unavailable"
+        assert replay[1]["retryable"] is False
+        receipt = replay[1]["completed_response"]
+        assert receipt["retained"] is False
+        assert receipt["body_bytes"] > 1024
+        assert len(receipt["body_sha256"]) == 64
+        assert "per_entry_limit" in receipt["unavailable_reason"]
+        assert "Retry-After" not in replay[2]
+        generated = [
+            event["request_id"] for event in request_events(harness.event_log)
+            if event["request_id"] == "completed-oversize"
+        ]
+        assert generated == ["completed-oversize"]
+        completed = harness.status()["parallel_pool"]["completed_responses"]
+        assert completed["entries"] == 1
+        assert completed["unavailable_entries"] == 1
+        assert completed["retained_bytes"] == 0
+        assert completed["unavailable_total"] == 1
+
+
+def test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        completed_ttl=0.2,
+        completed_max_entries=2,
+    ) as harness:
+        for index in range(1, 4):
+            result = chat(
+                harness.proxy_port, MODEL, f"completed-evict-{index}", 0, 8,
+                logical_request_id=f"turn:completed-evict-{index}",
+            )
+            assert result[0] == 200, result
+        bounded = harness.status()["parallel_pool"]["completed_responses"]
+        assert bounded["entries"] == 2
+        assert bounded["evicted_total"] == 1
+
+        regenerated = chat(
+            harness.proxy_port, MODEL, "completed-evict-1", 0, 8,
+            logical_request_id="turn:completed-evict-1",
+        )
+        assert regenerated[0] == 200, regenerated
+        assert "X-Ollama-Unify-Response-Replayed" not in regenerated[2]
+        generated = [
+            event["request_id"] for event in request_events(harness.event_log)
+            if event["request_id"] == "completed-evict-1"
+        ]
+        assert generated == ["completed-evict-1", "completed-evict-1"]
+
+        time.sleep(0.25)
+        after_ttl = chat(
+            harness.proxy_port, MODEL, "completed-evict-1", 0, 8,
+            logical_request_id="turn:completed-evict-1",
+        )
+        assert after_ttl[0] == 200, after_ttl
+        assert "X-Ollama-Unify-Response-Replayed" not in after_ttl[2]
+        completed = harness.status()["parallel_pool"]["completed_responses"]
+        assert completed["entries"] == 1
+        assert completed["expired_total"] >= 1
+
+
 def test_detached_logical_request_expires_without_inference(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=1, resume_ttl=0.2) as harness:
         assert harness.capacity(MODEL)[0] == 200
@@ -1403,6 +1682,13 @@ def main():
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
     test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin)
+    test_completed_native_response_replays_without_generation(helper, fixture_bin)
+    test_completed_streaming_response_replays_exact_body(helper, fixture_bin)
+    test_completed_response_survives_delivery_disconnect(helper, fixture_bin)
+    test_completed_oversize_response_fails_closed_without_regeneration(
+        helper, fixture_bin,
+    )
+    test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin)
     test_detached_logical_request_expires_without_inference(helper, fixture_bin)
     test_temporary_and_permanent_placement_failures(helper, fixture_bin)
     test_ready_model_bypasses_blocked_other_model(helper, fixture_bin)
@@ -1415,7 +1701,8 @@ def main():
         "negotiator pool integration: PASS "
         "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
-        "resumable logical admission, cancellation, terminal admission failures)"
+        "resumable logical admission, completed-response replay, cancellation, "
+        "terminal admission failures)"
     )
 
 

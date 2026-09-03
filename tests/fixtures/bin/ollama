@@ -58,11 +58,13 @@ class Server(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def send_json(self, payload, status=200):
+    def send_json(self, payload, status=200, headers=None):
         data = json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -112,6 +114,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         delay = float(payload.get("mock_delay") or 0)
         if delay > 0:
             time.sleep(delay)
+        if payload.get("mock_stream") is True:
+            chunks = [
+                json.dumps({"message": "first", "done": False}, separators=(",", ":")).encode() + b"\n",
+                json.dumps({"message": "second", "done": True}, separators=(",", ":")).encode() + b"\n",
+            ]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header(
+                "X-Mock-Response", str(payload.get("mock_request_id") or "")
+            )
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in chunks:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                time.sleep(0.02)
+            self.close_connection = True
+            return
         with self.server.lock:
             if payload.get("keep_alive") == 0:
                 self.server.models = []
@@ -119,7 +139,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif model:
                 self.server.models = [{"name": model, "size_vram": 1024}]
                 set_gpu_usage(True)
-        self.send_json({"done": True, "model": model, "gpu": gpu, "pid": os.getpid()})
+        response_payload = {
+            "done": True, "model": model, "gpu": gpu, "pid": os.getpid(),
+        }
+        mock_body_size = int(payload.get("mock_body_size") or 0)
+        if mock_body_size > 0:
+            response_payload["padding"] = "x" * mock_body_size
+        self.send_json(
+            response_payload,
+            headers={
+                "X-Mock-Response": str(payload.get("mock_request_id") or "")
+            },
+        )
 
     def log_message(self, _fmt, *_args):
         pass

@@ -1040,6 +1040,18 @@ POOL_MAX_QUEUE = max(1, env_int("OLLAMA_UNIFY_POOL_MAX_QUEUE", 64))
 POOL_RESUME_TTL = max(
     0.1, env_float("OLLAMA_UNIFY_POOL_RESUME_TTL", 30.0)
 )
+COMPLETED_RESPONSE_TTL = max(
+    0.1, env_float("OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL", 120.0)
+)
+COMPLETED_RESPONSE_MAX_ENTRIES = max(
+    1, env_int("OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_ENTRIES", 64)
+)
+COMPLETED_RESPONSE_MAX_BODY_BYTES = max(
+    0, env_int("OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_BODY_BYTES", 8 * 1024 * 1024)
+)
+COMPLETED_RESPONSE_MAX_TOTAL_BYTES = max(
+    0, env_int("OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_TOTAL_BYTES", 64 * 1024 * 1024)
+)
 POOL_PORT_START = env_int("OLLAMA_UNIFY_POOL_PORT_START", BACKEND_PORT + 1)
 POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1))
 POOL_IDLE_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_IDLE_TIMEOUT", 300.0)
@@ -1395,8 +1407,22 @@ def discovery_document() -> dict[str, Any]:
                     "backend_start_failed",
                     "logical_request_conflict",
                     "logical_request_in_progress",
+                    "completed_response_unavailable",
                     "invalid_admission_header",
                 ],
+                "completed_response_replay": {
+                    "schema": "io.ollama-unify.completed-response-cache.v1",
+                    "scope": "logical inference requests",
+                    "ttl_seconds": COMPLETED_RESPONSE_TTL,
+                    "max_entries": COMPLETED_RESPONSE_MAX_ENTRIES,
+                    "max_body_bytes": COMPLETED_RESPONSE_MAX_BODY_BYTES,
+                    "max_total_bytes": COMPLETED_RESPONSE_MAX_TOTAL_BYTES,
+                    "replay_header": "X-Ollama-Unify-Response-Replayed",
+                    "response_hash_header": (
+                        "X-Ollama-Unify-Completed-Response-Sha256"
+                    ),
+                    "content_exposed": False,
+                },
             },
         },
         "commands": {
@@ -1626,6 +1652,24 @@ class AdmissionTimeoutError(CapacityError):
         )
 
 
+class CompletedResponseUnavailableError(PermanentCapacityError):
+    def __init__(self, response: "CompletedResponse") -> None:
+        self.completed_status = response.status
+        self.completed_body_bytes = response.body_bytes
+        self.completed_body_sha256 = response.body_sha256
+        self.unavailable_reason = (
+            response.unavailable_reason or "response_body_not_retained"
+        )
+        super().__init__(
+            "logical request already completed, but its response body cannot "
+            "be replayed safely",
+            409,
+            "completed_response_unavailable",
+            request_id=response.request_id,
+            logical_request_id=response.logical_request_id,
+        )
+
+
 class ClientDisconnected(ConnectionError):
     pass
 
@@ -1680,6 +1724,29 @@ class Admission:
     initial_position: int
 
 
+@dataclass(frozen=True)
+class CompletedResponse:
+    """Bounded replay record for one completed logical inference request.
+
+    Bodies never enter logs or discovery. A body-free record is an explicit
+    tombstone: the backend completed the logical request, but replay is unsafe,
+    so a duplicate must fail closed instead of generating a second response.
+    """
+
+    logical_request_id: str
+    request_fingerprint: str
+    request_id: str
+    status: int
+    reason: str
+    headers: tuple[tuple[str, str], ...]
+    body: bytes | None
+    body_bytes: int
+    body_sha256: str
+    unavailable_reason: str | None
+    completed_at: float
+    expires_at: float
+
+
 class Broker:
     def __init__(self) -> None:
         self.cv = threading.Condition()
@@ -1695,6 +1762,14 @@ class Broker:
         self.anonymous_running = False
         self.waiters: list[QueuedRequest] = []
         self.logical_in_flight: dict[str, tuple[str, str]] = {}
+        self.completed_responses: dict[str, CompletedResponse] = {}
+        self.completed_response_bytes = 0
+        self.completed_response_recorded_total = 0
+        self.completed_response_replayed_total = 0
+        self.completed_response_unavailable_total = 0
+        self.completed_response_conflict_total = 0
+        self.completed_response_expired_total = 0
+        self.completed_response_evicted_total = 0
         self.reconcile_retry_at = 0.0
         self.reconcile_last_error = ""
         self.reconciling_model: str | None = None
@@ -1861,6 +1936,171 @@ class Broker:
                 f"{aggregate_free} MiB free after Ollama unload"
             )
         return requested, devices
+
+    def _remove_completed_response_locked(
+        self, logical_request_id: str, *, expired: bool = False,
+        evicted: bool = False,
+    ) -> None:
+        response = self.completed_responses.pop(logical_request_id, None)
+        if response is None:
+            return
+        if response.body is not None:
+            self.completed_response_bytes = max(
+                0, self.completed_response_bytes - len(response.body)
+            )
+        if expired:
+            self.completed_response_expired_total += 1
+        if evicted:
+            self.completed_response_evicted_total += 1
+
+    def _prune_completed_responses_locked(
+        self, now: float | None = None,
+    ) -> None:
+        current = time.monotonic() if now is None else now
+        expired = [
+            logical_request_id
+            for logical_request_id, response in self.completed_responses.items()
+            if current >= response.expires_at
+        ]
+        for logical_request_id in expired:
+            self._remove_completed_response_locked(
+                logical_request_id, expired=True
+            )
+
+    def _evict_oldest_completed_response_locked(self) -> bool:
+        if not self.completed_responses:
+            return False
+        oldest = min(
+            self.completed_responses,
+            key=lambda logical_request_id: self.completed_responses[
+                logical_request_id
+            ].completed_at,
+        )
+        self._remove_completed_response_locked(oldest, evicted=True)
+        return True
+
+    def completed_response_lookup(
+        self, logical_request_id: str, request_fingerprint: str,
+    ) -> CompletedResponse | None:
+        if not logical_request_id:
+            return None
+        with self.cv:
+            self._prune_completed_responses_locked()
+            response = self.completed_responses.get(logical_request_id)
+            if response is None:
+                return None
+            self.queue_duplicate_total += 1
+            if response.request_fingerprint != request_fingerprint:
+                self.completed_response_conflict_total += 1
+                raise PermanentCapacityError(
+                    "logical request ID was reused with different request content",
+                    409,
+                    "logical_request_conflict",
+                    request_id=response.request_id,
+                    logical_request_id=logical_request_id,
+                )
+            if response.body is None:
+                self.completed_response_unavailable_total += 1
+                raise CompletedResponseUnavailableError(response)
+            self.completed_response_replayed_total += 1
+            return response
+
+    def record_completed_response(
+        self,
+        *,
+        logical_request_id: str,
+        request_fingerprint: str,
+        request_id: str,
+        status: int,
+        reason: str,
+        headers: list[tuple[str, str]],
+        body: bytes | None,
+        body_bytes: int,
+        body_sha256: str,
+        unavailable_reason: str | None = None,
+    ) -> None:
+        if not logical_request_id:
+            return
+        retained = body
+        unavailable = unavailable_reason
+        if (
+            retained is not None
+            and len(retained) > COMPLETED_RESPONSE_MAX_BODY_BYTES
+        ):
+            retained = None
+            unavailable = "response_body_exceeds_per_entry_limit"
+        if (
+            retained is not None
+            and len(retained) > COMPLETED_RESPONSE_MAX_TOTAL_BYTES
+        ):
+            retained = None
+            unavailable = "response_body_exceeds_total_cache_limit"
+        now = time.monotonic()
+        with self.cv:
+            self._prune_completed_responses_locked(now)
+            self._remove_completed_response_locked(logical_request_id)
+            while (
+                len(self.completed_responses) >= COMPLETED_RESPONSE_MAX_ENTRIES
+            ):
+                if not self._evict_oldest_completed_response_locked():
+                    break
+            retained_bytes = len(retained) if retained is not None else 0
+            while (
+                retained is not None
+                and self.completed_response_bytes + retained_bytes
+                    > COMPLETED_RESPONSE_MAX_TOTAL_BYTES
+            ):
+                if not self._evict_oldest_completed_response_locked():
+                    retained = None
+                    retained_bytes = 0
+                    unavailable = "response_body_exceeds_total_cache_limit"
+                    break
+            response = CompletedResponse(
+                logical_request_id=logical_request_id,
+                request_fingerprint=request_fingerprint,
+                request_id=request_id,
+                status=status,
+                reason=reason,
+                headers=tuple(headers),
+                body=retained,
+                body_bytes=body_bytes,
+                body_sha256=body_sha256,
+                unavailable_reason=(
+                    unavailable if retained is None else None
+                ),
+                completed_at=now,
+                expires_at=now + COMPLETED_RESPONSE_TTL,
+            )
+            self.completed_responses[logical_request_id] = response
+            self.completed_response_bytes += retained_bytes
+            self.completed_response_recorded_total += 1
+            self.cv.notify_all()
+
+    def _completed_response_summary_locked(self) -> dict[str, Any]:
+        self._prune_completed_responses_locked()
+        retained_entries = sum(
+            response.body is not None
+            for response in self.completed_responses.values()
+        )
+        return {
+            "schema": "io.ollama-unify.completed-response-cache.v1",
+            "ttl_seconds": COMPLETED_RESPONSE_TTL,
+            "max_entries": COMPLETED_RESPONSE_MAX_ENTRIES,
+            "max_body_bytes": COMPLETED_RESPONSE_MAX_BODY_BYTES,
+            "max_total_bytes": COMPLETED_RESPONSE_MAX_TOTAL_BYTES,
+            "entries": len(self.completed_responses),
+            "retained_entries": retained_entries,
+            "unavailable_entries": (
+                len(self.completed_responses) - retained_entries
+            ),
+            "retained_bytes": self.completed_response_bytes,
+            "recorded_total": self.completed_response_recorded_total,
+            "replayed_total": self.completed_response_replayed_total,
+            "unavailable_total": self.completed_response_unavailable_total,
+            "conflict_total": self.completed_response_conflict_total,
+            "expired_total": self.completed_response_expired_total,
+            "evicted_total": self.completed_response_evicted_total,
+        }
 
     def _lane_summaries_locked(self) -> list[dict[str, Any]]:
         self._prune_dead_lanes_locked()
@@ -3181,6 +3421,7 @@ class Broker:
             reason = self.last_reason
             lanes = self._lane_summaries_locked()
             queue = self._queue_summary_locked(include_requests=True)
+            completed_responses = self._completed_response_summary_locked()
         backend = probe_backend()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
@@ -3197,6 +3438,7 @@ class Broker:
                     "instance_parallel": POOL_INSTANCE_PARALLEL,
                     "lanes": lanes,
                     "queue": queue,
+                    "completed_responses": completed_responses,
                 },
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
@@ -3447,6 +3689,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if failure.admission_retained:
             payload["admission_retained"] = True
             payload["resume_ttl_ms"] = int(POOL_RESUME_TTL * 1000)
+        if isinstance(failure, CompletedResponseUnavailableError):
+            payload["completed_response"] = {
+                "schema": "io.ollama-unify.completed-response-receipt.v1",
+                "status": failure.completed_status,
+                "body_bytes": failure.completed_body_bytes,
+                "body_sha256": failure.completed_body_sha256,
+                "retained": False,
+                "unavailable_reason": failure.unavailable_reason,
+            }
         headers = {
             "X-Ollama-Unify-Retryable": str(failure.retryable).lower(),
             "X-Ollama-Unify-Reason-Code": failure.reason_code,
@@ -3461,7 +3712,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             headers[LOGICAL_REQUEST_HEADER] = logical_id
         if failure.admission_retained:
             headers["X-Ollama-Unify-Admission-Retained"] = "true"
+        if isinstance(failure, CompletedResponseUnavailableError):
+            headers["X-Ollama-Unify-Completed-Response-Sha256"] = (
+                failure.completed_body_sha256
+            )
         self._send_json(failure.status, payload, headers)
+
+    def _send_completed_response(self, response: CompletedResponse) -> None:
+        """Replay retained bytes without contacting or admitting a backend."""
+        if response.body is None:
+            raise CompletedResponseUnavailableError(response)
+        try:
+            self.send_response(response.status, response.reason)
+            for key, value in response.headers:
+                if key.lower() not in HOP_HEADERS and key.lower() != "content-length":
+                    self.send_header(key, value)
+            self.send_header("Content-Length", str(len(response.body)))
+            self.send_header("X-Ollama-Unify-Response-Replayed", "true")
+            self.send_header(
+                "X-Ollama-Unify-Completed-Response-Sha256",
+                response.body_sha256,
+            )
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(response.body)
+                self.wfile.flush()
+        except OSError:
+            pass
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -3470,6 +3747,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             with self.broker.cv:
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
                 document["parallel_pool"]["queue"] = self.broker._queue_summary_locked()
+                document["parallel_pool"]["completed_responses"] = (
+                    self.broker._completed_response_summary_locked()
+                )
             self._send_json(200, document)
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -3534,6 +3814,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         admission = None
         request_id = secrets.token_hex(8)
         logical_request_id = ""
+        fingerprint = ""
         workload_class = "unspecified"
         queue_policy = "wait"
         try:
@@ -3545,10 +3826,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             fingerprint = hashlib.sha256(
                 self.command.encode()
                 + b"\0"
-                + path.encode()
+                + self.path.encode()
+                + b"\0"
+                + content_type.lower().encode()
                 + b"\0"
                 + body
             ).hexdigest()
+            if logical_request_id and path in INFERENCE_PATHS:
+                completed = self.broker.completed_response_lookup(
+                    logical_request_id, fingerprint
+                )
+                if completed is not None:
+                    self._send_completed_response(completed)
+                    return
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
                 allow_during_drain=path in SAFE_METADATA_PATHS,
@@ -3609,42 +3899,99 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             backend = http.client.HTTPConnection(lane.host, lane.port, timeout=None)
             backend.request(self.command, self.path, body=body if body else None, headers=headers)
             response = backend.getresponse()
-            self.send_response(response.status, response.reason)
-            for key, value in response.getheaders():
-                if key.lower() not in HOP_HEADERS and key.lower() != "content-length":
-                    self.send_header(key, value)
-            self.send_header("X-Ollama-Unify-Lane", lane.lane_id)
-            self.send_header("X-Ollama-Unify-Request-Id", admission.request_id)
+            forwarded_headers = [
+                (key, value) for key, value in response.getheaders()
+                if key.lower() not in HOP_HEADERS
+                and key.lower() != "content-length"
+            ]
+            broker_headers = [
+                ("X-Ollama-Unify-Lane", lane.lane_id),
+                ("X-Ollama-Unify-Request-Id", admission.request_id),
+                ("X-Ollama-Unify-Workload-Class", workload_class),
+                ("X-Ollama-Unify-Queue-Policy", queue_policy),
+                ("X-Ollama-Unify-Queue-Ms", str(admission.queue_ms)),
+                (
+                    "X-Ollama-Unify-Queue-Position",
+                    str(admission.initial_position),
+                ),
+            ]
             if admission.logical_request_id:
-                self.send_header(
-                    LOGICAL_REQUEST_HEADER, admission.logical_request_id
-                )
-            self.send_header(
-                "X-Ollama-Unify-Workload-Class", workload_class
-            )
-            self.send_header("X-Ollama-Unify-Queue-Policy", queue_policy)
-            self.send_header("X-Ollama-Unify-Queue-Ms", str(admission.queue_ms))
-            self.send_header(
-                "X-Ollama-Unify-Queue-Position", str(admission.initial_position)
-            )
+                broker_headers.append((
+                    LOGICAL_REQUEST_HEADER, admission.logical_request_id,
+                ))
             content_length = response.getheader("Content-Length")
+            client_writable = True
+            try:
+                self.send_response(response.status, response.reason)
+                for key, value in forwarded_headers + broker_headers:
+                    self.send_header(key, value)
+                if content_length is not None:
+                    self.send_header("Content-Length", content_length)
+                else:
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                self.end_headers()
+                response_started = True
+            except OSError:
+                client_writable = False
+
+            retain_body = bool(
+                admission.logical_request_id and path in INFERENCE_PATHS
+            )
+            unavailable_reason = None
             if content_length is not None:
-                self.send_header("Content-Length", content_length)
-            else:
-                self.send_header("Connection", "close")
-                self.close_connection = True
-            self.end_headers()
-            response_started = True
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    declared_length = -1
+                if declared_length > COMPLETED_RESPONSE_MAX_BODY_BYTES:
+                    retain_body = False
+                    unavailable_reason = "declared_body_exceeds_per_entry_limit"
+            retained_chunks: list[bytes] = []
+            response_body_bytes = 0
+            response_digest = hashlib.sha256()
             reader = getattr(response, "read1", response.read)
             while True:
                 chunk = reader(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                response_body_bytes += len(chunk)
+                response_digest.update(chunk)
+                if retain_body:
+                    if (
+                        response_body_bytes
+                        <= COMPLETED_RESPONSE_MAX_BODY_BYTES
+                    ):
+                        retained_chunks.append(chunk)
+                    else:
+                        retained_chunks.clear()
+                        retain_body = False
+                        unavailable_reason = (
+                            "observed_body_exceeds_per_entry_limit"
+                        )
+                if client_writable:
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except OSError:
+                        # Continue draining the completed backend response. A
+                        # retry with the logical ID can then replay it instead
+                        # of launching a duplicate generation.
+                        client_writable = False
             succeeded = response.status < 500
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            if admission.logical_request_id and path in INFERENCE_PATHS:
+                self.broker.record_completed_response(
+                    logical_request_id=admission.logical_request_id,
+                    request_fingerprint=admission.request_fingerprint,
+                    request_id=admission.request_id,
+                    status=response.status,
+                    reason=response.reason or "",
+                    headers=forwarded_headers + broker_headers,
+                    body=(b"".join(retained_chunks) if retain_body else None),
+                    body_bytes=response_body_bytes,
+                    body_sha256=response_digest.hexdigest(),
+                    unavailable_reason=unavailable_reason,
+                )
         except Exception as exc:
             LOG.error("proxy error %s %s: %s", self.command, self.path, exc)
             if not response_started:
@@ -4288,6 +4635,10 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_POOL_MAX_SERVERS="%s"\n' "$pool_max_servers"
     printf 'OLLAMA_UNIFY_POOL_MAX_QUEUE="64"\n'
     printf 'OLLAMA_UNIFY_POOL_RESUME_TTL="%s"\n' "$pool_resume_ttl"
+    printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL="120"\n'
+    printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_ENTRIES="64"\n'
+    printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_BODY_BYTES="8388608"\n'
+    printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_TOTAL_BYTES="67108864"\n'
     printf 'OLLAMA_UNIFY_POOL_PORT_START="%s"\n' "$pool_port_start"
     printf 'OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL="%s"\n' "$pool_instance_parallel"
     printf 'OLLAMA_UNIFY_POOL_IDLE_TIMEOUT="%s"\n' "$pool_idle_timeout"
