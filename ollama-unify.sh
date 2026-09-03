@@ -1040,6 +1040,12 @@ POOL_MAX_QUEUE = max(1, env_int("OLLAMA_UNIFY_POOL_MAX_QUEUE", 64))
 POOL_RESUME_TTL = max(
     0.1, env_float("OLLAMA_UNIFY_POOL_RESUME_TTL", 30.0)
 )
+RETAINED_REQUEST_MAX_BODY_BYTES = max(
+    0, env_int("OLLAMA_UNIFY_RETAINED_REQUEST_MAX_BODY_BYTES", 16 * 1024 * 1024)
+)
+RETAINED_REQUEST_MAX_TOTAL_BYTES = max(
+    0, env_int("OLLAMA_UNIFY_RETAINED_REQUEST_MAX_TOTAL_BYTES", 128 * 1024 * 1024)
+)
 COMPLETED_RESPONSE_TTL = max(
     0.1, env_float("OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL", 120.0)
 )
@@ -1083,6 +1089,7 @@ SAFE_METADATA_PATHS = (
 )
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
+RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
 
 
 def canonical_model_tag(model: str) -> str:
@@ -1388,6 +1395,16 @@ def discovery_document() -> dict[str, Any]:
             "host_reserve_mib_per_lane": POOL_HOST_RESERVE_MIB,
             "admission_protocol": {
                 "logical_request_header": LOGICAL_REQUEST_HEADER,
+                "resume_request_header": RESUME_REQUEST_HEADER,
+                "resume_request_body": "omitted",
+                "retained_request_max_body_bytes": (
+                    RETAINED_REQUEST_MAX_BODY_BYTES
+                ),
+                "retained_request_max_total_bytes": (
+                    RETAINED_REQUEST_MAX_TOTAL_BYTES
+                ),
+                "queue_position_header": "X-Ollama-Unify-Queue-Position",
+                "queue_ticket_header": "X-Ollama-Unify-Queue-Ticket",
                 "workload_class_header": "X-Ollama-Unify-Workload-Class",
                 "workload_classes": [
                     "foreground", "interactive-control", "background",
@@ -1401,12 +1418,20 @@ def discovery_document() -> dict[str, Any]:
                     "queue_full",
                     "lease_transition",
                     "lane_capacity_wait",
+                    "reclaimable_placement_wait",
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
                     "model_not_installed",
                     "backend_start_failed",
                     "logical_request_conflict",
                     "logical_request_in_progress",
+                    "logical_request_not_found",
+                    "logical_request_cancelled",
+                    "logical_request_expired",
+                    "retained_request_unavailable",
+                    "request_body_exceeds_resume_limit",
+                    "request_retention_capacity",
+                    "resume_body_forbidden",
                     "completed_response_unavailable",
                     "invalid_admission_header",
                 ],
@@ -1596,6 +1621,8 @@ class CapacityError(RuntimeError):
         logical_request_id: str = "",
         admission_retained: bool = False,
         cause_reason_code: str = "",
+        queue_position: int | None = None,
+        queue_ticket: int | None = None,
     ) -> None:
         self.status = status
         self.reason_code = reason_code
@@ -1605,6 +1632,8 @@ class CapacityError(RuntimeError):
         self.logical_request_id = logical_request_id
         self.admission_retained = admission_retained
         self.cause_reason_code = cause_reason_code
+        self.queue_position = queue_position
+        self.queue_ticket = queue_ticket
         super().__init__(message)
 
 
@@ -1617,6 +1646,8 @@ class PermanentCapacityError(CapacityError):
         *,
         request_id: str = "",
         logical_request_id: str = "",
+        queue_position: int | None = None,
+        queue_ticket: int | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -1626,6 +1657,8 @@ class PermanentCapacityError(CapacityError):
             None,
             request_id=request_id,
             logical_request_id=logical_request_id,
+            queue_position=queue_position,
+            queue_ticket=queue_ticket,
         )
 
 
@@ -1638,6 +1671,8 @@ class AdmissionTimeoutError(CapacityError):
         logical_request_id: str = "",
         admission_retained: bool = False,
         cause_reason_code: str = "",
+        queue_position: int | None = None,
+        queue_ticket: int | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -1649,6 +1684,8 @@ class AdmissionTimeoutError(CapacityError):
             logical_request_id=logical_request_id,
             admission_retained=admission_retained,
             cause_reason_code=cause_reason_code,
+            queue_position=queue_position,
+            queue_ticket=queue_ticket,
         )
 
 
@@ -1674,6 +1711,24 @@ class ClientDisconnected(ConnectionError):
     pass
 
 
+@dataclass(frozen=True)
+class RetainedRequest:
+    method: str
+    path: str
+    content_type: str
+    body: bytes
+    model: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class LogicalRequestTombstone:
+    logical_request_id: str
+    request_id: str
+    reason_code: str
+    expires_at: float
+
+
 @dataclass
 class QueuedRequest:
     request_id: str
@@ -1684,6 +1739,8 @@ class QueuedRequest:
     deadline: float
     connected: Callable[[], bool]
     request_path: str = ""
+    retained_request: RetainedRequest | None = None
+    queue_ticket: int = 0
     workload_class: str = "unspecified"
     queue_policy: str = "wait"
     phase: str = "queued"
@@ -1707,6 +1764,7 @@ class QueuedRequest:
             "workload_class": self.workload_class,
             "queue_policy": self.queue_policy,
             "position": position,
+            "ticket": self.queue_ticket,
             "phase": self.phase,
             "wait_ms": max(0, int((now - self.enqueued_at) * 1000)),
             "last_error": self.last_error,
@@ -1722,6 +1780,8 @@ class Admission:
     request_fingerprint: str
     queue_ms: int
     initial_position: int
+    queue_ticket: int
+    retained_request: RetainedRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -1736,6 +1796,8 @@ class CompletedResponse:
     logical_request_id: str
     request_fingerprint: str
     request_id: str
+    request_method: str
+    request_path: str
     status: int
     reason: str
     headers: tuple[tuple[str, str], ...]
@@ -1761,7 +1823,10 @@ class Broker:
         self.stopping = threading.Event()
         self.anonymous_running = False
         self.waiters: list[QueuedRequest] = []
-        self.logical_in_flight: dict[str, tuple[str, str]] = {}
+        self.logical_in_flight: dict[str, tuple[str, str, int]] = {}
+        self.logical_tombstones: dict[str, LogicalRequestTombstone] = {}
+        self.retained_request_bytes = 0
+        self.next_queue_ticket = 1
         self.completed_responses: dict[str, CompletedResponse] = {}
         self.completed_response_bytes = 0
         self.completed_response_recorded_total = 0
@@ -1950,6 +2015,11 @@ class Broker:
             )
         if expired:
             self.completed_response_expired_total += 1
+            self._record_logical_tombstone_locked(
+                logical_request_id,
+                response.request_id,
+                "logical_request_expired",
+            )
         if evicted:
             self.completed_response_evicted_total += 1
 
@@ -2005,12 +2075,126 @@ class Broker:
             self.completed_response_replayed_total += 1
             return response
 
+    def _record_logical_tombstone_locked(
+        self, logical_request_id: str, request_id: str, reason_code: str,
+    ) -> None:
+        if not logical_request_id:
+            return
+        self.logical_tombstones[logical_request_id] = LogicalRequestTombstone(
+            logical_request_id=logical_request_id,
+            request_id=request_id,
+            reason_code=reason_code,
+            expires_at=time.monotonic() + COMPLETED_RESPONSE_TTL,
+        )
+
+    def _prune_logical_tombstones_locked(
+        self, now: float | None = None,
+    ) -> None:
+        current = time.monotonic() if now is None else now
+        for logical_request_id in [
+            key for key, tombstone in self.logical_tombstones.items()
+            if current >= tombstone.expires_at
+        ]:
+            self.logical_tombstones.pop(logical_request_id, None)
+
+    def _raise_logical_tombstone_locked(self, logical_request_id: str) -> None:
+        self._prune_logical_tombstones_locked()
+        tombstone = self.logical_tombstones.get(logical_request_id)
+        if tombstone is None:
+            return
+        raise PermanentCapacityError(
+            "logical request can no longer be resumed",
+            409,
+            tombstone.reason_code,
+            request_id=tombstone.request_id,
+            logical_request_id=logical_request_id,
+        )
+
+    def resume_request_lookup(
+        self, logical_request_id: str, method: str, path: str,
+    ) -> tuple[RetainedRequest | None, CompletedResponse | None]:
+        if not logical_request_id:
+            raise PermanentCapacityError(
+                "resume requires a logical request ID",
+                400,
+                "invalid_admission_header",
+            )
+        with self.cv:
+            now = time.monotonic()
+            self._prune_completed_responses_locked(now)
+            self._prune_stale_waiters_locked(now)
+            self._raise_logical_tombstone_locked(logical_request_id)
+            response = self.completed_responses.get(logical_request_id)
+            if response is not None:
+                if response.request_method != method or response.request_path != path:
+                    raise PermanentCapacityError(
+                        "logical request ID was resumed on a different method or path",
+                        409,
+                        "logical_request_conflict",
+                        request_id=response.request_id,
+                        logical_request_id=logical_request_id,
+                    )
+                self.queue_duplicate_total += 1
+                if response.body is None:
+                    self.completed_response_unavailable_total += 1
+                    raise CompletedResponseUnavailableError(response)
+                self.completed_response_replayed_total += 1
+                return None, response
+            active = self.logical_in_flight.get(logical_request_id)
+            if active is not None:
+                _, request_id, queue_ticket = active
+                self.queue_duplicate_total += 1
+                raise CapacityError(
+                    "logical request is already admitted and in progress",
+                    409,
+                    "logical_request_in_progress",
+                    True,
+                    1,
+                    request_id=request_id,
+                    logical_request_id=logical_request_id,
+                    queue_ticket=queue_ticket,
+                )
+            waiter = next(
+                (
+                    item for item in self.waiters
+                    if item.logical_request_id == logical_request_id
+                ),
+                None,
+            )
+            if waiter is None:
+                raise PermanentCapacityError(
+                    "logical request is not retained by this broker",
+                    409,
+                    "logical_request_not_found",
+                    logical_request_id=logical_request_id,
+                )
+            retained = waiter.retained_request
+            if retained is None:
+                raise PermanentCapacityError(
+                    "logical request body was not retained",
+                    409,
+                    "retained_request_unavailable",
+                    request_id=waiter.request_id,
+                    logical_request_id=logical_request_id,
+                )
+            if retained.method != method or retained.path != path:
+                raise PermanentCapacityError(
+                    "logical request ID was resumed on a different method or path",
+                    409,
+                    "logical_request_conflict",
+                    request_id=waiter.request_id,
+                    logical_request_id=logical_request_id,
+                )
+            return retained, None
+
     def record_completed_response(
         self,
         *,
         logical_request_id: str,
         request_fingerprint: str,
         request_id: str,
+        request_method: str,
+        request_path: str,
         status: int,
         reason: str,
         headers: list[tuple[str, str]],
@@ -2059,6 +2243,8 @@ class Broker:
                 logical_request_id=logical_request_id,
                 request_fingerprint=request_fingerprint,
                 request_id=request_id,
+                request_method=request_method,
+                request_path=request_path,
                 status=status,
                 reason=reason,
                 headers=tuple(headers),
@@ -2143,6 +2329,8 @@ class Broker:
                 if self.queue_admitted_total else 0
             ),
             "reconciling_model": self.reconciling_model,
+            "retained_request_bytes": self.retained_request_bytes,
+            "retained_request_max_total_bytes": RETAINED_REQUEST_MAX_TOTAL_BYTES,
         }
         if include_requests:
             result["requests"] = requests
@@ -2490,7 +2678,7 @@ class Broker:
                     if len(replaceable) < overflow:
                         raise CapacityError(
                             "managed Ollama lane capacity reached; no idle lane can be replaced",
-                            reason_code="lane_capacity_wait",
+                            reason_code="reclaimable_placement_wait",
                         )
                     retired = replaceable[:overflow]
                     for lane in retired:
@@ -2567,12 +2755,23 @@ class Broker:
                              str(device.get("uuid") or ""))
                             for device in devices
                         )
+                        with self.cv:
+                            reclaimable_later = any(
+                                lane.kind == "managed"
+                                and lane.model != model
+                                and lane.gpu_uuid in device_uuids
+                                for lane in self.lanes.values()
+                            )
                         raise CapacityError(
                             f"model {model!r} requires {required_mib} MiB per lane; "
                             f"only {len(placements)} of {missing} required lane "
                             f"placements fit and no idle lane can be reclaimed "
                             f"(free={free})",
-                            reason_code="lane_capacity_wait",
+                            reason_code=(
+                                "reclaimable_placement_wait"
+                                if reclaimable_later
+                                else "lane_capacity_wait"
+                            ),
                         )
                     self._stop_lanes(
                         [victim], f"live VRAM reclamation for {model}",
@@ -2614,7 +2813,17 @@ class Broker:
             self.waiters.remove(waiter)
         except ValueError:
             pass
+        self._release_waiter_retention_locked(waiter)
         self.cv.notify_all()
+
+    def _release_waiter_retention_locked(self, waiter: QueuedRequest) -> None:
+        retained = waiter.retained_request
+        if retained is None:
+            return
+        self.retained_request_bytes = max(
+            0, self.retained_request_bytes - len(retained.body)
+        )
+        waiter.retained_request = None
 
     def _prune_stale_waiters_locked(self, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
@@ -2626,10 +2835,13 @@ class Broker:
         ]
         for waiter in stale:
             waiter.phase = "stale"
-            self.waiters.remove(waiter)
+            self._record_logical_tombstone_locked(
+                waiter.logical_request_id,
+                waiter.request_id,
+                "logical_request_expired",
+            )
+            self._remove_waiter_locked(waiter)
             self.queue_stale_total += 1
-        if stale:
-            self.cv.notify_all()
 
     @staticmethod
     def _waiter_terminal_failure(waiter: QueuedRequest) -> CapacityError:
@@ -2659,6 +2871,7 @@ class Broker:
                     admission_wait: float | None = None,
                     logical_request_id: str = "",
                     request_fingerprint: str = "",
+                    retained_request: RetainedRequest | None = None,
                     workload_class: str = "unspecified",
                     queue_policy: str = "wait") -> Admission:
         model = canonical_model_tag(model)
@@ -2703,7 +2916,8 @@ class Broker:
                         return Admission(
                             lane, request_id, logical_request_id,
                             request_fingerprint,
-                            max(0, int((time.monotonic() - enqueued_at) * 1000)), 1,
+                            max(0, int((time.monotonic() - enqueued_at) * 1000)),
+                            1, 0, retained_request,
                         )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -2719,7 +2933,7 @@ class Broker:
             if logical_request_id:
                 active = self.logical_in_flight.get(logical_request_id)
                 if active is not None:
-                    active_fingerprint, active_request_id = active
+                    active_fingerprint, active_request_id, queue_ticket = active
                     self.queue_duplicate_total += 1
                     if active_fingerprint != request_fingerprint:
                         raise PermanentCapacityError(
@@ -2737,6 +2951,7 @@ class Broker:
                         1,
                         request_id=active_request_id,
                         logical_request_id=logical_request_id,
+                        queue_ticket=queue_ticket,
                     )
                 waiter = next(
                     (
@@ -2758,6 +2973,8 @@ class Broker:
                             "logical_request_conflict",
                             request_id=waiter.request_id,
                             logical_request_id=logical_request_id,
+                            queue_position=self.waiters.index(waiter) + 1,
+                            queue_ticket=waiter.queue_ticket,
                         )
                     if waiter.attached:
                         self.queue_duplicate_total += 1
@@ -2810,6 +3027,36 @@ class Broker:
                     logical_request_id=logical_request_id,
                 )
             if waiter is None:
+                if logical_request_id:
+                    # A full-body submission is an explicit new attempt after
+                    # a prior cancel/expiry. Body-free resume remains closed
+                    # over the tombstone in resume_request_lookup().
+                    self.logical_tombstones.pop(logical_request_id, None)
+                if retained_request is not None:
+                    retained_bytes = len(retained_request.body)
+                    if retained_bytes > RETAINED_REQUEST_MAX_BODY_BYTES:
+                        raise PermanentCapacityError(
+                            "request body exceeds retained-resume per-entry limit",
+                            413,
+                            "request_body_exceeds_resume_limit",
+                            request_id=request_id,
+                            logical_request_id=logical_request_id,
+                        )
+                    if (
+                        self.retained_request_bytes + retained_bytes
+                        > RETAINED_REQUEST_MAX_TOTAL_BYTES
+                    ):
+                        raise CapacityError(
+                            "retained-request capacity is temporarily full",
+                            503,
+                            "request_retention_capacity",
+                            True,
+                            2,
+                            request_id=request_id,
+                            logical_request_id=logical_request_id,
+                        )
+                queue_ticket = self.next_queue_ticket
+                self.next_queue_ticket += 1
                 waiter = QueuedRequest(
                     request_id=request_id,
                     logical_request_id=logical_request_id,
@@ -2819,11 +3066,15 @@ class Broker:
                     deadline=deadline,
                     connected=connected,
                     request_path=request_path,
+                    retained_request=retained_request,
+                    queue_ticket=queue_ticket,
                     workload_class=workload_class,
                     queue_policy=queue_policy,
                     initial_position=len(self.waiters) + 1,
                 )
                 self.waiters.append(waiter)
+                if retained_request is not None:
+                    self.retained_request_bytes += len(retained_request.body)
                 self.queue_enqueued_total += 1
                 self.queue_peak = max(self.queue_peak, len(self.waiters))
                 self.cv.notify_all()
@@ -2836,6 +3087,11 @@ class Broker:
                         continue
                     waiter.phase = "cancelled"
                     self.queue_cancelled_total += 1
+                    self._record_logical_tombstone_locked(
+                        waiter.logical_request_id,
+                        waiter.request_id,
+                        "logical_request_cancelled",
+                    )
                     self._remove_waiter_locked(waiter)
                 raise ClientDisconnected("client disconnected while queued")
             with self.cv:
@@ -2859,14 +3115,19 @@ class Broker:
                             logical_request_id=waiter.logical_request_id,
                             admission_retained=True,
                             cause_reason_code=waiter.last_reason_code or "",
+                            queue_position=self.waiters.index(waiter) + 1,
+                            queue_ticket=waiter.queue_ticket,
                         )
                     waiter.phase = "timed-out"
+                    queue_position = self.waiters.index(waiter) + 1
                     self.queue_timed_out_total += 1
                     self._remove_waiter_locked(waiter)
                     raise AdmissionTimeoutError(
                         f"broker queue admission deadline expired{detail}",
                         request_id=waiter.request_id,
                         cause_reason_code=waiter.last_reason_code or "",
+                        queue_position=queue_position,
+                        queue_ticket=waiter.queue_ticket,
                     )
                 self._prune_dead_lanes_locked()
                 waiter_index = next(
@@ -2881,7 +3142,9 @@ class Broker:
                     lane = self._select_lane_locked(model, True)
                     if lane is not None:
                         waiter.phase = "generating"
+                        retained_for_admission = waiter.retained_request
                         self.waiters.pop(waiter_index)
+                        self._release_waiter_retention_locked(waiter)
                         queue_ms = max(
                             0, int((time.monotonic() - enqueued_at) * 1000)
                         )
@@ -2897,6 +3160,7 @@ class Broker:
                             self.logical_in_flight[waiter.logical_request_id] = (
                                 waiter.request_fingerprint,
                                 waiter.request_id,
+                                waiter.queue_ticket,
                             )
                         self.cv.notify_all()
                         return Admission(
@@ -2905,6 +3169,8 @@ class Broker:
                             waiter.request_fingerprint,
                             queue_ms,
                             waiter.initial_position,
+                            waiter.queue_ticket,
+                            retained_for_admission,
                         )
                 self.cv.wait(min(remaining, 0.25))
 
@@ -3689,6 +3955,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if failure.admission_retained:
             payload["admission_retained"] = True
             payload["resume_ttl_ms"] = int(POOL_RESUME_TTL * 1000)
+        if failure.queue_position is not None:
+            payload["queue_position"] = failure.queue_position
+        if failure.queue_ticket is not None:
+            payload["queue_ticket"] = failure.queue_ticket
         if isinstance(failure, CompletedResponseUnavailableError):
             payload["completed_response"] = {
                 "schema": "io.ollama-unify.completed-response-receipt.v1",
@@ -3712,6 +3982,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             headers[LOGICAL_REQUEST_HEADER] = logical_id
         if failure.admission_retained:
             headers["X-Ollama-Unify-Admission-Retained"] = "true"
+        if failure.queue_position is not None:
+            headers["X-Ollama-Unify-Queue-Position"] = str(
+                failure.queue_position
+            )
+        if failure.queue_ticket is not None:
+            headers["X-Ollama-Unify-Queue-Ticket"] = str(failure.queue_ticket)
         if isinstance(failure, CompletedResponseUnavailableError):
             headers["X-Ollama-Unify-Completed-Response-Sha256"] = (
                 failure.completed_body_sha256
@@ -3802,43 +4078,95 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if admission is not None:
                     self.broker.proxy_exit(admission.lane, "", True)
             return
-        body = clamp_request(self.path, content_type, body)
         model = ""
-        if body and "json" in content_type.lower():
-            try:
-                payload = json.loads(body)
-                if isinstance(payload, dict):
-                    model = canonical_model_tag(str(payload.get("model") or ""))
-            except (TypeError, ValueError):
-                pass
         admission = None
         request_id = secrets.token_hex(8)
         logical_request_id = ""
         fingerprint = ""
         workload_class = "unspecified"
         queue_policy = "wait"
+        retained_request = None
         try:
             (
                 logical_request_id,
                 workload_class,
                 queue_policy,
             ) = self._requested_admission_controls()
-            fingerprint = hashlib.sha256(
-                self.command.encode()
-                + b"\0"
-                + self.path.encode()
-                + b"\0"
-                + content_type.lower().encode()
-                + b"\0"
-                + body
-            ).hexdigest()
-            if logical_request_id and path in INFERENCE_PATHS:
-                completed = self.broker.completed_response_lookup(
-                    logical_request_id, fingerprint
+            resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
+            if resume_header and resume_header.lower() != "true":
+                raise PermanentCapacityError(
+                    f"{RESUME_REQUEST_HEADER} must be true when present",
+                    400,
+                    "invalid_admission_header",
+                )
+            is_resume = resume_header.lower() == "true"
+            if is_resume:
+                if body:
+                    raise PermanentCapacityError(
+                        "resume request must not resend the inference body",
+                        400,
+                        "resume_body_forbidden",
+                        logical_request_id=logical_request_id,
+                    )
+                if path not in INFERENCE_PATHS:
+                    raise PermanentCapacityError(
+                        "resume is supported only for inference paths",
+                        400,
+                        "invalid_admission_header",
+                        logical_request_id=logical_request_id,
+                    )
+                retained_request, completed = self.broker.resume_request_lookup(
+                    logical_request_id, self.command, path
                 )
                 if completed is not None:
                     self._send_completed_response(completed)
                     return
+                if retained_request is None:
+                    raise PermanentCapacityError(
+                        "logical request body was not retained",
+                        409,
+                        "retained_request_unavailable",
+                        logical_request_id=logical_request_id,
+                    )
+                body = retained_request.body
+                content_type = retained_request.content_type
+                model = retained_request.model
+                fingerprint = retained_request.fingerprint
+            else:
+                body = clamp_request(self.path, content_type, body)
+                if body and "json" in content_type.lower():
+                    try:
+                        payload = json.loads(body)
+                        if isinstance(payload, dict):
+                            model = canonical_model_tag(
+                                str(payload.get("model") or "")
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                fingerprint = hashlib.sha256(
+                    self.command.encode()
+                    + b"\0"
+                    + self.path.encode()
+                    + b"\0"
+                    + content_type.lower().encode()
+                    + b"\0"
+                    + body
+                ).hexdigest()
+                if logical_request_id and path in INFERENCE_PATHS:
+                    completed = self.broker.completed_response_lookup(
+                        logical_request_id, fingerprint
+                    )
+                    if completed is not None:
+                        self._send_completed_response(completed)
+                        return
+                    retained_request = RetainedRequest(
+                        method=self.command,
+                        path=path,
+                        content_type=content_type,
+                        body=body,
+                        model=model,
+                        fingerprint=fingerprint,
+                    )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
                 allow_during_drain=path in SAFE_METADATA_PATHS,
@@ -3846,6 +4174,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 admission_wait=self._requested_admission_wait(),
                 logical_request_id=logical_request_id,
                 request_fingerprint=fingerprint,
+                retained_request=retained_request,
                 workload_class=workload_class,
                 queue_policy=queue_policy,
             )
@@ -3889,6 +4218,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             broker_control_headers = {
                 "x-ollama-unify-admission-wait-ms",
                 "x-ollama-unify-logical-request-id",
+                "x-ollama-unify-resume-request",
                 "x-ollama-unify-workload-class",
                 "x-ollama-unify-queue-policy",
             }
@@ -3896,6 +4226,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                        if key.lower() not in HOP_HEADERS
                        and key.lower() not in {"host", "content-length"}
                        and key.lower() not in broker_control_headers}
+            if content_type and not any(
+                key.lower() == "content-type" for key in headers
+            ):
+                headers["Content-Type"] = content_type
             backend = http.client.HTTPConnection(lane.host, lane.port, timeout=None)
             backend.request(self.command, self.path, body=body if body else None, headers=headers)
             response = backend.getresponse()
@@ -3913,6 +4247,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 (
                     "X-Ollama-Unify-Queue-Position",
                     str(admission.initial_position),
+                ),
+                (
+                    "X-Ollama-Unify-Queue-Ticket",
+                    str(admission.queue_ticket),
                 ),
             ]
             if admission.logical_request_id:
@@ -3984,6 +4322,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     logical_request_id=admission.logical_request_id,
                     request_fingerprint=admission.request_fingerprint,
                     request_id=admission.request_id,
+                    request_method=self.command,
+                    request_path=path,
                     status=response.status,
                     reason=response.reason or "",
                     headers=forwarded_headers + broker_headers,
@@ -4635,6 +4975,8 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_POOL_MAX_SERVERS="%s"\n' "$pool_max_servers"
     printf 'OLLAMA_UNIFY_POOL_MAX_QUEUE="64"\n'
     printf 'OLLAMA_UNIFY_POOL_RESUME_TTL="%s"\n' "$pool_resume_ttl"
+    printf 'OLLAMA_UNIFY_RETAINED_REQUEST_MAX_BODY_BYTES="16777216"\n'
+    printf 'OLLAMA_UNIFY_RETAINED_REQUEST_MAX_TOTAL_BYTES="134217728"\n'
     printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL="120"\n'
     printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_ENTRIES="64"\n'
     printf 'OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_BODY_BYTES="8388608"\n'

@@ -210,6 +210,45 @@ def chat(
     )
 
 
+def resume_chat(
+    port,
+    logical_request_id,
+    timeout=10,
+    *,
+    admission_wait_ms=None,
+    workload_class="foreground",
+    queue_policy="wait",
+):
+    headers = {
+        "X-Ollama-Unify-Logical-Request-Id": logical_request_id,
+        "X-Ollama-Unify-Resume-Request": "true",
+        "X-Ollama-Unify-Workload-Class": workload_class,
+        "X-Ollama-Unify-Queue-Policy": queue_policy,
+    }
+    if admission_wait_ms is not None:
+        headers["X-Ollama-Unify-Admission-Wait-Ms"] = str(admission_wait_ms)
+    return http_json(
+        port, "POST", "/api/chat", None,
+        timeout=timeout, extra_headers=headers,
+    )
+
+
+def resume_chat_raw(port, logical_request_id, timeout=10):
+    return http_raw(
+        port,
+        "POST",
+        "/api/chat",
+        None,
+        timeout=timeout,
+        extra_headers={
+            "X-Ollama-Unify-Logical-Request-Id": logical_request_id,
+            "X-Ollama-Unify-Resume-Request": "true",
+            "X-Ollama-Unify-Workload-Class": "foreground",
+            "X-Ollama-Unify-Queue-Policy": "wait",
+        },
+    )
+
+
 def embed(port, model, request_id, timeout=10):
     return http_json(port, "POST", "/api/embed", {
         "model": model,
@@ -1076,9 +1115,14 @@ def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
             assert timeout_payload["retry_after_ms"] == 2000
             assert timeout_payload["admission_retained"] is True
             assert timeout_payload["logical_request_id"] == "turn:logical-resume"
+            assert timeout_payload["queue_position"] == 1
+            assert timeout_payload["queue_ticket"] >= 1
             assert timeout_headers["Retry-After"] == "2"
             assert timeout_headers["X-Ollama-Unify-Admission-Retained"] == "true"
+            assert timeout_headers["X-Ollama-Unify-Queue-Position"] == "1"
+            assert int(timeout_headers["X-Ollama-Unify-Queue-Ticket"]) >= 1
             broker_request_id = timeout_payload["request_id"]
+            broker_queue_ticket = timeout_payload["queue_ticket"]
 
             conflict = chat(
                 harness.proxy_port,
@@ -1104,13 +1148,10 @@ def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
                 "retained logical waiter and FIFO follower",
             )
             resumed = executor.submit(
-                chat,
+                resume_chat,
                 harness.proxy_port,
-                MODEL,
-                "logical-run",
-                0.5,
+                "turn:logical-resume",
                 8,
-                logical_request_id="turn:logical-resume",
                 admission_wait_ms=2000,
             )
             wait_until(
@@ -1144,6 +1185,9 @@ def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
             )
             assert resumed_result[2]["X-Ollama-Unify-Workload-Class"] == "foreground"
             assert resumed_result[2]["X-Ollama-Unify-Queue-Policy"] == "wait"
+            assert int(
+                resumed_result[2]["X-Ollama-Unify-Queue-Ticket"]
+            ) == broker_queue_ticket
             assert follower.result(timeout=8)[0] == 200
 
         observed_ids = [
@@ -1170,10 +1214,7 @@ def test_completed_native_response_replays_without_generation(
             harness.proxy_port, MODEL, "completed-native", 0, 8,
             logical_request_id=logical_id,
         )
-        replay = chat(
-            harness.proxy_port, MODEL, "completed-native", 0, 8,
-            logical_request_id=logical_id,
-        )
+        replay = resume_chat(harness.proxy_port, logical_id, 8)
         assert first[0] == replay[0] == 200
         assert first[1] == replay[1]
         for header in (
@@ -1228,9 +1269,7 @@ def test_completed_streaming_response_replays_exact_body(helper, fixture_bin):
         first = streaming_chat(
             harness.proxy_port, MODEL, "completed-stream", logical_id, 8,
         )
-        replay = streaming_chat(
-            harness.proxy_port, MODEL, "completed-stream", logical_id, 8,
-        )
+        replay = resume_chat_raw(harness.proxy_port, logical_id, 8)
         assert first[0] == replay[0] == 200
         assert first[1] == replay[1]
         assert first[1].count(b"\n") == 2
@@ -1402,6 +1441,10 @@ def test_detached_logical_request_expires_without_inference(helper, fixture_bin)
                 "detached logical waiter expiration",
                 timeout=2,
             )
+            resume = resume_chat(harness.proxy_port, "turn:expires", 3)
+            assert resume[0] == 409, resume
+            assert resume[1]["reason_code"] == "logical_request_expired"
+            assert resume[1]["retryable"] is False
             assert active.result(timeout=8)[0] == 200
 
         assert not any(
@@ -1444,7 +1487,9 @@ def test_temporary_and_permanent_placement_failures(helper, fixture_bin):
             )
             assert temporary[0] == 503, temporary
             assert temporary[1]["reason_code"] == "queue_admission_timeout"
-            assert temporary[1]["cause_reason_code"] == "lane_capacity_wait"
+            assert temporary[1]["cause_reason_code"] == (
+                "reclaimable_placement_wait"
+            )
             assert temporary[1]["retryable"] is True
             assert "admission_retained" not in temporary[1]
             assert active.result(timeout=8)[0] == 200
@@ -1565,6 +1610,10 @@ def test_queued_disconnect_is_cancelled(helper, fixture_bin):
                 lambda: queue_with_depth(harness, 0),
                 "abandoned request cancellation",
             )
+            resume = resume_chat(harness.proxy_port, "turn:cancelled", 3)
+            assert resume[0] == 409, resume
+            assert resume[1]["reason_code"] == "logical_request_cancelled"
+            assert resume[1]["retryable"] is False
             assert active.result(timeout=8)[0] == 200
 
         time.sleep(0.15)
