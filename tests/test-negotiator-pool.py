@@ -87,9 +87,10 @@ def free_port():
     return port
 
 
-def http_json(port, method, path, payload=None, timeout=10):
+def http_json(port, method, path, payload=None, timeout=10, extra_headers=None):
     body = None if payload is None else json.dumps(payload).encode()
     headers = {} if body is None else {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     conn.request(method, path, body=body, headers=headers)
     response = conn.getresponse()
@@ -161,13 +162,32 @@ def request_events(path):
             if event["kind"] == "request" and event.get("request_id") is not None]
 
 
-def chat(port, model, request_id, delay=0, timeout=10):
+def chat(
+    port,
+    model,
+    request_id,
+    delay=0,
+    timeout=10,
+    *,
+    logical_request_id=None,
+    admission_wait_ms=None,
+    workload_class="foreground",
+    queue_policy="wait",
+):
+    headers = {
+        "X-Ollama-Unify-Workload-Class": workload_class,
+        "X-Ollama-Unify-Queue-Policy": queue_policy,
+    }
+    if logical_request_id is not None:
+        headers["X-Ollama-Unify-Logical-Request-Id"] = logical_request_id
+    if admission_wait_ms is not None:
+        headers["X-Ollama-Unify-Admission-Wait-Ms"] = str(admission_wait_ms)
     return http_json(port, "POST", "/api/chat", {
         "model": model,
         "stream": False,
         "mock_request_id": request_id,
         "mock_delay": delay,
-    }, timeout=timeout)
+    }, timeout=timeout, extra_headers=headers)
 
 
 def embed(port, model, request_id, timeout=10):
@@ -178,7 +198,7 @@ def embed(port, model, request_id, timeout=10):
     }, timeout=timeout)
 
 
-def open_abandonable_chat(port, model, request_id):
+def open_abandonable_chat(port, model, request_id, logical_request_id=None):
     payload = json.dumps({
         "model": model,
         "stream": False,
@@ -190,6 +210,10 @@ def open_abandonable_chat(port, model, request_id):
         b"Host: 127.0.0.1\r\n"
         b"Content-Type: application/json\r\n"
         + f"Content-Length: {len(payload)}\r\n".encode()
+        + (
+            f"X-Ollama-Unify-Logical-Request-Id: {logical_request_id}\r\n".encode()
+            if logical_request_id else b""
+        )
         + b"Connection: close\r\n\r\n"
         + payload
     )
@@ -206,7 +230,7 @@ def reset_connection(connection):
 class PoolHarness:
     def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
                  runner_vram_mib=2048, max_queue=64,
-                 release_tolerance_mib=256):
+                 release_tolerance_mib=256, resume_ttl=1.0):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
@@ -214,6 +238,7 @@ class PoolHarness:
         self.runner_vram_mib = runner_vram_mib
         self.max_queue = max_queue
         self.release_tolerance_mib = release_tolerance_mib
+        self.resume_ttl = resume_ttl
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -245,6 +270,7 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
             "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
+            "OLLAMA_UNIFY_POOL_RESUME_TTL": str(self.resume_ttl),
             "OLLAMA_UNIFY_POOL_PORT_START": str(pool_port),
             "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": "1",
             "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
@@ -342,6 +368,12 @@ def test_existing_pool_contract(helper, fixture_bin):
             assert discovery_status == 200, discovery
             assert discovery["parallel_pool"]["private_port_start"] == pool_port
             assert discovery["parallel_pool"]["private_port_end"] == pool_port + 31
+            admission_protocol = discovery["parallel_pool"]["admission_protocol"]
+            assert admission_protocol["logical_request_header"] == (
+                "X-Ollama-Unify-Logical-Request-Id"
+            )
+            assert admission_protocol["queue_policies"] == ["wait", "yield"]
+            assert admission_protocol["retry_after_json_field"] == "retry_after_ms"
             status, capacity, _ = http_json(
                 proxy_port, "POST",
                 "/.well-known/ollama-unify-gpu-negotiator/capacity",
@@ -393,7 +425,9 @@ def test_existing_pool_contract(helper, fixture_bin):
                 "/.well-known/ollama-unify-gpu-negotiator/capacity",
                 {"model": MODEL, "parallel": 4},
             )
-            assert status == 503, rejected
+            assert status == 422, rejected
+            assert rejected["retryable"] is False
+            assert rejected["reason_code"] == "parallel_exceeds_capacity"
             assert len([event for event in events(event_log)
                         if event["kind"] == "start"]) == before
 
@@ -604,6 +638,9 @@ def test_broker_queue_has_hard_ceiling_during_all_gpu_lease(
             assert time.monotonic() - started < 1
             assert "broker queue is full (2/2)" in payload["error"]
             assert payload["retryable"] is True
+            assert payload["reason_code"] == "queue_full"
+            assert payload["retry_after_ms"] == 2000
+            assert headers["Retry-After"] == "2"
             assert headers["X-Ollama-Unify-Retryable"] == "true"
             assert harness.status()["parallel_pool"]["queue"]["depth"] == 2
 
@@ -938,6 +975,236 @@ def test_fifo_queue_and_metrics(helper, fixture_bin):
         assert final_queue["wait_ms_max"] >= final_queue["wait_ms_mean"]
 
 
+def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1, resume_ttl=2.0) as harness:
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            active = executor.submit(
+                chat, harness.proxy_port, MODEL, "logical-active", 0.8, 8
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "logical-active"
+                    for event in request_events(harness.event_log)
+                ),
+                "active request before resumable admission",
+            )
+
+            timed_out = chat(
+                harness.proxy_port,
+                MODEL,
+                "logical-run",
+                0.5,
+                3,
+                logical_request_id="turn:logical-resume",
+                admission_wait_ms=100,
+            )
+            assert timed_out[0] == 503, timed_out
+            timeout_payload = timed_out[1]
+            timeout_headers = timed_out[2]
+            assert timeout_payload["reason_code"] == "queue_admission_timeout"
+            assert timeout_payload["retryable"] is True
+            assert timeout_payload["retry_after_ms"] == 2000
+            assert timeout_payload["admission_retained"] is True
+            assert timeout_payload["logical_request_id"] == "turn:logical-resume"
+            assert timeout_headers["Retry-After"] == "2"
+            assert timeout_headers["X-Ollama-Unify-Admission-Retained"] == "true"
+            broker_request_id = timeout_payload["request_id"]
+
+            conflict = chat(
+                harness.proxy_port,
+                MODEL,
+                "logical-run-changed",
+                0.5,
+                3,
+                logical_request_id="turn:logical-resume",
+                admission_wait_ms=100,
+            )
+            assert conflict[0] == 409, conflict
+            assert conflict[1]["reason_code"] == "logical_request_conflict"
+            assert conflict[1]["retryable"] is False
+            assert conflict[1]["request_id"] == broker_request_id
+            assert conflict[2]["X-Ollama-Unify-Retryable"] == "false"
+            assert "Retry-After" not in conflict[2]
+
+            follower = executor.submit(
+                chat, harness.proxy_port, MODEL, "logical-follower", 0.05, 8
+            )
+            wait_until(
+                lambda: queue_with_depth(harness, 2),
+                "retained logical waiter and FIFO follower",
+            )
+            resumed = executor.submit(
+                chat,
+                harness.proxy_port,
+                MODEL,
+                "logical-run",
+                0.5,
+                8,
+                logical_request_id="turn:logical-resume",
+                admission_wait_ms=2000,
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "logical-run"
+                    for event in request_events(harness.event_log)
+                ),
+                "resumed logical request admission",
+                timeout=3,
+            )
+            duplicate = chat(
+                harness.proxy_port,
+                MODEL,
+                "logical-run",
+                0.5,
+                3,
+                logical_request_id="turn:logical-resume",
+                admission_wait_ms=100,
+            )
+            assert duplicate[0] == 409, duplicate
+            assert duplicate[1]["reason_code"] == "logical_request_in_progress"
+            assert duplicate[1]["retryable"] is True
+            assert duplicate[1]["request_id"] == broker_request_id
+
+            assert active.result(timeout=8)[0] == 200
+            resumed_result = resumed.result(timeout=8)
+            assert resumed_result[0] == 200, resumed_result
+            assert resumed_result[2]["X-Ollama-Unify-Request-Id"] == broker_request_id
+            assert resumed_result[2]["X-Ollama-Unify-Logical-Request-Id"] == (
+                "turn:logical-resume"
+            )
+            assert resumed_result[2]["X-Ollama-Unify-Workload-Class"] == "foreground"
+            assert resumed_result[2]["X-Ollama-Unify-Queue-Policy"] == "wait"
+            assert follower.result(timeout=8)[0] == 200
+
+        observed_ids = [
+            event["request_id"] for event in request_events(harness.event_log)
+        ]
+        assert observed_ids == [
+            "logical-active", "logical-run", "logical-follower",
+        ]
+        queue = harness.status()["parallel_pool"]["queue"]
+        assert queue["enqueued_total"] == 3
+        assert queue["admitted_total"] == 3
+        assert queue["admission_timeout_total"] == 1
+        assert queue["resumed_total"] == 1
+        assert queue["duplicate_total"] == 2
+        assert queue["stale_total"] == 0
+
+
+def test_detached_logical_request_expires_without_inference(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1, resume_ttl=0.2) as harness:
+        assert harness.capacity(MODEL)[0] == 200
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            active = executor.submit(
+                chat, harness.proxy_port, MODEL, "stale-active", 0.7, 8
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "stale-active"
+                    for event in request_events(harness.event_log)
+                ),
+                "active request before stale admission",
+            )
+            expired = chat(
+                harness.proxy_port,
+                MODEL,
+                "must-expire",
+                0,
+                3,
+                logical_request_id="turn:expires",
+                admission_wait_ms=100,
+            )
+            assert expired[0] == 503, expired
+            assert expired[1]["admission_retained"] is True
+            wait_until(
+                lambda: queue_with_depth(harness, 0),
+                "detached logical waiter expiration",
+                timeout=2,
+            )
+            assert active.result(timeout=8)[0] == 200
+
+        assert not any(
+            event.get("request_id") == "must-expire"
+            for event in request_events(harness.event_log)
+        )
+        queue = harness.status()["parallel_pool"]["queue"]
+        assert queue["stale_total"] == 1
+        assert queue["resumed_total"] == 0
+
+
+def test_temporary_and_permanent_placement_failures(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        tags=[MODEL, OTHER_MODEL],
+    ) as harness:
+        assert harness.capacity(MODEL)[0] == 200
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            active = executor.submit(
+                chat, harness.proxy_port, MODEL, "temporary-active", 0.8, 8
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "temporary-active"
+                    for event in request_events(harness.event_log)
+                ),
+                "active lane before temporary placement failure",
+            )
+            temporary = chat(
+                harness.proxy_port,
+                OTHER_MODEL,
+                "temporary-placement",
+                0,
+                3,
+                logical_request_id="turn:temporary-placement",
+                admission_wait_ms=150,
+                queue_policy="yield",
+            )
+            assert temporary[0] == 503, temporary
+            assert temporary[1]["reason_code"] == "queue_admission_timeout"
+            assert temporary[1]["cause_reason_code"] == "lane_capacity_wait"
+            assert temporary[1]["retryable"] is True
+            assert "admission_retained" not in temporary[1]
+            assert active.result(timeout=8)[0] == 200
+
+    oversized = {
+        "name": OTHER_MODEL,
+        "model": OTHER_MODEL,
+        "size": 100 * 1024**3,
+        "capabilities": ["completion"],
+    }
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1, tags=[MODEL, oversized]
+    ) as harness:
+        assert harness.capacity(MODEL)[0] == 200
+        permanent = chat(
+            harness.proxy_port,
+            OTHER_MODEL,
+            "permanent-placement",
+            timeout=3,
+            logical_request_id="turn:permanent-placement",
+        )
+        assert permanent[0] == 422, permanent
+        assert permanent[1]["reason_code"] == "model_exceeds_gpu_capacity"
+        assert permanent[1]["retryable"] is False
+        assert permanent[2]["X-Ollama-Unify-Retryable"] == "false"
+        assert "Retry-After" not in permanent[2]
+        assert not any(
+            event.get("request_id") == "permanent-placement"
+            for event in request_events(harness.event_log)
+        )
+        assert [lane["model"] for lane in managed_lanes(harness.status())] == [
+            MODEL
+        ]
+        assert not [
+            event for event in events(harness.event_log)
+            if event["kind"] == "stop"
+        ]
+
+
 def test_ready_model_bypasses_blocked_other_model(helper, fixture_bin):
     with PoolHarness(
         helper, fixture_bin, max_servers=2, tags=[MODEL, OTHER_MODEL]
@@ -950,7 +1217,7 @@ def test_ready_model_bypasses_blocked_other_model(helper, fixture_bin):
                 chat, harness.proxy_port, OTHER_MODEL, "other-active", 1.5, 8
             )
             model_active = executor.submit(
-                chat, harness.proxy_port, MODEL, "model-active", 0.4, 8
+                chat, harness.proxy_port, MODEL, "model-active", 1.0, 8
             )
             wait_until(
                 lambda: {
@@ -1005,7 +1272,10 @@ def test_queued_disconnect_is_cancelled(helper, fixture_bin):
                 "active request before cancellation",
             )
             abandoned = open_abandonable_chat(
-                harness.proxy_port, MODEL, "must-not-run"
+                harness.proxy_port,
+                MODEL,
+                "must-not-run",
+                logical_request_id="turn:cancelled",
             )
             wait_until(
                 lambda: queue_with_depth(harness, 1),
@@ -1025,6 +1295,7 @@ def test_queued_disconnect_is_cancelled(helper, fixture_bin):
         assert status["active_requests"] == 0
         assert status["parallel_pool"]["queue"]["depth"] == 0
         assert status["parallel_pool"]["queue"]["cancelled_total"] == 1
+        assert status["parallel_pool"]["queue"]["stale_total"] == 0
         assert status["parallel_pool"]["queue"]["admitted_total"] == 1
         assert all(lane["in_flight"] == 0 for lane in managed_lanes(status))
 
@@ -1131,6 +1402,9 @@ def main():
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
+    test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin)
+    test_detached_logical_request_expires_without_inference(helper, fixture_bin)
+    test_temporary_and_permanent_placement_failures(helper, fixture_bin)
     test_ready_model_bypasses_blocked_other_model(helper, fixture_bin)
     test_queued_disconnect_is_cancelled(helper, fixture_bin)
     test_embedding_model_uses_embedding_warmup(helper, fixture_bin)
@@ -1141,7 +1415,7 @@ def main():
         "negotiator pool integration: PASS "
         "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
-        "cancellation, terminal admission failures)"
+        "resumable logical admission, cancellation, terminal admission failures)"
     )
 
 

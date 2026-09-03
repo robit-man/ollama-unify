@@ -255,7 +255,8 @@ def main():
             assert bounded_payload["request_id"]
             assert "queue" in bounded_payload
             assert bounded_payload["retryable"] is True
-            assert bounded_payload["reason_code"] == "gpu_admission_unavailable"
+            assert bounded_payload["reason_code"] == "queue_admission_timeout"
+            assert bounded_payload["retry_after_ms"] == 2000
 
             ready = control(socket_path, {"action": "ready", "token": token})
             assert ready["lease"]["state"] == "active"
@@ -328,7 +329,8 @@ def main():
             revoked_payload = json.loads(revoked_body)
             assert "revoked" in revoked_payload["error"].lower()
             assert revoked_payload["retryable"] is True
-            assert revoked_payload["reason_code"] == "gpu_admission_unavailable"
+            assert revoked_payload["reason_code"] == "lease_transition"
+            assert revoked_payload["retry_after_ms"] == 2000
             assert revoked_headers["Retry-After"] == "2"
             assert revoked_headers["X-Ollama-Unify-Retryable"] == "true"
             released = control(socket_path, {"action": "release", "token": token})

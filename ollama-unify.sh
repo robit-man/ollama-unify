@@ -918,6 +918,7 @@ render_gpu_negotiator_script() {
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import http.server
 import json
@@ -1033,6 +1034,9 @@ POOL_MAX_SERVERS = env_int(
     "OLLAMA_UNIFY_POOL_MAX_SERVERS", max(1, len(SELECTED_GPUS) * 2)
 )
 POOL_MAX_QUEUE = max(1, env_int("OLLAMA_UNIFY_POOL_MAX_QUEUE", 64))
+POOL_RESUME_TTL = max(
+    0.1, env_float("OLLAMA_UNIFY_POOL_RESUME_TTL", 30.0)
+)
 POOL_PORT_START = env_int("OLLAMA_UNIFY_POOL_PORT_START", BACKEND_PORT + 1)
 POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1))
 POOL_IDLE_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_IDLE_TIMEOUT", 300.0)
@@ -1063,6 +1067,7 @@ SAFE_METADATA_PATHS = (
     "/api/ps", "/api/tags", "/api/version", "/api/show", "/v1/models",
 )
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
+LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 
 
 def canonical_model_tag(model: str) -> str:
@@ -1356,6 +1361,7 @@ def discovery_document() -> dict[str, Any]:
             "enabled": POOL_ENABLED,
             "max_managed_servers": POOL_MAX_SERVERS,
             "max_queue": POOL_MAX_QUEUE,
+            "resume_ttl_seconds": POOL_RESUME_TTL,
             "private_port_start": POOL_PORT_START,
             "private_port_end": POOL_PORT_START + max(32, POOL_MAX_SERVERS + 4) - 1,
             "instance_parallel": POOL_INSTANCE_PARALLEL,
@@ -1364,6 +1370,30 @@ def discovery_document() -> dict[str, Any]:
             "model_overhead_percent": POOL_MODEL_OVERHEAD_PERCENT,
             "vram_reserve_mib": POOL_VRAM_RESERVE_MIB,
             "host_reserve_mib_per_lane": POOL_HOST_RESERVE_MIB,
+            "admission_protocol": {
+                "logical_request_header": LOGICAL_REQUEST_HEADER,
+                "workload_class_header": "X-Ollama-Unify-Workload-Class",
+                "workload_classes": [
+                    "foreground", "interactive-control", "background",
+                ],
+                "admission_wait_header": "X-Ollama-Unify-Admission-Wait-Ms",
+                "queue_policy_header": "X-Ollama-Unify-Queue-Policy",
+                "queue_policies": ["wait", "yield"],
+                "retry_after_json_field": "retry_after_ms",
+                "reason_codes": [
+                    "queue_admission_timeout",
+                    "queue_full",
+                    "lease_transition",
+                    "lane_capacity_wait",
+                    "host_memory_unavailable",
+                    "model_exceeds_gpu_capacity",
+                    "model_not_installed",
+                    "backend_start_failed",
+                    "logical_request_conflict",
+                    "logical_request_in_progress",
+                    "invalid_admission_header",
+                ],
+            },
         },
         "commands": {
             "discover": "docker gpu discover",
@@ -1519,13 +1549,72 @@ class Lane:
 
 
 class CapacityError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        status: int = 503,
+        reason_code: str = "lane_capacity_wait",
+        retryable: bool = True,
+        retry_after: int | None = 2,
+        *,
+        request_id: str = "",
+        logical_request_id: str = "",
+        admission_retained: bool = False,
+        cause_reason_code: str = "",
+    ) -> None:
+        self.status = status
+        self.reason_code = reason_code
+        self.retryable = retryable
+        self.retry_after = retry_after if retryable else None
+        self.request_id = request_id
+        self.logical_request_id = logical_request_id
+        self.admission_retained = admission_retained
+        self.cause_reason_code = cause_reason_code
+        super().__init__(message)
 
 
 class PermanentCapacityError(CapacityError):
-    def __init__(self, message: str, status: int = 503) -> None:
-        self.status = status
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        status: int = 422,
+        reason_code: str = "permanent_capacity_error",
+        *,
+        request_id: str = "",
+        logical_request_id: str = "",
+    ) -> None:
+        super().__init__(
+            message,
+            status,
+            reason_code,
+            False,
+            None,
+            request_id=request_id,
+            logical_request_id=logical_request_id,
+        )
+
+
+class AdmissionTimeoutError(CapacityError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        logical_request_id: str = "",
+        admission_retained: bool = False,
+        cause_reason_code: str = "",
+    ) -> None:
+        super().__init__(
+            message,
+            503,
+            "queue_admission_timeout",
+            True,
+            2,
+            request_id=request_id,
+            logical_request_id=logical_request_id,
+            admission_retained=admission_retained,
+            cause_reason_code=cause_reason_code,
+        )
 
 
 class ClientDisconnected(ConnectionError):
@@ -1535,26 +1624,40 @@ class ClientDisconnected(ConnectionError):
 @dataclass
 class QueuedRequest:
     request_id: str
+    logical_request_id: str
+    request_fingerprint: str
     model: str
     enqueued_at: float
     deadline: float
     connected: Callable[[], bool]
     request_path: str = ""
+    workload_class: str = "unspecified"
+    queue_policy: str = "wait"
     phase: str = "queued"
     initial_position: int = 1
     last_error: str | None = None
+    last_reason_code: str | None = None
     terminal_error: str | None = None
     terminal_status: int | None = None
+    terminal_reason_code: str | None = None
+    terminal_retryable: bool = False
+    terminal_retry_after: int | None = None
+    attached: bool = True
+    resume_deadline: float | None = None
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
+            "logical_request_id": self.logical_request_id or None,
             "model": self.model,
             "request_path": self.request_path or None,
+            "workload_class": self.workload_class,
+            "queue_policy": self.queue_policy,
             "position": position,
             "phase": self.phase,
             "wait_ms": max(0, int((now - self.enqueued_at) * 1000)),
             "last_error": self.last_error,
+            "last_reason_code": self.last_reason_code,
         }
 
 
@@ -1562,6 +1665,8 @@ class QueuedRequest:
 class Admission:
     lane: Lane
     request_id: str
+    logical_request_id: str
+    request_fingerprint: str
     queue_ms: int
     initial_position: int
 
@@ -1580,6 +1685,7 @@ class Broker:
         self.stopping = threading.Event()
         self.anonymous_running = False
         self.waiters: list[QueuedRequest] = []
+        self.logical_in_flight: dict[str, tuple[str, str]] = {}
         self.reconcile_retry_at = 0.0
         self.reconcile_last_error = ""
         self.reconciling_model: str | None = None
@@ -1587,6 +1693,10 @@ class Broker:
         self.queue_admitted_total = 0
         self.queue_cancelled_total = 0
         self.queue_timed_out_total = 0
+        self.queue_admission_timeout_total = 0
+        self.queue_resumed_total = 0
+        self.queue_stale_total = 0
+        self.queue_duplicate_total = 0
         self.queue_rejected_total = 0
         self.queue_wait_ms_total = 0
         self.queue_wait_ms_max = 0
@@ -1749,6 +1859,7 @@ class Broker:
 
     def _queue_summary_locked(self, include_requests: bool = False) -> dict[str, Any]:
         now = time.monotonic()
+        self._prune_stale_waiters_locked(now)
         by_model: dict[str, int] = {}
         phase_counts: dict[str, int] = {}
         requests = []
@@ -1771,6 +1882,10 @@ class Broker:
             "admitted_total": self.queue_admitted_total,
             "cancelled_total": self.queue_cancelled_total,
             "timed_out_total": self.queue_timed_out_total,
+            "admission_timeout_total": self.queue_admission_timeout_total,
+            "resumed_total": self.queue_resumed_total,
+            "stale_total": self.queue_stale_total,
+            "duplicate_total": self.queue_duplicate_total,
             "rejected_total": self.queue_rejected_total,
             "wait_ms_total": self.queue_wait_ms_total,
             "wait_ms_max": self.queue_wait_ms_max,
@@ -1825,7 +1940,9 @@ class Broker:
                 break
         if match is None:
             raise PermanentCapacityError(
-                f"model {model!r} is not installed on the managed Ollama store", 404
+                f"model {model!r} is not installed on the managed Ollama store",
+                404,
+                "model_not_installed",
             )
         try:
             size_bytes = int(match.get("size") or 0)
@@ -1833,7 +1950,9 @@ class Broker:
             size_bytes = 0
         if size_bytes <= 0:
             raise PermanentCapacityError(
-                f"model {model!r} has no local size metadata", 422
+                f"model {model!r} has no local size metadata",
+                422,
+                "model_metadata_invalid",
             )
         model_mib = math.ceil(size_bytes / (1024 * 1024))
         capabilities = match.get("capabilities")
@@ -1888,7 +2007,10 @@ class Broker:
                 continue
             finally:
                 candidate.close()
-        raise CapacityError("no loopback port is available for another managed Ollama lane")
+        raise CapacityError(
+            "no loopback port is available for another managed Ollama lane",
+            reason_code="backend_start_failed",
+        )
 
     @staticmethod
     def _terminate_process(process: Any) -> None:
@@ -1914,7 +2036,11 @@ class Broker:
                     capabilities: set[str], request_path: str) -> Lane:
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
-            raise CapacityError(f"managed Ollama binary is not executable: {OLLAMA_BINARY}")
+            raise PermanentCapacityError(
+                f"managed Ollama binary is not executable: {OLLAMA_BINARY}",
+                500,
+                "backend_start_failed",
+            )
         with self.cv:
             port = self._available_port_locked()
             lane_id = f"lane-{self.next_lane_id}"
@@ -1996,7 +2122,9 @@ class Broker:
             if (isinstance(exc, BackendHTTPError)
                     and 400 <= exc.status < 500
                     and exc.status not in (408, 409, 425, 429)):
-                raise PermanentCapacityError(str(exc), exc.status) from exc
+                raise PermanentCapacityError(
+                    str(exc), exc.status, "backend_rejected_model"
+                ) from exc
             raise
         now = time.time()
         lane = Lane(
@@ -2041,26 +2169,57 @@ class Broker:
                         request_path: str = "") -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
-            raise CapacityError("capacity request requires a model tag")
+            raise PermanentCapacityError(
+                "capacity request requires a model tag", 400, "invalid_capacity_request"
+            )
         if parallel < 1:
-            raise CapacityError("parallel must be at least 1")
+            raise PermanentCapacityError(
+                "parallel must be at least 1", 400, "invalid_capacity_request"
+            )
         maximum = POOL_MAX_SERVERS * POOL_INSTANCE_PARALLEL
         if parallel > maximum:
-            raise CapacityError(
-                f"requested parallel={parallel}, but configured maximum is {maximum}"
+            raise PermanentCapacityError(
+                f"requested parallel={parallel}, but configured maximum is {maximum}",
+                422,
+                "parallel_exceeds_capacity",
             )
         if not POOL_ENABLED:
-            raise CapacityError("managed Ollama parallel pool is disabled")
+            raise PermanentCapacityError(
+                "managed Ollama parallel pool is disabled",
+                409,
+                "pool_disabled",
+            )
         with self.transition:
             with self.cv:
                 if self.draining or self._global_transition_lease_locked():
-                    raise CapacityError("GPU lease transition is in progress")
+                    raise CapacityError(
+                        "GPU lease transition is in progress",
+                        reason_code="lease_transition",
+                    )
                 self._prune_dead_lanes_locked()
                 existing = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 required_mib, capabilities = self._model_profile(model)
+                selected_devices = [
+                    device for device in gpu_snapshot()
+                    if device.get("uuid") in SELECTED_GPUS
+                ]
+                if selected_devices and required_mib > max(
+                    int(device.get("total_mib") or 0)
+                    for device in selected_devices
+                ):
+                    capacity = max(
+                        int(device.get("total_mib") or 0)
+                        for device in selected_devices
+                    )
+                    raise PermanentCapacityError(
+                        f"model {model!r} requires {required_mib} MiB per lane, "
+                        f"but the largest selected GPU has {capacity} MiB total",
+                        422,
+                        "model_exceeds_gpu_capacity",
+                    )
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
@@ -2081,7 +2240,8 @@ class Broker:
                     )
                     if len(replaceable) < overflow:
                         raise CapacityError(
-                            "managed Ollama lane capacity reached; no idle lane can be replaced"
+                            "managed Ollama lane capacity reached; no idle lane can be replaced",
+                            reason_code="lane_capacity_wait",
                         )
                     retired = replaceable[:overflow]
                     for lane in retired:
@@ -2100,7 +2260,8 @@ class Broker:
                 if available_host and available_host < required_host:
                     raise CapacityError(
                         f"{missing} new lane(s) reserve {required_host} MiB host memory, "
-                        f"but only {available_host} MiB is available"
+                        f"but only {available_host} MiB is available",
+                        reason_code="host_memory_unavailable",
                     )
                 placements: list[str] = []
                 devices: list[dict[str, Any]] = []
@@ -2161,7 +2322,8 @@ class Broker:
                             f"model {model!r} requires {required_mib} MiB per lane; "
                             f"only {len(placements)} of {missing} required lane "
                             f"placements fit and no idle lane can be reclaimed "
-                            f"(free={free})"
+                            f"(free={free})",
+                            reason_code="lane_capacity_wait",
                         )
                     self._stop_lanes(
                         [victim], f"live VRAM reclamation for {model}",
@@ -2205,12 +2367,51 @@ class Broker:
             pass
         self.cv.notify_all()
 
+    def _prune_stale_waiters_locked(self, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        stale = [
+            waiter for waiter in self.waiters
+            if not waiter.attached
+            and waiter.resume_deadline is not None
+            and current >= waiter.resume_deadline
+        ]
+        for waiter in stale:
+            waiter.phase = "stale"
+            self.waiters.remove(waiter)
+            self.queue_stale_total += 1
+        if stale:
+            self.cv.notify_all()
+
+    @staticmethod
+    def _waiter_terminal_failure(waiter: QueuedRequest) -> CapacityError:
+        if waiter.terminal_retryable:
+            return CapacityError(
+                waiter.terminal_error or "broker admission failed",
+                waiter.terminal_status or 503,
+                waiter.terminal_reason_code or "lane_capacity_wait",
+                True,
+                waiter.terminal_retry_after or 2,
+                request_id=waiter.request_id,
+                logical_request_id=waiter.logical_request_id,
+            )
+        return PermanentCapacityError(
+            waiter.terminal_error or "broker admission failed",
+            waiter.terminal_status or 422,
+            waiter.terminal_reason_code or "permanent_capacity_error",
+            request_id=waiter.request_id,
+            logical_request_id=waiter.logical_request_id,
+        )
+
     def proxy_enter(self, model: str, routable: bool,
                     connected: Callable[[], bool] = lambda: True,
                     request_id: str = "",
                     allow_during_drain: bool = False,
                     request_path: str = "",
-                    admission_wait: float | None = None) -> Admission:
+                    admission_wait: float | None = None,
+                    logical_request_id: str = "",
+                    request_fingerprint: str = "",
+                    workload_class: str = "unspecified",
+                    queue_policy: str = "wait") -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         enqueued_at = time.monotonic()
@@ -2226,15 +2427,24 @@ class Broker:
                 with self.cv:
                     revoked = self.blocking_revoking_lease()
                     if revoked is not None and not allow_during_drain:
-                        raise PermanentCapacityError(
+                        raise CapacityError(
                             f"GPU lease transition for {revoked.owner} was revoked; "
                             "waiting for verified CUDA release",
                             503,
+                            "lease_transition",
+                            True,
+                            2,
+                            request_id=request_id,
+                            logical_request_id=logical_request_id,
                         )
                     while self.draining and not allow_during_drain:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            raise TimeoutError("GPU negotiation is still draining Ollama")
+                            raise AdmissionTimeoutError(
+                                "GPU negotiation is still draining Ollama",
+                                request_id=request_id,
+                                logical_request_id=logical_request_id,
+                            )
                         self.cv.wait(min(remaining, 0.25))
                     lane = self._select_lane_locked(model, routable)
                     if lane is not None:
@@ -2242,44 +2452,137 @@ class Broker:
                         lane.last_used = time.time()
                         self.active_requests += 1
                         return Admission(
-                            lane, request_id,
+                            lane, request_id, logical_request_id,
+                            request_fingerprint,
                             max(0, int((time.monotonic() - enqueued_at) * 1000)), 1,
                         )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("Ollama system lane is busy")
+                        raise AdmissionTimeoutError(
+                            "Ollama system lane is busy",
+                            request_id=request_id,
+                            logical_request_id=logical_request_id,
+                        )
                     self.cv.wait(min(remaining, 0.25))
 
         with self.cv:
+            self._prune_stale_waiters_locked(enqueued_at)
+            if logical_request_id:
+                active = self.logical_in_flight.get(logical_request_id)
+                if active is not None:
+                    active_fingerprint, active_request_id = active
+                    self.queue_duplicate_total += 1
+                    if active_fingerprint != request_fingerprint:
+                        raise PermanentCapacityError(
+                            "logical request ID was reused with different request content",
+                            409,
+                            "logical_request_conflict",
+                            request_id=active_request_id,
+                            logical_request_id=logical_request_id,
+                        )
+                    raise CapacityError(
+                        "logical request is already admitted and in progress",
+                        409,
+                        "logical_request_in_progress",
+                        True,
+                        1,
+                        request_id=active_request_id,
+                        logical_request_id=logical_request_id,
+                    )
+                waiter = next(
+                    (
+                        item for item in self.waiters
+                        if item.logical_request_id == logical_request_id
+                    ),
+                    None,
+                )
+                if waiter is not None:
+                    if (
+                        waiter.request_fingerprint != request_fingerprint
+                        or waiter.model != model
+                        or waiter.request_path != request_path
+                    ):
+                        self.queue_duplicate_total += 1
+                        raise PermanentCapacityError(
+                            "logical request ID was reused with different request content",
+                            409,
+                            "logical_request_conflict",
+                            request_id=waiter.request_id,
+                            logical_request_id=logical_request_id,
+                        )
+                    if waiter.attached:
+                        self.queue_duplicate_total += 1
+                        raise CapacityError(
+                            "logical request already has an attached admission attempt",
+                            409,
+                            "logical_request_in_progress",
+                            True,
+                            1,
+                            request_id=waiter.request_id,
+                            logical_request_id=logical_request_id,
+                        )
+                    waiter.connected = connected
+                    waiter.deadline = deadline
+                    waiter.attached = True
+                    waiter.resume_deadline = None
+                    waiter.workload_class = workload_class
+                    waiter.queue_policy = queue_policy
+                    if waiter.phase == "detached":
+                        waiter.phase = "queued"
+                    request_id = waiter.request_id
+                    enqueued_at = waiter.enqueued_at
+                    self.queue_resumed_total += 1
+                    self.cv.notify_all()
+                else:
+                    waiter = None
+            else:
+                waiter = None
             revoked = self.blocking_revoking_lease()
             if revoked is not None and not allow_during_drain:
-                raise PermanentCapacityError(
+                raise CapacityError(
                     f"GPU lease transition for {revoked.owner} was revoked; "
                     "waiting for verified CUDA release",
                     503,
+                    "lease_transition",
+                    True,
+                    2,
+                    request_id=request_id,
+                    logical_request_id=logical_request_id,
                 )
-            if len(self.waiters) >= POOL_MAX_QUEUE:
+            if waiter is None and len(self.waiters) >= POOL_MAX_QUEUE:
                 self.queue_rejected_total += 1
-                raise PermanentCapacityError(
+                raise CapacityError(
                     f"broker queue is full ({len(self.waiters)}/{POOL_MAX_QUEUE}); retry after current admissions settle",
                     503,
+                    "queue_full",
+                    True,
+                    2,
+                    request_id=request_id,
+                    logical_request_id=logical_request_id,
                 )
-            waiter = QueuedRequest(
-                request_id, model, enqueued_at, deadline, connected,
-                request_path=request_path,
-                initial_position=len(self.waiters) + 1,
-            )
-            self.waiters.append(waiter)
-            self.queue_enqueued_total += 1
-            self.queue_peak = max(self.queue_peak, len(self.waiters))
-            self.cv.notify_all()
+            if waiter is None:
+                waiter = QueuedRequest(
+                    request_id=request_id,
+                    logical_request_id=logical_request_id,
+                    request_fingerprint=request_fingerprint,
+                    model=model,
+                    enqueued_at=enqueued_at,
+                    deadline=deadline,
+                    connected=connected,
+                    request_path=request_path,
+                    workload_class=workload_class,
+                    queue_policy=queue_policy,
+                    initial_position=len(self.waiters) + 1,
+                )
+                self.waiters.append(waiter)
+                self.queue_enqueued_total += 1
+                self.queue_peak = max(self.queue_peak, len(self.waiters))
+                self.cv.notify_all()
         while True:
             if not connected():
                 with self.cv:
                     if waiter.terminal_error:
-                        raise PermanentCapacityError(
-                            waiter.terminal_error, waiter.terminal_status or 503
-                        )
+                        raise self._waiter_terminal_failure(waiter)
                     if waiter not in self.waiters:
                         continue
                     waiter.phase = "cancelled"
@@ -2288,16 +2591,34 @@ class Broker:
                 raise ClientDisconnected("client disconnected while queued")
             with self.cv:
                 if waiter.terminal_error:
-                    raise PermanentCapacityError(
-                        waiter.terminal_error, waiter.terminal_status or 503
-                    )
+                    raise self._waiter_terminal_failure(waiter)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    detail = f": {waiter.last_error}" if waiter.last_error else ""
+                    if (
+                        waiter.logical_request_id
+                        and waiter.queue_policy == "wait"
+                    ):
+                        waiter.phase = "detached"
+                        waiter.attached = False
+                        waiter.resume_deadline = time.monotonic() + POOL_RESUME_TTL
+                        self.queue_admission_timeout_total += 1
+                        self.cv.notify_all()
+                        raise AdmissionTimeoutError(
+                            f"broker queue admission deadline expired{detail}",
+                            request_id=waiter.request_id,
+                            logical_request_id=waiter.logical_request_id,
+                            admission_retained=True,
+                            cause_reason_code=waiter.last_reason_code or "",
+                        )
                     waiter.phase = "timed-out"
                     self.queue_timed_out_total += 1
                     self._remove_waiter_locked(waiter)
-                    detail = f": {waiter.last_error}" if waiter.last_error else ""
-                    raise TimeoutError(f"broker queue deadline expired{detail}")
+                    raise AdmissionTimeoutError(
+                        f"broker queue admission deadline expired{detail}",
+                        request_id=waiter.request_id,
+                        cause_reason_code=waiter.last_reason_code or "",
+                    )
                 self._prune_dead_lanes_locked()
                 waiter_index = next(
                     (index for index, item in enumerate(self.waiters)
@@ -2323,9 +2644,16 @@ class Broker:
                         lane.in_flight += 1
                         lane.last_used = time.time()
                         self.active_requests += 1
+                        if waiter.logical_request_id:
+                            self.logical_in_flight[waiter.logical_request_id] = (
+                                waiter.request_fingerprint,
+                                waiter.request_id,
+                            )
                         self.cv.notify_all()
                         return Admission(
-                            lane, request_id,
+                            lane, waiter.request_id,
+                            waiter.logical_request_id,
+                            waiter.request_fingerprint,
                             queue_ms,
                             waiter.initial_position,
                         )
@@ -2335,6 +2663,7 @@ class Broker:
         """One scheduler owns managed-lane creation and replacement."""
         while not self.stopping.is_set():
             with self.cv:
+                self._prune_stale_waiters_locked()
                 if (self.draining or self._global_transition_lease_locked()
                         or not self.waiters):
                     self.cv.wait(0.5)
@@ -2352,6 +2681,7 @@ class Broker:
                     waiter.last_error = (
                         "all selected GPUs are reserved by pending or revoking leases"
                     )
+                    waiter.last_reason_code = "lease_transition"
                     self.reconcile_retry_at = 0.0
                     self.reconcile_last_error = waiter.last_error
                     self.reconciling_model = None
@@ -2394,8 +2724,12 @@ class Broker:
                     if waiter in self.waiters:
                         waiter.phase = "failed"
                         waiter.last_error = message
+                        waiter.last_reason_code = exc.reason_code
                         waiter.terminal_error = message
                         waiter.terminal_status = exc.status
+                        waiter.terminal_reason_code = exc.reason_code
+                        waiter.terminal_retryable = exc.retryable
+                        waiter.terminal_retry_after = exc.retry_after
                         self.queue_rejected_total += 1
                         self._remove_waiter_locked(waiter)
                     self.reconcile_retry_at = 0.0
@@ -2405,10 +2739,16 @@ class Broker:
                 LOG.error("managed capacity rejected model=%s: %s", model, message)
             except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
                 message = str(exc)
+                reason_code = (
+                    exc.reason_code
+                    if isinstance(exc, CapacityError)
+                    else "backend_start_failed"
+                )
                 with self.cv:
                     if waiter in self.waiters:
                         waiter.phase = "queued"
                         waiter.last_error = message
+                        waiter.last_reason_code = reason_code
                     changed = message != self.reconcile_last_error
                     self.reconcile_last_error = message
                     self.reconcile_retry_at = time.monotonic() + 2.0
@@ -2417,13 +2757,21 @@ class Broker:
                 if changed:
                     LOG.warning("managed capacity queued model=%s: %s", model, message)
 
-    def proxy_exit(self, lane: Lane, model: str, succeeded: bool) -> None:
+    def proxy_exit(
+        self,
+        lane: Lane,
+        model: str,
+        succeeded: bool,
+        logical_request_id: str = "",
+    ) -> None:
         with self.cv:
             lane.in_flight = max(0, lane.in_flight - 1)
             lane.last_used = time.time()
             if succeeded and model:
                 lane.model = model
             self.active_requests = max(0, self.active_requests - 1)
+            if logical_request_id:
+                self.logical_in_flight.pop(logical_request_id, None)
             self.cv.notify_all()
 
     def begin_drain(self, reason: str) -> None:
@@ -2483,8 +2831,12 @@ class Broker:
             for waiter in list(self.waiters):
                 waiter.phase = "failed"
                 waiter.last_error = message
+                waiter.last_reason_code = "lease_transition"
                 waiter.terminal_error = message
                 waiter.terminal_status = 503
+                waiter.terminal_reason_code = "lease_transition"
+                waiter.terminal_retryable = True
+                waiter.terminal_retry_after = 2
                 self.queue_rejected_total += 1
                 self._remove_waiter_locked(waiter)
         self._persist_leases_locked()
@@ -2816,6 +3168,7 @@ class Broker:
             leases = [asdict(lease) for lease in self.leases.values()]
             draining = self.draining
             active = self.active_requests
+            logical_in_flight = len(self.logical_in_flight)
             reason = self.last_reason
             lanes = self._lane_summaries_locked()
             queue = self._queue_summary_locked(include_requests=True)
@@ -2830,6 +3183,8 @@ class Broker:
                     "enabled": POOL_ENABLED,
                     "max_managed_servers": POOL_MAX_SERVERS,
                     "max_queue": POOL_MAX_QUEUE,
+                    "resume_ttl_seconds": POOL_RESUME_TTL,
+                    "logical_in_flight": logical_in_flight,
                     "instance_parallel": POOL_INSTANCE_PARALLEL,
                     "lanes": lanes,
                     "queue": queue,
@@ -3009,6 +3364,96 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         return max(0.1, min(DRAIN_TIMEOUT, milliseconds / 1000.0))
 
+    def _requested_admission_controls(self) -> tuple[str, str, str]:
+        logical_request_id = self.headers.get(
+            LOGICAL_REQUEST_HEADER, ""
+        ).strip()
+        if logical_request_id and (
+            len(logical_request_id) > 128
+            or any(
+                not (
+                    character.isascii()
+                    and (character.isalnum() or character in "._:-")
+                )
+                for character in logical_request_id
+            )
+        ):
+            raise PermanentCapacityError(
+                "logical request ID must be 1-128 letters, digits, '.', '_', ':', or '-'",
+                400,
+                "invalid_admission_header",
+            )
+        workload_class = self.headers.get(
+            "X-Ollama-Unify-Workload-Class", "unspecified"
+        ).strip().lower() or "unspecified"
+        if workload_class not in {
+            "foreground", "interactive-control", "background", "unspecified",
+        }:
+            raise PermanentCapacityError(
+                "workload class must be foreground, interactive-control, background, or unspecified",
+                400,
+                "invalid_admission_header",
+                logical_request_id=logical_request_id,
+            )
+        queue_policy = self.headers.get(
+            "X-Ollama-Unify-Queue-Policy", "wait"
+        ).strip().lower() or "wait"
+        if queue_policy not in {"wait", "yield"}:
+            raise PermanentCapacityError(
+                "queue policy must be wait or yield",
+                400,
+                "invalid_admission_header",
+                logical_request_id=logical_request_id,
+            )
+        return logical_request_id, workload_class, queue_policy
+
+    def _send_capacity_failure(
+        self,
+        failure: CapacityError,
+        *,
+        request_id: str = "",
+        logical_request_id: str = "",
+        workload_class: str = "unspecified",
+        queue_policy: str = "wait",
+        queue: dict[str, Any] | None = None,
+    ) -> None:
+        broker_request_id = failure.request_id or request_id
+        logical_id = failure.logical_request_id or logical_request_id
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error": str(failure),
+            "retryable": failure.retryable,
+            "reason_code": failure.reason_code,
+        }
+        if broker_request_id:
+            payload["request_id"] = broker_request_id
+        if logical_id:
+            payload["logical_request_id"] = logical_id
+        if queue is not None:
+            payload["queue"] = queue
+        if failure.retry_after is not None:
+            payload["retry_after_ms"] = failure.retry_after * 1000
+        if failure.cause_reason_code:
+            payload["cause_reason_code"] = failure.cause_reason_code
+        if failure.admission_retained:
+            payload["admission_retained"] = True
+            payload["resume_ttl_ms"] = int(POOL_RESUME_TTL * 1000)
+        headers = {
+            "X-Ollama-Unify-Retryable": str(failure.retryable).lower(),
+            "X-Ollama-Unify-Reason-Code": failure.reason_code,
+            "X-Ollama-Unify-Workload-Class": workload_class,
+            "X-Ollama-Unify-Queue-Policy": queue_policy,
+        }
+        if failure.retry_after is not None:
+            headers["Retry-After"] = str(failure.retry_after)
+        if broker_request_id:
+            headers["X-Ollama-Unify-Request-Id"] = broker_request_id
+        if logical_id:
+            headers[LOGICAL_REQUEST_HEADER] = logical_id
+        if failure.admission_retained:
+            headers["X-Ollama-Unify-Admission-Retained"] = "true"
+        self._send_json(failure.status, payload, headers)
+
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
         if self.command == "GET" and path == "/.well-known/ollama-unify-gpu-negotiator":
@@ -3042,29 +3487,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
-                retryable = exc.status == 503
-                self._send_json(exc.status, {
-                    "ok": False,
-                    "error": str(exc),
-                    "retryable": retryable,
-                    "reason_code": (
-                        "gpu_admission_unavailable" if retryable
-                        else "permanent_capacity_error"
-                    ),
-                }, ({
-                    "Retry-After": "2",
-                    "X-Ollama-Unify-Retryable": "true",
-                } if retryable else None))
-            except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
-                self._send_json(503, {
-                    "ok": False,
-                    "error": str(exc),
-                    "retryable": True,
-                    "reason_code": "gpu_admission_unavailable",
-                }, {
-                    "Retry-After": "2",
-                    "X-Ollama-Unify-Retryable": "true",
-                })
+                self._send_capacity_failure(exc)
+            except CapacityError as exc:
+                self._send_capacity_failure(exc)
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                self._send_capacity_failure(CapacityError(
+                    str(exc), reason_code="backend_start_failed"
+                ))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -3095,76 +3524,79 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 pass
         admission = None
         request_id = secrets.token_hex(8)
+        logical_request_id = ""
+        workload_class = "unspecified"
+        queue_policy = "wait"
         try:
+            (
+                logical_request_id,
+                workload_class,
+                queue_policy,
+            ) = self._requested_admission_controls()
+            fingerprint = hashlib.sha256(
+                self.command.encode()
+                + b"\0"
+                + path.encode()
+                + b"\0"
+                + body
+            ).hexdigest()
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
                 allow_during_drain=path in SAFE_METADATA_PATHS,
                 request_path=path,
                 admission_wait=self._requested_admission_wait(),
+                logical_request_id=logical_request_id,
+                request_fingerprint=fingerprint,
+                workload_class=workload_class,
+                queue_policy=queue_policy,
             )
         except ClientDisconnected:
             return
-        except TimeoutError as exc:
+        except CapacityError as exc:
             with self.broker.cv:
                 queue = self.broker._queue_summary_locked()
-            self._send_json(503, {
-                "error": str(exc),
-                "request_id": request_id,
-                "queue": queue,
-                "retryable": True,
-                "reason_code": "gpu_admission_unavailable",
-            }, {
-                "Retry-After": "2",
-                "X-Ollama-Unify-Retryable": "true",
-                "X-Ollama-Unify-Request-Id": request_id,
-            })
+            self._send_capacity_failure(
+                exc,
+                request_id=request_id,
+                logical_request_id=logical_request_id,
+                workload_class=workload_class,
+                queue_policy=queue_policy,
+                queue=queue,
+            )
             return
-        except PermanentCapacityError as exc:
+        except (OSError, RuntimeError, TimeoutError) as exc:
             with self.broker.cv:
                 queue = self.broker._queue_summary_locked()
-            self._send_json(exc.status, {
-                "error": str(exc),
-                "request_id": request_id,
-                "queue": queue,
-                "retryable": exc.status == 503,
-                "reason_code": (
-                    "gpu_admission_unavailable" if exc.status == 503
-                    else "permanent_capacity_error"
-                ),
-            }, ({
-                "Retry-After": "2",
-                "X-Ollama-Unify-Retryable": "true",
-                "X-Ollama-Unify-Request-Id": request_id,
-            } if exc.status == 503 else {
-                "X-Ollama-Unify-Request-Id": request_id,
-            }))
-            return
-        except (CapacityError, OSError, RuntimeError) as exc:
-            with self.broker.cv:
-                queue = self.broker._queue_summary_locked()
-            self._send_json(503, {
-                "error": str(exc),
-                "request_id": request_id,
-                "queue": queue,
-                "retryable": True,
-                "reason_code": "gpu_admission_unavailable",
-            }, {
-                "Retry-After": "2",
-                "X-Ollama-Unify-Retryable": "true",
-                "X-Ollama-Unify-Request-Id": request_id,
-            })
+            self._send_capacity_failure(
+                CapacityError(str(exc), reason_code="backend_start_failed"),
+                request_id=request_id,
+                logical_request_id=logical_request_id,
+                workload_class=workload_class,
+                queue_policy=queue_policy,
+                queue=queue,
+            )
             return
         lane = admission.lane
         if not self._client_connected():
-            self.broker.proxy_exit(lane, model, False)
+            self.broker.proxy_exit(
+                lane, model, False, admission.logical_request_id
+            )
             admission = None
             return
         response_started = False
         succeeded = False
         backend = None
         try:
+            broker_control_headers = {
+                "x-ollama-unify-admission-wait-ms",
+                "x-ollama-unify-logical-request-id",
+                "x-ollama-unify-workload-class",
+                "x-ollama-unify-queue-policy",
+            }
             headers = {key: value for key, value in self.headers.items()
-                       if key.lower() not in HOP_HEADERS and key.lower() not in {"host", "content-length"}}
+                       if key.lower() not in HOP_HEADERS
+                       and key.lower() not in {"host", "content-length"}
+                       and key.lower() not in broker_control_headers}
             backend = http.client.HTTPConnection(lane.host, lane.port, timeout=None)
             backend.request(self.command, self.path, body=body if body else None, headers=headers)
             response = backend.getresponse()
@@ -3174,6 +3606,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header(key, value)
             self.send_header("X-Ollama-Unify-Lane", lane.lane_id)
             self.send_header("X-Ollama-Unify-Request-Id", admission.request_id)
+            if admission.logical_request_id:
+                self.send_header(
+                    LOGICAL_REQUEST_HEADER, admission.logical_request_id
+                )
+            self.send_header(
+                "X-Ollama-Unify-Workload-Class", workload_class
+            )
+            self.send_header("X-Ollama-Unify-Queue-Policy", queue_policy)
             self.send_header("X-Ollama-Unify-Queue-Ms", str(admission.queue_ms))
             self.send_header(
                 "X-Ollama-Unify-Queue-Position", str(admission.initial_position)
@@ -3204,7 +3644,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if backend is not None:
                 backend.close()
             if admission is not None:
-                self.broker.proxy_exit(lane, model, succeeded)
+                self.broker.proxy_exit(
+                    lane, model, succeeded, admission.logical_request_id
+                )
 
     do_GET = _handle
     do_POST = _handle
@@ -3695,6 +4137,7 @@ install_gpu_negotiator() {
   backend_port="${SAFETY_OLLAMA_BACKEND##*:}"
   pool_port_start="${OLLAMA_SAFE_POOL_PORT_START:-$((backend_port + 1))}"
   pool_instance_parallel="${OLLAMA_SAFE_POOL_INSTANCE_PARALLEL:-1}"
+  pool_resume_ttl="${OLLAMA_SAFE_POOL_RESUME_TTL:-30}"
   pool_idle_timeout="${OLLAMA_SAFE_POOL_IDLE_TIMEOUT:-300}"
   pool_ready_timeout="${OLLAMA_SAFE_POOL_READY_TIMEOUT:-30}"
   pool_load_timeout="${OLLAMA_SAFE_POOL_LOAD_TIMEOUT:-$drain_timeout}"
@@ -3731,6 +4174,8 @@ install_gpu_negotiator() {
     || { err "OLLAMA_SAFE_POOL_READY_TIMEOUT must be numeric"; exit 2; }
   [[ "$pool_load_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_POOL_LOAD_TIMEOUT must be numeric"; exit 2; }
+  [[ "$pool_resume_ttl" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_POOL_RESUME_TTL must be numeric"; exit 2; }
   [ -x "$ollama_binary" ] \
     || { err "managed pool Ollama binary is not executable: $ollama_binary"; exit 2; }
   [[ "$model_store" != *'"'* ]] \
@@ -3776,6 +4221,7 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_POOL_ENABLED="%s"\n' "$pool_enabled"
     printf 'OLLAMA_UNIFY_POOL_MAX_SERVERS="%s"\n' "$pool_max_servers"
     printf 'OLLAMA_UNIFY_POOL_MAX_QUEUE="64"\n'
+    printf 'OLLAMA_UNIFY_POOL_RESUME_TTL="%s"\n' "$pool_resume_ttl"
     printf 'OLLAMA_UNIFY_POOL_PORT_START="%s"\n' "$pool_port_start"
     printf 'OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL="%s"\n' "$pool_instance_parallel"
     printf 'OLLAMA_UNIFY_POOL_IDLE_TIMEOUT="%s"\n' "$pool_idle_timeout"
