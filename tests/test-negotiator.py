@@ -128,6 +128,7 @@ def well_known(port):
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
+    installer = os.path.abspath(sys.argv[3])
     backend = Backend()
     backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
     backend_thread.start()
@@ -206,6 +207,43 @@ def main():
             assert request["options"]["num_gpu"] == -1
             assert "main_gpu" not in request["options"]
             assert request["options"]["num_ctx"] == 8192
+
+            discovery_config = os.path.join(temp_dir, "negotiator.env")
+            discovery_manifest = os.path.join(temp_dir, "discovery.json")
+            with open(discovery_config, "w", encoding="utf-8") as stream:
+                stream.write(
+                    f'OLLAMA_UNIFY_LISTEN="127.0.0.1:{proxy_port}"\n'
+                )
+            refresh_command = [
+                "bash",
+                "-c",
+                'source "$1"; '
+                'SAFETY_DISCOVERY_PATH="$2"; '
+                'SAFETY_NEGOTIATOR_CONFIG_PATH="$3"; '
+                'refresh_installed_gpu_discovery ""',
+                "bash",
+                installer,
+                discovery_manifest,
+                discovery_config,
+            ]
+            subprocess.run(
+                refresh_command,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with open(discovery_manifest, encoding="utf-8") as stream:
+                installed_discovery = json.load(stream)
+            assert installed_discovery["available"] is True
+            assert installed_discovery["backend_available"] is True
+            assert installed_discovery["pending_transition_timeout_seconds"] == 2
+            assert installed_discovery["heartbeat_reconnect_grace_seconds"] == 4
+            assert (
+                installed_discovery["parallel_pool"]["admission_protocol"]
+                ["logical_request_header"]
+                == "X-Ollama-Unify-Logical-Request-Id"
+            )
 
             acquired = subprocess.run(
                 [
@@ -537,6 +575,17 @@ def main():
             dead_discovery = well_known(proxy_port)
             assert dead_discovery["available"] is False
             assert dead_discovery["backend_available"] is False
+            with open(discovery_manifest, encoding="utf-8") as stream:
+                healthy_manifest = stream.read()
+            failed_refresh = subprocess.run(
+                refresh_command,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert failed_refresh.returncode != 0
+            with open(discovery_manifest, encoding="utf-8") as stream:
+                assert stream.read() == healthy_manifest
 
             failed_acquire = subprocess.run(
                 [helper, "acquire", "--owner", "backend-down", "--vram-mib", "1"],

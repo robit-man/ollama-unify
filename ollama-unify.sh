@@ -4354,6 +4354,53 @@ UNIT
   say "  Ollama backend: $SAFETY_OLLAMA_BACKEND; negotiated API: $proxy_listen"
 }
 
+refresh_installed_gpu_discovery() {
+  local sudo_pfx="$1"
+  local -a elevate=()
+  local temp_file proxy_listen proxy_port
+  [ -n "$sudo_pfx" ] && elevate=("$sudo_pfx")
+  temp_file=$(mktemp "${TMPDIR:-/tmp}/ollama-unify-discovery.XXXXXX")
+  proxy_listen=$(detect_ollama_proxy_listen)
+  proxy_port="${proxy_listen##*:}"
+  if ! python3 - "$proxy_port" "$temp_file" <<'PY'
+import json
+import sys
+import urllib.request
+
+try:
+    port = int(sys.argv[1])
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/.well-known/ollama-unify-gpu-negotiator",
+        timeout=5,
+    ) as response:
+        document = json.load(response)
+    if not isinstance(document, dict):
+        raise ValueError("discovery response is not an object")
+    if document.get("schema") != "io.ollama-unify.gpu-negotiator.discovery.v1":
+        raise ValueError("unexpected discovery schema")
+    if document.get("available") is not True:
+        raise ValueError("negotiated API reports unavailable")
+    if document.get("backend_available") is not True:
+        raise ValueError("Ollama backend reports unavailable")
+    protocol = document.get("parallel_pool", {}).get("admission_protocol", {})
+    if protocol.get("logical_request_header") != "X-Ollama-Unify-Logical-Request-Id":
+        raise ValueError("installed broker lacks the logical admission protocol")
+    with open(sys.argv[2], "w", encoding="utf-8") as stream:
+        json.dump(document, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(f"ollama-unify live discovery refresh: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    rm -f "$temp_file"
+    return 1
+  fi
+  "${elevate[@]}" install -m 0644 "$temp_file" "$SAFETY_DISCOVERY_PATH"
+  rm -f "$temp_file"
+  ok "live agent discovery manifest refreshed: $SAFETY_DISCOVERY_PATH"
+}
+
 install_global_codex_gpu_instructions() {
   local sudo_pfx="$1" enabled="${OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY:-1}"
   [ "$enabled" = 1 ] || { [ "$enabled" = 0 ] && return; err "OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY must be 0 or 1"; exit 2; }
@@ -4532,6 +4579,12 @@ install_safety_only() {
     fi
     if systemctl is-active ollama.service >/dev/null 2>&1; then
       ok "ollama.service restarted under the new policy"
+      if systemctl is-active ollama-unify-negotiator.service >/dev/null 2>&1; then
+        refresh_installed_gpu_discovery "$SUDO" \
+          || warn "live discovery refresh failed; inspect the negotiated API before trusting the static manifest"
+      else
+        warn "ollama-unify-negotiator.service did not become active; static discovery was not refreshed"
+      fi
     else
       warn "ollama.service remains stopped because the safety condition refused the restart"
     fi

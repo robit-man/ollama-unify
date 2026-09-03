@@ -48,6 +48,7 @@ python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
   "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/fixtures/bin/ollama"
 "$test_tmp/ollama-unify-gpu-negotiator" self-test
 python3 "$repo_dir/tests/test-negotiator.py" \
-  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin" \
+  "$repo_dir/ollama-unify.sh"
 python3 "$repo_dir/tests/test-negotiator-pool.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
