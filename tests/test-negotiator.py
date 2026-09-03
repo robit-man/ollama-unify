@@ -152,6 +152,7 @@ def main():
                 "OLLAMA_UNIFY_PENDING_TIMEOUT": "2",
                 "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
                 "OLLAMA_UNIFY_LEASE_TTL": "30",
+                "OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE": "4",
                 "OLLAMA_UNIFY_ANON_POLL": "0.1",
                 "OLLAMA_UNIFY_ANON_SETTLE": "0.1",
                 "OLLAMA_UNIFY_ANON_MAX_DRAIN": "0.5",
@@ -300,6 +301,44 @@ def main():
             )
             watching = json.loads(watcher.stdout.readline())
             assert watching["watching"] is True
+            assert watching["reconnect_grace"] == 4
+            heartbeat_before_restart = control(
+                socket_path, {"action": "status"}
+            )["leases"][0]["heartbeat_at"]
+            daemon.terminate()
+            daemon.wait(timeout=5)
+            time.sleep(0.3)
+            assert watcher.poll() is None, (
+                "heartbeat watcher exited during bounded broker restart"
+            )
+            daemon = subprocess.Popen(
+                [helper, "serve"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if daemon.poll() is not None:
+                    raise RuntimeError(daemon.stderr.read())
+                if os.path.exists(socket_path):
+                    try:
+                        restored = control(socket_path, {"action": "status"})
+                        if (
+                            restored["leases"][0]["token"] == token
+                            and restored["leases"][0]["heartbeat_at"]
+                            > heartbeat_before_restart
+                        ):
+                            break
+                    except (ConnectionError, OSError):
+                        pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(
+                    "heartbeat watcher did not renew the persisted lease after restart"
+                )
+            assert watcher.poll() is None
             watcher.terminate()
             watcher.wait(timeout=5)
 
@@ -340,6 +379,104 @@ def main():
             assert status["draining"] is False
             assert status["backend_available"] is True
             assert len(status["gpus"]) == 3
+
+            scoped_child = subprocess.Popen(
+                [
+                    helper,
+                    "run",
+                    "--owner",
+                    "restart-safe-child",
+                    "--vram-mib",
+                    "1",
+                    "--ttl",
+                    "6",
+                    "--gpu",
+                    "GPU-large-0",
+                    "--ready-timeout",
+                    "2",
+                    "--ready-command",
+                    "true",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(7)",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                scoped_status = control(socket_path, {"action": "status"})
+                scoped_leases = [
+                    lease
+                    for lease in scoped_status["leases"]
+                    if lease["owner"] == "restart-safe-child"
+                    and lease["state"] == "active"
+                ]
+                if scoped_leases:
+                    break
+                if scoped_child.poll() is not None:
+                    raise RuntimeError(scoped_child.stderr.read())
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("scoped child lease did not become active")
+            scoped_token = scoped_leases[0]["token"]
+            scoped_gpus = scoped_leases[0]["gpu_uuids"]
+            scoped_heartbeat = scoped_leases[0]["heartbeat_at"]
+
+            daemon.terminate()
+            daemon.wait(timeout=5)
+            time.sleep(2.25)
+            assert scoped_child.poll() is None, (
+                "scoped child exited during negotiator restart grace"
+            )
+            daemon = subprocess.Popen(
+                [helper, "serve"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if daemon.poll() is not None:
+                    raise RuntimeError(daemon.stderr.read())
+                if os.path.exists(socket_path):
+                    try:
+                        restored_status = control(
+                            socket_path, {"action": "status"}
+                        )
+                        restored_lease = next(
+                            (
+                                lease
+                                for lease in restored_status["leases"]
+                                if lease["token"] == scoped_token
+                            ),
+                            None,
+                        )
+                        if (
+                            restored_lease is not None
+                            and restored_lease["heartbeat_at"] > scoped_heartbeat
+                        ):
+                            break
+                    except (ConnectionError, OSError):
+                        pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(
+                    "scoped child did not renew its exact lease after restart"
+                )
+            assert restored_lease["gpu_uuids"] == scoped_gpus
+            assert scoped_child.wait(timeout=10) == 0, scoped_child.stderr.read()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not control(socket_path, {"action": "status"})["leases"]:
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("scoped child did not release its lease")
 
             live_acquired = subprocess.run(
                 [

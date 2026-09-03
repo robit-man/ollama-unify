@@ -1014,6 +1014,9 @@ PENDING_TIMEOUT = env_float("OLLAMA_UNIFY_PENDING_TIMEOUT", 300.0)
 UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
 HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
+HEARTBEAT_RECONNECT_GRACE = env_float(
+    "OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE", 90.0
+)
 MAX_CONTEXT = env_int("OLLAMA_UNIFY_MAX_CONTEXT", 0)
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
 ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
@@ -1357,6 +1360,7 @@ def discovery_document() -> dict[str, Any]:
         "well_known": f"http://127.0.0.1:{LISTEN_PORT}/.well-known/ollama-unify-gpu-negotiator",
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
+        "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
         "parallel_pool": {
             "enabled": POOL_ENABLED,
             "max_managed_servers": POOL_MAX_SERVERS,
@@ -1419,6 +1423,11 @@ def discovery_document() -> dict[str, Any]:
             ),
             "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
             "release": "Free external CUDA allocations before releasing the lease.",
+            "heartbeat_restart_safety": (
+                "Heartbeat clients retain the exact lease token and GPU scope "
+                "through a bounded negotiator restart; an explicit rejection "
+                "or expired reconnect grace remains fail-closed."
+            ),
             "pending_timeout": (
                 "Pending transitions have an absolute, non-renewable deadline. "
                 "After it expires, the broker revokes heartbeats and remains drained "
@@ -3716,12 +3725,21 @@ class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSe
     daemon_threads = True
 
 
-def send_control(payload: dict[str, Any]) -> dict[str, Any]:
+def send_control(
+    payload: dict[str, Any], timeout_override: float | None = None
+) -> dict[str, Any]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     response_file = None
     try:
-        timeout = (HEARTBEAT_TIMEOUT if payload.get("action") == "heartbeat"
-                   else DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10)
+        timeout = (
+            timeout_override
+            if timeout_override is not None
+            else (
+                HEARTBEAT_TIMEOUT
+                if payload.get("action") == "heartbeat"
+                else DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10
+            )
+        )
         client.settimeout(timeout)
         client.connect(CONTROL_SOCKET)
         client.sendall(json.dumps(payload).encode() + b"\n")
@@ -3739,55 +3757,93 @@ def send_control(payload: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def heartbeat_reconnect_grace(ttl: int) -> float:
+    """Bound reconnect time below the persisted lease's expiry window."""
+    if ttl <= 0:
+        return HEARTBEAT_RECONNECT_GRACE
+    return max(0.1, min(HEARTBEAT_RECONNECT_GRACE, ttl / 2.0))
+
+
+def heartbeat_with_reconnect(
+    token: str,
+    grace: float,
+    stopped: threading.Event | None = None,
+) -> dict[str, Any] | None:
+    """Renew one exact lease across a bounded broker restart.
+
+    Connection failures can mean that systemd is replacing the negotiator.
+    Retry only that transport condition, using the same persisted token. An
+    explicit broker rejection remains terminal so a revoked or invalid lease
+    still fails closed immediately.
+    """
+    deadline = time.monotonic() + max(0.1, grace)
+    retry_delay = 0.1
+    last_error: Exception | None = None
+    while True:
+        if stopped is not None and stopped.is_set():
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ConnectionError(
+                f"lease heartbeat could not reconnect within {grace:.1f}s: "
+                f"{last_error or 'broker unavailable'}"
+            )
+        try:
+            return send_control(
+                {"action": "heartbeat", "token": token},
+                timeout_override=min(HEARTBEAT_TIMEOUT, max(0.1, remaining)),
+            )
+        except RuntimeError:
+            # The broker answered and rejected this exact lease. Retrying
+            # cannot repair an invalid, expired, or revoking lease.
+            raise
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            delay = min(retry_delay, max(0.0, deadline - time.monotonic()))
+            if delay <= 0:
+                continue
+            if stopped is not None:
+                stopped.wait(delay)
+            else:
+                time.sleep(delay)
+            retry_delay = min(2.0, retry_delay * 2.0)
+
+
 def watch_heartbeat(token: str, requested_interval: float) -> int:
-    """Renew a lease without repeatedly starting the Docker CLI and Python."""
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    response_file = None
+    """Renew a lease and reconnect through bounded negotiator restarts."""
     stopped = threading.Event()
     previous_handlers: dict[int, Any] = {}
 
     def stop(_signum: int, _frame: Any) -> None:
         stopped.set()
-        try:
-            client.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
 
     try:
-        client.settimeout(HEARTBEAT_TIMEOUT)
-        client.connect(CONTROL_SOCKET)
-        response_file = client.makefile("rb")
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, stop)
+        response = heartbeat_with_reconnect(
+            token, HEARTBEAT_RECONNECT_GRACE, stopped
+        )
+        if response is None:
+            return 0
+        lease = response.get("lease") or {}
+        ttl = max(0, int(lease.get("ttl") or 0))
         interval = requested_interval
-        first = True
-        while not stopped.is_set():
-            client.sendall(json.dumps({
-                "action": "heartbeat", "token": token, "persistent": True,
-            }).encode() + b"\n")
-            raw_response = response_file.readline(1024 * 1024)
-            if not raw_response:
-                if stopped.is_set():
-                    return 0
-                raise ConnectionError("negotiator closed the heartbeat connection")
-            response = json.loads(raw_response)
-            if not response.get("ok"):
-                raise RuntimeError(str(response.get("error") or "lease heartbeat failed"))
-            if first:
-                lease = response.get("lease") or {}
-                if interval <= 0:
-                    ttl = max(0, int(lease.get("ttl") or 0))
-                    interval = max(2.0, min(30.0, ttl / 3 if ttl else 30.0))
-                print(json.dumps({"ok": True, "watching": True, "interval": interval}), flush=True)
-                first = False
-            stopped.wait(interval)
+        if interval <= 0:
+            interval = max(2.0, min(30.0, ttl / 3 if ttl else 30.0))
+        reconnect_grace = heartbeat_reconnect_grace(ttl)
+        print(json.dumps({
+            "ok": True,
+            "watching": True,
+            "interval": interval,
+            "reconnect_grace": reconnect_grace,
+        }), flush=True)
+        while not stopped.wait(interval):
+            if heartbeat_with_reconnect(token, reconnect_grace, stopped) is None:
+                return 0
         return 0
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        if response_file is not None:
-            response_file.close()
-        client.close()
 
 
 def serve() -> int:
@@ -3859,9 +3915,13 @@ def lease_run(args: argparse.Namespace) -> int:
 
         def heartbeat() -> None:
             interval = max(2.0, min(30.0, args.ttl / 3 if args.ttl else 30.0))
+            reconnect_grace = heartbeat_reconnect_grace(args.ttl)
             while not stop_heartbeat.wait(interval):
                 try:
-                    send_control({"action": "heartbeat", "token": token})
+                    if heartbeat_with_reconnect(
+                        token, reconnect_grace, stop_heartbeat
+                    ) is None:
+                        return
                 except Exception as exc:
                     heartbeat_errors.append(str(exc))
                     heartbeat_failed.set()
@@ -3930,6 +3990,7 @@ def self_test() -> int:
     document = discovery_document()
     assert document["schema"] == "io.ollama-unify.gpu-negotiator.discovery.v1"
     assert document["commands"]["discover"] == "docker gpu discover"
+    assert document["heartbeat_reconnect_grace_seconds"] > 0
     assert "num_gpu" in agent_instructions_text()
     print("negotiator self-test: PASS")
     return 0
@@ -4098,7 +4159,8 @@ install_gpu_negotiator() {
 
   local proxy_listen service_user service_group access_group unit_dir config_dir helper_dir cli_dir
   local plugin_dir selected_ids model_store ollama_binary configured_environment backend_port
-  local drain_timeout pending_timeout unload_timeout lease_ttl anon_poll anon_settle anon_max_drain
+  local drain_timeout pending_timeout unload_timeout lease_ttl heartbeat_reconnect_grace
+  local anon_poll anon_settle anon_max_drain
   local pool_enabled pool_max_servers pool_port_start pool_instance_parallel
   local pool_idle_timeout pool_ready_timeout pool_load_timeout
   local pool_vram_reserve pool_host_reserve pool_model_overhead
@@ -4120,6 +4182,7 @@ install_gpu_negotiator() {
   pending_timeout="${OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT:-300}"
   unload_timeout="${OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT:-120}"
   lease_ttl="${OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL:-300}"
+  heartbeat_reconnect_grace="${OLLAMA_SAFE_HEARTBEAT_RECONNECT_GRACE:-90}"
   anon_poll="${OLLAMA_SAFE_NEGOTIATOR_ANON_POLL:-0.5}"
   anon_settle="${OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE:-2}"
   anon_max_drain="${OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN:-15}"
@@ -4152,6 +4215,8 @@ install_gpu_negotiator() {
     || { err "OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT must be numeric"; exit 2; }
   [[ "$lease_ttl" =~ ^[0-9]+$ ]] \
     || { err "OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL must be an unsigned integer"; exit 2; }
+  [[ "$heartbeat_reconnect_grace" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_HEARTBEAT_RECONNECT_GRACE must be numeric"; exit 2; }
   [[ "$anon_poll" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_NEGOTIATOR_ANON_POLL must be numeric"; exit 2; }
   [[ "$anon_settle" =~ ^[0-9]+([.][0-9]+)?$ ]] \
@@ -4214,6 +4279,7 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_PENDING_TIMEOUT="%s"\n' "$pending_timeout"
     printf 'OLLAMA_UNIFY_UNLOAD_TIMEOUT="%s"\n' "$unload_timeout"
     printf 'OLLAMA_UNIFY_LEASE_TTL="%s"\n' "$lease_ttl"
+    printf 'OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE="%s"\n' "$heartbeat_reconnect_grace"
     printf 'OLLAMA_UNIFY_ANON_POLL="%s"\n' "$anon_poll"
     printf 'OLLAMA_UNIFY_ANON_SETTLE="%s"\n' "$anon_settle"
     printf 'OLLAMA_UNIFY_ANON_MAX_DRAIN="%s"\n' "$anon_max_drain"

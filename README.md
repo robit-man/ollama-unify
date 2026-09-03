@@ -184,6 +184,15 @@ For workloads managed by another supervisor, use the explicit lifecycle:
 4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
 
+Lease heartbeat clients tolerate a bounded negotiator service restart. They
+retry the same persisted token and never acquire a replacement scope or change
+the assigned GPU UUIDs. The reconnect window defaults to 90 seconds and is
+also capped at half of the lease TTL. Set
+`OLLAMA_SAFE_HEARTBEAT_RECONNECT_GRACE` when installing to tune the ceiling.
+An explicit broker rejection still fails immediately. If the broker remains
+unavailable past the bounded window, `docker gpu run` terminates its child so
+the external CUDA allocation fails closed.
+
 To preserve a running workload while upgrading a legacy host-wide lease, use `docker gpu scope <token> --gpu <uuid> [--gpu <uuid> ...]`. The broker accepts the live transition only when all foreign CUDA growth since acquire is contained in the requested external-owner-exclusive scope and the scope can satisfy the original reservation. It then reopens measured free VRAM for broker-owned lanes without stopping the external process. Later foreign growth on an unreserved GPU triggers the existing reactive safety guard.
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
