@@ -2872,6 +2872,7 @@ class Broker:
                     logical_request_id: str = "",
                     request_fingerprint: str = "",
                     retained_request: RetainedRequest | None = None,
+                    resume_request: bool = False,
                     workload_class: str = "unspecified",
                     queue_policy: str = "wait") -> Admission:
         model = canonical_model_tag(model)
@@ -2931,6 +2932,8 @@ class Broker:
         with self.cv:
             self._prune_stale_waiters_locked(enqueued_at)
             if logical_request_id:
+                if resume_request:
+                    self._raise_logical_tombstone_locked(logical_request_id)
                 active = self.logical_in_flight.get(logical_request_id)
                 if active is not None:
                     active_fingerprint, active_request_id, queue_ticket = active
@@ -3027,6 +3030,13 @@ class Broker:
                     logical_request_id=logical_request_id,
                 )
             if waiter is None:
+                if resume_request:
+                    raise PermanentCapacityError(
+                        "logical request is not retained by this broker",
+                        409,
+                        "logical_request_not_found",
+                        logical_request_id=logical_request_id,
+                    )
                 if logical_request_id:
                     # A full-body submission is an explicit new attempt after
                     # a prior cancel/expiry. Body-free resume remains closed
@@ -3245,6 +3255,11 @@ class Broker:
                         waiter.terminal_reason_code = exc.reason_code
                         waiter.terminal_retryable = exc.retryable
                         waiter.terminal_retry_after = exc.retry_after
+                        self._record_logical_tombstone_locked(
+                            waiter.logical_request_id,
+                            waiter.request_id,
+                            exc.reason_code,
+                        )
                         self.queue_rejected_total += 1
                         self._remove_waiter_locked(waiter)
                     self.reconcile_retry_at = 0.0
@@ -4086,6 +4101,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         workload_class = "unspecified"
         queue_policy = "wait"
         retained_request = None
+        is_resume = False
         try:
             (
                 logical_request_id,
@@ -4175,6 +4191,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 logical_request_id=logical_request_id,
                 request_fingerprint=fingerprint,
                 retained_request=retained_request,
+                resume_request=is_resume,
                 workload_class=workload_class,
                 queue_policy=queue_policy,
             )

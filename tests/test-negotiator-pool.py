@@ -1706,6 +1706,18 @@ def test_capacity_rejects_unknown_endpoint(helper, fixture_bin):
         assert "supported Ollama inference path" in payload["error"]
 
 
+def test_unknown_body_free_resume_never_enqueues(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        before = harness.status()["parallel_pool"]["queue"]
+        resumed = resume_chat(harness.proxy_port, "turn:never-accepted", 3)
+        after = harness.status()["parallel_pool"]["queue"]
+        assert resumed[0] == 409, resumed
+        assert resumed[1]["reason_code"] == "logical_request_not_found"
+        assert resumed[1]["retryable"] is False
+        assert after["depth"] == 0
+        assert after["enqueued_total"] == before["enqueued_total"]
+
+
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
@@ -1746,6 +1758,7 @@ def main():
     test_permanent_failure_does_not_block_fifo(helper, fixture_bin)
     test_retryable_warm_failure_stays_queued(helper, fixture_bin)
     test_capacity_rejects_unknown_endpoint(helper, fixture_bin)
+    test_unknown_body_free_resume_never_enqueues(helper, fixture_bin)
     print(
         "negotiator pool integration: PASS "
         "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
