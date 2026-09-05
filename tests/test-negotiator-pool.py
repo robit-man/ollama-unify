@@ -113,13 +113,18 @@ def http_raw(port, method, path, payload=None, timeout=10, extra_headers=None):
     return result
 
 
-def control(path, payload):
+def control_result(path, payload):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(10)
     client.connect(path)
     client.sendall(json.dumps(payload).encode() + b"\n")
     response = json.loads(client.makefile("rb").readline())
     client.close()
+    return response
+
+
+def control(path, payload):
+    response = control_result(path, payload)
     assert response["ok"], response
     return response
 
@@ -313,6 +318,7 @@ class PoolHarness:
     def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
                  runner_vram_mib=2048, max_queue=64,
                  release_tolerance_mib=256, resume_ttl=1.0,
+                 pending_timeout=300.0,
                  completed_ttl=2.0, completed_max_entries=8,
                  completed_max_body_bytes=1024 * 1024,
                  completed_max_total_bytes=4 * 1024 * 1024):
@@ -324,6 +330,7 @@ class PoolHarness:
         self.max_queue = max_queue
         self.release_tolerance_mib = release_tolerance_mib
         self.resume_ttl = resume_ttl
+        self.pending_timeout = pending_timeout
         self.completed_ttl = completed_ttl
         self.completed_max_entries = completed_max_entries
         self.completed_max_body_bytes = completed_max_body_bytes
@@ -375,6 +382,7 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
             "OLLAMA_UNIFY_POOL_READY_TIMEOUT": "3",
             "OLLAMA_UNIFY_POOL_LOAD_TIMEOUT": "3",
+            "OLLAMA_UNIFY_PENDING_TIMEOUT": str(self.pending_timeout),
             "OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB": "1024",
             "OLLAMA_UNIFY_POOL_MODEL_OVERHEAD_PERCENT": "100",
             "OLLAMA_UNIFY_OLLAMA_BINARY": os.path.join(self.fixture_bin, "ollama"),
@@ -637,6 +645,107 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
         )
         assert released["released"] == token
         assert harness.status()["draining"] is False
+
+
+def test_disjoint_scoped_acquire_bypasses_unrelated_revoking_lease(
+    helper, fixture_bin,
+):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=3, pending_timeout=0.2,
+    ) as harness:
+        first = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "first-scoped-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        revoked = wait_until(
+            lambda: (
+                status if any(
+                    lease["state"] == "revoking" for lease in status["leases"]
+                ) else None
+            ) if (status := harness.status()) else None,
+            "first scoped lease to enter revoking",
+            timeout=10,  # The broker reaper ticks every five seconds.
+        )
+        assert revoked["draining"] is False
+
+        overlap = control_result(harness.socket_path, {
+            "action": "acquire",
+            "owner": "overlap-scoped-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        assert overlap["ok"] is False
+        assert "another lease" in overlap["error"]
+
+        unscoped = control_result(harness.socket_path, {
+            "action": "acquire",
+            "owner": "unscoped-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+        })
+        assert unscoped["ok"] is False
+        assert "another lease" in unscoped["error"]
+
+        second = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "second-scoped-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-1"],
+        })
+
+        pending = harness.status()
+        assert pending["draining"] is False
+        assert sorted(
+            lease["gpu_uuids"] for lease in pending["leases"]
+        ) == [["GPU-large-0"], ["GPU-large-1"]]
+        assert sorted(lease["state"] for lease in pending["leases"]) == [
+            "pending", "revoking",
+        ]
+
+        for token in (second["lease"]["token"], first["lease"]["token"]):
+            released = control(
+                harness.socket_path, {"action": "release", "token": token}
+            )
+            assert released["released"] == token
+        assert harness.status()["leases"] == []
+
+
+def test_scoped_prepare_preserves_disjoint_lane_and_revoking_lease(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=3, pending_timeout=3) as harness:
+        first = control(harness.socket_path, {
+            "action": "acquire", "owner": "revoking-resize-fixture",
+            "requested_mib": 1024, "ttl": 30, "gpu_uuids": ["GPU-large-0"],
+        })
+        wait_until(
+            lambda: any(x["state"] == "revoking" for x in harness.status()["leases"]),
+            "unrelated lease revocation",
+            timeout=10,
+        )
+        second = control(harness.socket_path, {
+            "action": "acquire", "owner": "resize-fixture",
+            "requested_mib": 1024, "ttl": 30, "gpu_uuids": ["GPU-large-1"],
+        })
+        token = second["lease"]["token"]
+        # While both scopes are blocked, the managed lane must use GPU 2.
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        lanes = managed_lanes(harness.status())
+        assert lanes and all(x["gpu_uuid"] == "GPU-large-2" for x in lanes)
+        control(harness.socket_path, {"action": "ready", "token": token})
+        prepared = control(harness.socket_path, {"action": "prepare", "token": token})
+        assert prepared["lease"]["state"] == "pending"
+        assert prepared["stopped_lanes"] == []
+        assert [x["id"] for x in managed_lanes(harness.status())] == [x["id"] for x in lanes]
+        assert any(x["state"] == "revoking" and x["gpu_uuids"] == ["GPU-large-0"]
+                   for x in harness.status()["leases"])
+        assert chat(harness.proxy_port, MODEL, "after-scoped-prepare", timeout=10)[0] == 200
+        for lease_token in (token, first["lease"]["token"]):
+            control(harness.socket_path, {"action": "release", "token": lease_token})
 
 
 def test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
@@ -1807,6 +1916,10 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
+    test_disjoint_scoped_acquire_bypasses_unrelated_revoking_lease(
+        helper, fixture_bin,
+    )
+    test_scoped_prepare_preserves_disjoint_lane_and_revoking_lease(helper, fixture_bin)
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         helper, fixture_bin,
     )
