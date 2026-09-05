@@ -667,6 +667,7 @@ def test_disjoint_scoped_acquire_bypasses_unrelated_revoking_lease(
                 ) else None
             ) if (status := harness.status()) else None,
             "first scoped lease to enter revoking",
+            timeout=10,  # The broker reaper ticks every five seconds.
         )
         assert revoked["draining"] is False
 
@@ -712,6 +713,39 @@ def test_disjoint_scoped_acquire_bypasses_unrelated_revoking_lease(
             )
             assert released["released"] == token
         assert harness.status()["leases"] == []
+
+
+def test_scoped_prepare_preserves_disjoint_lane_and_revoking_lease(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=3, pending_timeout=3) as harness:
+        first = control(harness.socket_path, {
+            "action": "acquire", "owner": "revoking-resize-fixture",
+            "requested_mib": 1024, "ttl": 30, "gpu_uuids": ["GPU-large-0"],
+        })
+        wait_until(
+            lambda: any(x["state"] == "revoking" for x in harness.status()["leases"]),
+            "unrelated lease revocation",
+            timeout=10,
+        )
+        second = control(harness.socket_path, {
+            "action": "acquire", "owner": "resize-fixture",
+            "requested_mib": 1024, "ttl": 30, "gpu_uuids": ["GPU-large-1"],
+        })
+        token = second["lease"]["token"]
+        # While both scopes are blocked, the managed lane must use GPU 2.
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        lanes = managed_lanes(harness.status())
+        assert lanes and all(x["gpu_uuid"] == "GPU-large-2" for x in lanes)
+        control(harness.socket_path, {"action": "ready", "token": token})
+        prepared = control(harness.socket_path, {"action": "prepare", "token": token})
+        assert prepared["lease"]["state"] == "pending"
+        assert prepared["stopped_lanes"] == []
+        assert [x["id"] for x in managed_lanes(harness.status())] == [x["id"] for x in lanes]
+        assert any(x["state"] == "revoking" and x["gpu_uuids"] == ["GPU-large-0"]
+                   for x in harness.status()["leases"])
+        assert chat(harness.proxy_port, MODEL, "after-scoped-prepare", timeout=10)[0] == 200
+        for lease_token in (token, first["lease"]["token"]):
+            control(harness.socket_path, {"action": "release", "token": lease_token})
 
 
 def test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
@@ -1885,6 +1919,7 @@ def main():
     test_disjoint_scoped_acquire_bypasses_unrelated_revoking_lease(
         helper, fixture_bin,
     )
+    test_scoped_prepare_preserves_disjoint_lane_and_revoking_lease(helper, fixture_bin)
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         helper, fixture_bin,
     )

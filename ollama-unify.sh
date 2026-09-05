@@ -3593,13 +3593,16 @@ class Broker:
                 lease = self.leases.get(token)
                 if lease is None:
                     raise KeyError("unknown lease")
-                if self.pending_lease():
-                    raise RuntimeError("a lease transition is already pending")
                 if lease.state != "active":
                     raise RuntimeError("only an active lease can prepare a resize")
+                if self.blocking_transition_lease(lease.gpu_uuids):
+                    raise RuntimeError("a lease transition is already pending")
             self.begin_drain(f"lease resize by {lease.owner}")
             try:
-                stopped = self.stop_pool_lanes("lease prepare")
+                stopped = self.stop_pool_lanes(
+                    "lease prepare",
+                    set(lease.gpu_uuids) if lease.gpu_uuids else None,
+                )
                 unloaded = unload_all_models()
                 with self.cv:
                     now = time.time()
