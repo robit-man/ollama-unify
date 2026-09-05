@@ -3329,6 +3329,29 @@ class Broker:
             for lease in self.leases.values()
         )
 
+    def blocking_transition_lease(
+        self, requested_gpu_uuids: list[str],
+    ) -> Lease | None:
+        """Return a pending/revoking lease that conflicts with a new scope.
+
+        An unscoped transition remains host-wide. Scoped transitions only
+        serialize owners that request an overlapping GPU; disjoint external
+        workloads can proceed independently.
+        """
+        requested = set(requested_gpu_uuids)
+        return next(
+            (
+                lease for lease in self.leases.values()
+                if lease.state in ("pending", "revoking")
+                and (
+                    not requested
+                    or not lease.gpu_uuids
+                    or bool(requested.intersection(lease.gpu_uuids))
+                )
+            ),
+            None,
+        )
+
     def revoking_lease(self) -> Lease | None:
         return next(
             (lease for lease in self.leases.values()
@@ -3391,14 +3414,14 @@ class Broker:
         requested_gpu_uuids: list[str] | None = None,
     ) -> dict[str, Any]:
         with self.transition:
+            requested_scope = (
+                requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
+            )
             with self.cv:
-                if self.pending_lease():
+                if self.blocking_transition_lease(requested_scope):
                     raise RuntimeError("another lease is waiting for its external workload to become ready")
             self.begin_drain(f"lease acquire by {owner}")
             try:
-                requested_scope = (
-                    requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
-                )
                 stopped: list[str] = []
                 # The system lane is not GPU-scoped, so unload any model it
                 # holds before measuring a scoped reservation. Managed lanes
