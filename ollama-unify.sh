@@ -5349,16 +5349,21 @@ install_global_codex_gpu_instructions() {
   [ "$enabled" = 1 ] || { [ "$enabled" = 0 ] && return; err "OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY must be 0 or 1"; exit 2; }
 
   local agent_user agent_group agent_home agent_dir agent_file temp_file
+  # These are "nothing to do" exits, not failures. A bare `return` propagates the
+  # status of the preceding test, so under `set -e` a host without ~/.codex would
+  # abort install_systemd_safety_policy here — after the negotiator is installed
+  # but before daemon-reload, unit enable, and the service restart, leaving Ollama
+  # stopped.
   agent_user="${SUDO_USER:-${USER:-}}"
-  [ -n "$agent_user" ] || return
+  [ -n "$agent_user" ] || return 0
   agent_home=$(getent passwd "$agent_user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
-  [ -n "$agent_home" ] || return
+  [ -n "$agent_home" ] || return 0
   agent_dir="$agent_home/.codex"
-  [ -d "$agent_dir" ] || return
+  [ -d "$agent_dir" ] || return 0
   agent_file="$agent_dir/AGENTS.md"
   if [ -L "$agent_file" ]; then
     warn "skipping global Codex discovery because $agent_file is a symlink"
-    return
+    return 0
   fi
   agent_group=$(id -gn "$agent_user" 2>/dev/null || printf '%s' "$agent_user")
   temp_file=$(mktemp)
