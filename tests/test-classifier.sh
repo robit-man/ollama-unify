@@ -73,6 +73,53 @@ assert_contains "$display_output" 'CUDA_VISIBLE_DEVICES=GPU-display'
 assert_contains "$display_output" 'Device memory: live free-VRAM telemetry; no guessed fixed carve-out'
 assert_not_contains "$display_output" 'LLAMA_ARG_N_GPU_LAYERS=auto'
 
+# --- Tegra / unified memory -------------------------------------------------
+# A Tegra GPU reports no private VRAM. It must still classify as a usable CUDA
+# device backed by the unified pool, and the cgroup boundary must leave room for
+# the payload because on this shape the payload is host memory.
+tegra_output=$(PATH="$test_path" MOCK_PROFILE=cuda_tegra \
+  OLLAMA_SAFE_UNIFIED_MEMORY=1 OLLAMA_SAFE_UNIFIED_MEMORY_MODEL='Mock Jetson AGX Thor' \
+  OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=125772 OLLAMA_SAFE_LARGEST_MODEL_MIB=64313 \
+  "$script" --safety-preview)
+assert_contains "$tegra_output" 'Tegra: Mock Jetson AGX Thor (unified CPU/GPU memory)'
+assert_contains "$tegra_output" '[cuda/unified] GPU 0: Mock Tegra Thor, 125772 MiB unified memory, compute 11.0'
+assert_contains "$tegra_output" 'Backend: cuda (unified-memory)'
+assert_contains "$tegra_output" 'Device memory: unified with host memory'
+assert_contains "$tegra_output" 'Unified memory pool: 125772 MiB shared by CPU and GPU across 1 accelerator(s)'
+assert_contains "$tegra_output" 'Device scoping: nvidia-smi selects this device by UUID'
+assert_contains "$tegra_output" 'Host limit basis: unified pool: installed manifest payload plus Ollama working set'
+# payload (64313) + observed working set (2048) — additive, not the larger of.
+assert_contains "$tegra_output" 'MemoryMax=66361M'
+assert_contains "$tegra_output" 'MemoryHigh=64313M'
+assert_contains "$tegra_output" 'CUDA_VISIBLE_DEVICES=GPU-tegra-thor-0000'
+assert_contains "$tegra_output" 'GPU negotiator: cooperative leases plus anonymous-process rebalance'
+assert_contains "$tegra_output" 'GPU-resident weights are allocated through the driver and are not charged'
+# A unified pool has no separate dedicated-VRAM budget to report.
+assert_not_contains "$tegra_output" 'Aggregate dedicated device memory'
+# The device must not be discarded as unusable, nor demoted to Vulkan.
+assert_not_contains "$tegra_output" '[cuda/unusable]'
+assert_not_contains "$tegra_output" 'Backend: vulkan'
+
+# An older Tegra release cannot select by UUID and reports no compute-app PID.
+# It stays usable as a CUDA device but must not claim broker guarantees.
+tegra_legacy_output=$(PATH="$test_path" MOCK_PROFILE=cuda_tegra_legacy \
+  OLLAMA_SAFE_UNIFIED_MEMORY=1 \
+  OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=62827 OLLAMA_SAFE_LARGEST_MODEL_MIB=6384 \
+  "$script" --safety-preview)
+assert_contains "$tegra_legacy_output" '[cuda/unified] GPU 0: Mock Tegra Orin (nvgpu), 62827 MiB unified memory, compute 8.7'
+assert_contains "$tegra_legacy_output" 'Backend: cuda (unified-memory)'
+assert_contains "$tegra_legacy_output" 'Device scoping: unavailable (bare UUID); device isolation variables are omitted'
+assert_contains "$tegra_legacy_output" 'GPU negotiator: unavailable — nvidia-smi cannot select this device by UUID'
+assert_contains "$tegra_legacy_output" 'MemoryMax=8432M'
+# Pinning an unrecognised UUID would hide the only accelerator.
+assert_not_contains "$tegra_legacy_output" 'CUDA_VISIBLE_DEVICES'
+
+# The override must also be able to force unified handling off.
+tegra_off_output=$(PATH="$test_path" MOCK_PROFILE=cuda_tegra OLLAMA_SAFE_UNIFIED_MEMORY=0 \
+  OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=125772 "$script" --safety-preview 2>&1 || true)
+assert_contains "$tegra_off_output" '[cuda/unusable]'
+
+
 rocm_output=$(PATH="$test_path" MOCK_PROFILE=rocm OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB=131072 "$script" --safety-preview)
 assert_contains "$rocm_output" '[rocm/discrete] GPU 0: Mock AMD 48GB'
 assert_contains "$rocm_output" 'Backend: rocm (discrete)'
@@ -191,4 +238,4 @@ if ! "$preflight_script" 1 100 >/dev/null 2>&1; then
   exit 1
 fi
 
-printf 'classifier fixtures: PASS (CUDA dedicated/display, ROCm, Vulkan, Metal, CPU)\n'
+printf 'classifier fixtures: PASS (CUDA dedicated/display/unified, Tegra legacy, ROCm, Vulkan, Metal, CPU)\n'

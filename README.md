@@ -99,6 +99,7 @@ Proceed? [N]: y
 - **Content-addressed dedup** — blobs are SHA-256-named, so `rsync --ignore-existing` collapses duplicates across stores for free
 - **Systemd integration** — installs a drop-in to set `OLLAMA_MODELS` and (optionally) change the service `User/Group` to your user for cleaner single-user setups
 - **Role-aware accelerator selection** — prefers dedicated devices; display/shared GPUs remain usable when they are the only eligible accelerator
+- **Unified-memory (NVIDIA Tegra/Jetson) support** — `nvidia-smi` reports `memory.total/used/free` as `[N/A]` on Tegra because the GPU has no private VRAM. Rather than discarding an otherwise healthy CUDA device, the classifier measures the shared pool from effective host memory, which the CUDA runtime agrees with, and sizes the cgroup boundary to hold the payload because on this shape the payload *is* host memory
 - **Generic capability floors** — classifies constrained or legacy devices from memory and compute telemetry rather than special-casing product names
 - **Backend isolation and preflight** — emits the correct visibility variables for the selected backend and validates CUDA, ROCm, or Vulkan telemetry before systemd starts Ollama
 - **GPU-first bounded-overflow mode** — delegates placement to Ollama's live-VRAM scheduler and fits the maximum safe number of layers into available VRAM without forcing every selected device into every load; overflow uses ordinary pageable memory inside the service cgroup, never CUDA unified-memory spill, registered host mappings, pinned-host buffers, or swap
@@ -302,7 +303,7 @@ Heavy inference can exhaust discrete VRAM, shared/unified memory, pinned host pa
 
 | Candidate | Detection and classification | Selection policy |
 | --- | --- |
-| CUDA | `nvidia-smi`: UUID, VRAM, display role, compute capability | Dedicated devices first; display devices only when no dedicated CUDA device qualifies; default floor 4 GiB and compute 5.x |
+| CUDA | `nvidia-smi`: UUID, VRAM, display role, compute capability | Dedicated devices first; unified-memory (Tegra) devices are preferred over a discrete bucket that cannot coexist with them; display devices only when no dedicated CUDA device qualifies; default floor 4 GiB and compute 5.x |
 | ROCm | `amd-smi --json` or `rocminfo`: UUID/ordinal, product, VRAM when available | Native AMD candidate; distinguishes discrete, shared/constrained, and unknown-memory devices |
 | Vulkan | `vulkaninfo --summary`: device index, name, discrete/integrated/virtual type | Discrete first, then shared/integrated; uses conservative memory estimates because standard summary telemetry lacks free VRAM |
 | Metal | macOS `system_profiler` and Apple Silicon architecture | Preferred automatically on macOS; GPU and CPU share unified memory |
@@ -323,6 +324,7 @@ On macOS, `auto` prefers Metal. Elsewhere it chooses CUDA, then ROCm, then Vulka
 | Device capacity | Current free VRAM as measured by Ollama at load time; no automatic fixed carve-out is subtracted a second time |
 | Dedicated multi-GPU | Forced spreading is disabled so Ollama can choose devices from live free-VRAM state and split only when needed; aggregate capacity is reported directly from the hardware scan |
 | Physical GPU count | Every selected dedicated accelerator remains in the visibility list. API `num_gpu=-1` selects the number of offloaded layers automatically; it does not reduce the host to one physical GPU |
+| Unified memory | Device capacity is effective host memory; the host hard cap becomes the installed payload **plus** the observed working set instead of the larger of the two, because a unified payload is charged against the same pool |
 | External lease | Ollama drains and unloads, the external workload allocates first, then Ollama reloads against remaining VRAM; release repeats the cycle so Ollama can expand |
 | Dedicated GPU load | Automatic maximum GPU layers, layer splitting and runner fitting enabled, unified-memory spill absent, pinned-host allocation disabled, cgroup-bounded pageable CPU overflow allowed, and cgroup swap disabled |
 | Loaded models | 1 on every hardware shape by default; an override is required to allow simultaneous resident models |
@@ -350,7 +352,7 @@ OLLAMA_SAFE_BACKEND=cuda \
 ./ollama-unify.sh
 ```
 
-Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_STARTUP_HEADROOM_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no`, `on-success`, or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`, `OLLAMA_SAFE_POOL_ENABLED`, `OLLAMA_SAFE_POOL_MAX_SERVERS`, `OLLAMA_SAFE_POOL_PORT_START`, `OLLAMA_SAFE_POOL_INSTANCE_PARALLEL`, `OLLAMA_SAFE_POOL_RESUME_TTL`, `OLLAMA_SAFE_POOL_IDLE_TIMEOUT`, `OLLAMA_SAFE_POOL_READY_TIMEOUT`, `OLLAMA_SAFE_POOL_LOAD_TIMEOUT`, `OLLAMA_SAFE_POOL_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_POOL_HOST_RESERVE_MIB`, `OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT`, `OLLAMA_SAFE_POOL_OLLAMA_BINARY`, and `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY` (`0` or `1`).
+Supported overrides are `OLLAMA_SAFE_BACKEND`, `OLLAMA_SAFE_EFFECTIVE_MEMORY_MIB`, `OLLAMA_SAFE_MIN_GPU_MEMORY_MIB`, `OLLAMA_SAFE_MIN_COMPUTE_MAJOR`, `OLLAMA_SAFE_MODEL_STORE`, `OLLAMA_SAFE_LARGEST_MODEL_MIB`, `OLLAMA_SAFE_OBSERVED_HOST_MIB`, `OLLAMA_SAFE_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_HOST_RESERVE_MIB`, `OLLAMA_SAFE_HOST_MEMORY_HIGH_MIB`, `OLLAMA_SAFE_HOST_MEMORY_MAX_MIB`, `OLLAMA_SAFE_STARTUP_HEADROOM_MIB`, `OLLAMA_SAFE_CONTEXT_LENGTH`, `OLLAMA_SAFE_NUM_PARALLEL`, `OLLAMA_SAFE_MAX_LOADED_MODELS`, `OLLAMA_SAFE_MAX_QUEUE`, `OLLAMA_SAFE_KEEP_ALIVE`, `OLLAMA_SAFE_SWAP_MAX`, `OLLAMA_SAFE_MEMORY_PRESSURE_LIMIT_PERCENT`, `OLLAMA_SAFE_CPU_QUOTA_PERCENT`, `OLLAMA_SAFE_CPU_WEIGHT`, `OLLAMA_SAFE_IO_WEIGHT`, `OLLAMA_SAFE_RESTART_POLICY` (`no`, `on-success`, or `on-failure`), `OLLAMA_SAFE_NEGOTIATOR_LISTEN`, `OLLAMA_SAFE_NEGOTIATOR_GROUP`, `OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT`, `OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_POLL`, `OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE`, `OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN`, `OLLAMA_SAFE_POOL_ENABLED`, `OLLAMA_SAFE_POOL_MAX_SERVERS`, `OLLAMA_SAFE_POOL_PORT_START`, `OLLAMA_SAFE_POOL_INSTANCE_PARALLEL`, `OLLAMA_SAFE_POOL_RESUME_TTL`, `OLLAMA_SAFE_POOL_IDLE_TIMEOUT`, `OLLAMA_SAFE_POOL_READY_TIMEOUT`, `OLLAMA_SAFE_POOL_LOAD_TIMEOUT`, `OLLAMA_SAFE_POOL_VRAM_RESERVE_MIB`, `OLLAMA_SAFE_POOL_HOST_RESERVE_MIB`, `OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT`, `OLLAMA_SAFE_POOL_OLLAMA_BINARY`, and `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY` (`0` or `1`), `OLLAMA_SAFE_UNIFIED_MEMORY` (`0` or `1`), `OLLAMA_SAFE_UNIFIED_MEMORY_MODEL`, and `OLLAMA_SAFE_UNIFIED_WORKING_SET_MIB`.
 
 `OLLAMA_CONTEXT_LENGTH` is normally only a server default. When the negotiator proxy is installed, native Ollama API requests are clamped to the context ceiling derived by the hardware scan, and positive `num_gpu`/`main_gpu` overrides are replaced with automatic live fitting. Clients that bypass the proxy and contact the loopback backend directly can bypass those request-level checks; the one-model scheduler, PSI kill, hard cgroup boundary, and failure-only stop policy remain the final containment layer. Under launchd, rc.d, WSL without systemd, or a manually launched server, classification and policy generation still work, but the generated environment must be integrated manually and native cgroup containment is unavailable.
 
@@ -393,12 +395,64 @@ volumes:
   - /srv/ollama/models:/root/.ollama/models
 ```
 
+### Unified memory (NVIDIA Tegra / Jetson)
+
+Tegra integrates the GPU and CPU on one physical memory pool. `nvidia-smi` reports
+no memory figures there:
+
+```console
+$ nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader
+NVIDIA Thor, [N/A], [N/A], 11.0
+```
+
+The CUDA runtime itself has no such problem — Ollama logs the pool correctly from
+`cudaMemGetInfo`, and those figures track `/proc/meminfo`:
+
+```
+inference compute ... library=CUDA compute=11.0 ... type=iGPU total="122.8 GiB" available="66.1 GiB"
+MemTotal: 125772 MiB (= 122.8 GiB)   MemAvailable: 67906 MiB (~= 66.2 GiB)
+```
+
+So the classifier measures the pool from effective host memory instead of
+discarding the device, and reports it as its own role:
+
+```
+Accelerator classification
+  [cuda/unified] GPU 0: NVIDIA Thor, 125772 MiB unified memory, compute 11.0, GPU-… (unified)
+
+Selected Ollama safety policy
+  Backend: cuda (unified-memory) — native NVIDIA backend on a unified-memory accelerator
+  Device memory: unified with host memory; live /proc/meminfo availability drives placement
+  Unified memory pool: 125772 MiB shared by CPU and GPU across 1 accelerator(s)
+  Device scoping: nvidia-smi selects this device by UUID
+```
+
+Three behaviours change on this shape:
+
+- **The host cap becomes additive.** A discrete host takes the larger of the
+  installed payload and the observed host projection, because the payload lives in
+  VRAM outside the cgroup. On a unified pool the payload is host memory and is
+  charged to the same cgroup, so the two terms add. Taking the larger would cap the
+  service at exactly the weight of its own largest model and OOM-kill it on load.
+- **Device isolation variables are conditional.** `CUDA_VISIBLE_DEVICES` is emitted
+  only when `nvidia-smi` can actually select the device by UUID. Pinning an
+  unrecognised UUID would hide the only accelerator on the host.
+- **Foreign-process detection keys on identity, not magnitude.** Tegra reports
+  `used_gpu_memory` as `0` or `[N/A]` per process, so a growth comparison can never
+  fire. The broker treats a newly observed non-Ollama CUDA process as the signal,
+  which is the reactive contract it already documents.
+
+Force the unified path on an unrecognised board — a newer Jetson, or another
+unified-memory part — with `OLLAMA_SAFE_UNIFIED_MEMORY=1`; `=0` forces it off.
+
 ## Limitations
 
 - **Classification is broader than service integration.** CUDA, ROCm, Vulkan, Metal, CPU, containers, WSL, macOS, and FreeBSD are classified best-effort; automatic cgroup installation currently targets `ollama.service` on systemd.
 - **Native Windows needs WSL.** The project is Bash-based and does not install a Windows service policy.
 - **ROCm and Vulkan telemetry varies by driver generation.** Missing memory telemetry is reported explicitly instead of being presented as an exact capacity.
 - **Single host only.** No remote/multi-host orchestration. For distributed Ollama deployments, run the script per host.
+- **Cgroup containment does not bound GPU-resident memory on a unified pool.** On Tegra the driver allocates model weights outside the memory cgroup: a 5.6 GiB GPU-resident model measured 1381 MiB of `memory.peak`. `MemoryMax` therefore bounds the CPU-fallback path, and live-availability admission — not the cgroup — is the operative guard against accelerator exhaustion. The generated policy states this explicitly rather than implying a boundary it does not have.
+- **Older Tegra releases cannot support the negotiator.** The broker needs to select a device by UUID and to tell foreign CUDA processes apart from Ollama's own. Releases that report a bare (non `GPU-` prefixed) UUID, reject `--id=`, or emit `[N/A]` instead of a compute-app PID get the unified CUDA backend and cgroup policy, and an explicit refusal reason for the negotiator, instead of a guarantee that cannot be kept.
 - **Doesn't handle in-flight model pulls.** If `ollama pull` is mid-download when daemons stop, restart it after migration.
 - **Systemd containment only covers `ollama.service`.** Manually launched `ollama serve` processes do not inherit the cgroup limits or generated environment.
 - **Anonymous CUDA allocation is reactive, not atomic.** The negotiator can detect a new non-Ollama CUDA process and refit after its first successful allocation, but it cannot know an undeclared future `cudaMalloc`. Workloads requiring an OOM guarantee must acquire/resize a lease or run in a fixed hardware partition such as MIG.

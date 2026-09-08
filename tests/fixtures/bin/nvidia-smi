@@ -5,6 +5,54 @@ if [[ "${MOCK_PROFILE:-}" != cuda* ]]; then
   exit 1
 fi
 
+# NVIDIA Tegra (Jetson) parts report memory.* as [N/A]: the GPU has no private
+# VRAM and allocates from the same pool as the CPU. cuda_tegra models a current
+# release (GPU- prefixed UUID, --id= selection, numeric compute-app PIDs);
+# cuda_tegra_legacy models an older one that supports none of those.
+if [[ "$MOCK_PROFILE" == cuda_tegra* ]]; then
+  if [ "$MOCK_PROFILE" = "cuda_tegra_legacy" ]; then
+    tegra_uuid='cd71ddd4-7e01-5949-a9ea-47e27adf0e3c'
+    tegra_name='Mock Tegra Orin (nvgpu)'
+    tegra_cc='8.7'
+  else
+    tegra_uuid='GPU-tegra-thor-0000'
+    tegra_name='Mock Tegra Thor'
+    tegra_cc='11.0'
+  fi
+  case "$*" in
+    *--query-compute-apps=*)
+      if [ "$MOCK_PROFILE" = "cuda_tegra_legacy" ]; then
+        printf '%s\n' "[N/A], $tegra_uuid, [N/A]"
+      elif [ -n "${MOCK_NVIDIA_COMPUTE_APPS_FILE:-}" ] \
+        && [ -r "${MOCK_NVIDIA_COMPUTE_APPS_FILE}" ]; then
+        sed -n '/[^[:space:]]/p' "$MOCK_NVIDIA_COMPUTE_APPS_FILE"
+      else
+        printf '%s\n' "4242, $tegra_uuid, 0"
+      fi
+      ;;
+    *--id=*)
+      if [ "$MOCK_PROFILE" = "cuda_tegra_legacy" ]; then
+        printf 'No devices were found\n'
+      else
+        case "$*" in
+          *compute_cap*) printf '%s, %s\n' "$tegra_uuid" "$tegra_cc" ;;
+          *) printf '%s\n' "$tegra_uuid" ;;
+        esac
+      fi
+      ;;
+    *--query-gpu=index,uuid,name,display_active,memory.total,compute_cap*)
+      printf '%s\n' "0, $tegra_uuid, $tegra_name, Disabled, [N/A], $tegra_cc" ;;
+    *--query-gpu=uuid,memory.total,memory.used,memory.free*)
+      printf '%s\n' "$tegra_uuid, [N/A], [N/A], [N/A]" ;;
+    *--query-gpu=uuid,compute_cap*)
+      printf '%s, %s\n' "$tegra_uuid" "$tegra_cc" ;;
+    *--query-gpu=uuid*)
+      printf '%s\n' "$tegra_uuid" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
+
 case "$*" in
   *--query-gpu=uuid,memory.total,memory.used,memory.free*)
     if [ "$MOCK_PROFILE" = "cuda_triple" ]; then

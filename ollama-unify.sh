@@ -78,6 +78,8 @@ HOST_CPU=""
 HOST_CPU_CORES=0
 HOST_VIRTUALIZATION="none"
 HOST_SERVICE_MANAGER="none"
+HOST_TEGRA=0
+HOST_TEGRA_MODEL=""
 HOST_MEMORY_SOURCE=""
 SAFETY_PHYSICAL_MEMORY_MIB=0
 SAFETY_HOST_TOTAL_MIB=0
@@ -87,6 +89,7 @@ SAFETY_BACKEND_CLASS="fallback"
 SAFETY_BACKEND_REASON=""
 SAFETY_DEVICE_COUNT=0
 SAFETY_SHARED_ACCELERATOR=0
+SAFETY_UNIFIED_MEMORY=0
 SAFETY_MIN_DEVICE_MEMORY_MIB=0
 SAFETY_AGGREGATE_DEVICE_MEMORY_MIB=0
 SAFETY_DEVICE_MEMORY_KNOWN=0
@@ -109,6 +112,9 @@ SAFETY_MAX_LOADED_MODELS=0
 SAFETY_MAX_QUEUE=0
 SAFETY_KEEP_ALIVE=""
 SAFETY_SWAP_MAX=""
+# Floor for Ollama's non-payload working set on unified-memory hosts, used only
+# when the journal carries no observed host projection to measure instead.
+UNIFIED_WORKING_SET_FLOOR_MIB="${OLLAMA_SAFE_UNIFIED_WORKING_SET_MIB:-2048}"
 SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT=20
 SAFETY_CPU_QUOTA_PERCENT=400
 SAFETY_CPU_WEIGHT=10
@@ -116,6 +122,7 @@ SAFETY_IO_WEIGHT=10
 SAFETY_RESTART_POLICY="on-success"
 SAFETY_PREFLIGHT_PATH="/usr/local/libexec/ollama-unify-memory-preflight"
 SAFETY_NEGOTIATOR_ENABLED=0
+SAFETY_NEGOTIATOR_BLOCKED_REASON=""
 SAFETY_NEGOTIATOR_PATH="/usr/local/libexec/ollama-unify-gpu-negotiator"
 SAFETY_NEGOTIATOR_CLI_PATH="/usr/local/bin/ollama-unify-gpu-lease"
 SAFETY_NEGOTIATOR_CONFIG_PATH="/etc/default/ollama-unify-negotiator"
@@ -135,6 +142,7 @@ SAFETY_OLLAMA_RELEASE_API="https://api.github.com/repos/ollama/ollama/releases/l
 SAFETY_OLLAMA_INSTALL_URL="https://ollama.com/install.sh"
 
 CUDA_TOOL=""; CUDA_COUNT=0; CUDA_MIN_VRAM_MIB=0; CUDA_TOTAL_VRAM_MIB=0; CUDA_SHARED=0
+CUDA_UNIFIED=0; CUDA_DEVICE_SCOPING=0
 ROCM_TOOL=""; ROCM_COUNT=0; ROCM_MIN_VRAM_MIB=0; ROCM_TOTAL_VRAM_MIB=0; ROCM_KNOWN_VRAM_COUNT=0; ROCM_SHARED=0
 VULKAN_TOOL=""; VULKAN_COUNT=0; VULKAN_SHARED=0
 METAL_COUNT=0
@@ -251,6 +259,69 @@ detect_host_profile() {
   esac
 }
 
+# NVIDIA Tegra (Jetson) integrates the GPU and CPU on one physical memory pool.
+# nvidia-smi reports memory.total/used/free as [N/A] on these parts, but the CUDA
+# runtime resolves the pool correctly: Ollama logs `type=iGPU total=... available=...`
+# from cudaMemGetInfo, and those values track /proc/meminfo MemTotal/MemAvailable.
+# Unified memory is therefore measured, not guessed.
+detect_tegra_platform() {
+  HOST_TEGRA=0; HOST_TEGRA_MODEL=""
+  # An operator override keeps newer or unrecognised unified-memory parts usable
+  # without waiting for a detector update.
+  if [ -n "${OLLAMA_SAFE_UNIFIED_MEMORY:-}" ]; then
+    case "$OLLAMA_SAFE_UNIFIED_MEMORY" in
+      1) HOST_TEGRA=1; HOST_TEGRA_MODEL="${OLLAMA_SAFE_UNIFIED_MEMORY_MODEL:-NVIDIA unified-memory accelerator}"; return 0 ;;
+      0) return 0 ;;
+      *) err "OLLAMA_SAFE_UNIFIED_MEMORY must be 0 or 1"; exit 2 ;;
+    esac
+  fi
+  [ "$HOST_OS" = "Linux" ] || return 0
+  if [ -r /etc/nv_tegra_release ]; then
+    HOST_TEGRA=1
+  elif [ -r /proc/device-tree/model ] \
+    && tr -d '\0' < /proc/device-tree/model 2>/dev/null | grep -qiE 'jetson|tegra'; then
+    HOST_TEGRA=1
+  fi
+  [ "$HOST_TEGRA" = 1 ] || return 0
+  if [ -r /proc/device-tree/model ]; then
+    HOST_TEGRA_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
+  fi
+  [ -n "$HOST_TEGRA_MODEL" ] || HOST_TEGRA_MODEL="NVIDIA Tegra"
+}
+
+# The GPU allocates from system memory, so effective host memory is the honest
+# device capacity. Using the effective figure rather than raw MemTotal keeps the
+# device bounded by a cgroup limit when Ollama runs inside one.
+tegra_unified_memory_mib() {
+  if [ "${SAFETY_HOST_TOTAL_MIB:-0}" -gt 0 ]; then
+    printf '%d' "$SAFETY_HOST_TOTAL_MIB"; return 0
+  fi
+  awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' /proc/meminfo 2>/dev/null || printf '0'
+}
+
+# Per-GPU scoping requires that nvidia-smi can actually select the device by UUID.
+# Older Tegra releases report a bare UUID and reject --id=, which makes scoped
+# leases and per-device placement unprovable.
+tegra_device_scoping_supported() {
+  local uuid="$1" probe=""
+  [[ "$uuid" == GPU-* ]] || return 1
+  probe=$("$CUDA_TOOL" --id="$uuid" --query-gpu=uuid --format=csv,noheader 2>/dev/null) || return 1
+  [ "$(trim_ws "$probe")" = "$uuid" ]
+}
+
+# Foreign CUDA processes can only be told apart from Ollama's own when nvidia-smi
+# reports a numeric PID. Tegra releases that emit [N/A] cannot support the
+# reactive drain, so the negotiator must not claim that guarantee there.
+tegra_compute_apps_supported() {
+  local line pid
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    pid=$(trim_ws "${line%%,*}")
+    [[ "$pid" =~ ^[0-9]+$ ]] && return 0
+  done < <("$CUDA_TOOL" --query-compute-apps=pid,gpu_uuid --format=csv,noheader 2>/dev/null)
+  return 1
+}
+
 detect_cuda_devices() {
   command -v nvidia-smi >/dev/null 2>&1 || return 0
   CUDA_TOOL=$(command -v nvidia-smi)
@@ -264,24 +335,44 @@ detect_cuda_devices() {
   require_uint_value OLLAMA_SAFE_MIN_GPU_MEMORY_MIB "$min_vram"
   require_uint_value OLLAMA_SAFE_MIN_COMPUTE_MAJOR "$min_compute"
   local -a dedicated_ids=() dedicated_summaries=() shared_ids=() shared_summaries=()
+  local -a unified_ids=() unified_summaries=()
   local dedicated_min=0 dedicated_total=0 shared_min=0 shared_total=0
+  local unified_min=0 unified_total=0
 
   while IFS=',' read -r raw_index raw_uuid raw_name raw_display raw_vram raw_compute; do
-    local index uuid name display vram compute major role summary
+    local index uuid name display vram compute major role summary unified=0
     index=$(trim_ws "$raw_index"); uuid=$(trim_ws "$raw_uuid"); name=$(trim_ws "$raw_name")
     display=$(trim_ws "$raw_display"); vram=$(trim_ws "$raw_vram"); compute=$(trim_ws "$raw_compute")
     major="${compute%%.*}"
-    if ! [[ "$vram" =~ ^[0-9]+$ && "$major" =~ ^[0-9]+$ && "$uuid" == GPU-* ]]; then
+    # Tegra has no private VRAM to report. Substitute the measured unified pool
+    # rather than discarding an otherwise healthy CUDA device.
+    if [ "$HOST_TEGRA" = 1 ] && ! [[ "$vram" =~ ^[0-9]+$ ]]; then
+      vram=$(tegra_unified_memory_mib); unified=1
+    fi
+    # A bare (non GPU- prefixed) UUID is only tolerated on unified devices, where
+    # it costs device scoping but not usability.
+    if ! [[ "$vram" =~ ^[0-9]+$ && "$major" =~ ^[0-9]+$ ]] \
+      || { [ "$unified" = 0 ] && [[ "$uuid" != GPU-* ]]; }; then
       ACCELERATOR_SUMMARIES+=("[cuda/unusable] GPU $index: $name — incomplete CUDA telemetry")
     elif [ "$major" -lt "$min_compute" ]; then
       ACCELERATOR_SUMMARIES+=("[cuda/legacy] GPU $index: $name, ${vram} MiB, compute $compute — below compute ${min_compute}.x")
     elif [ "$vram" -lt "$min_vram" ]; then
       ACCELERATOR_SUMMARIES+=("[cuda/constrained] GPU $index: $name, ${vram} MiB, compute $compute — below ${min_vram} MiB safety floor")
     else
-      if [ "$display" = "Enabled" ]; then role="shared-display"; else role="dedicated"; fi
-      summary="GPU $index: $name, ${vram} MiB, compute $compute, $uuid ($role)"
+      if [ "$unified" = 1 ]; then role="unified"
+      elif [ "$display" = "Enabled" ]; then role="shared-display"
+      else role="dedicated"; fi
+      if [ "$unified" = 1 ]; then
+        summary="GPU $index: $name, ${vram} MiB unified memory, compute $compute, $uuid ($role)"
+      else
+        summary="GPU $index: $name, ${vram} MiB, compute $compute, $uuid ($role)"
+      fi
       ACCELERATOR_SUMMARIES+=("[cuda/$role] $summary")
-      if [ "$role" = "dedicated" ]; then
+      if [ "$role" = "unified" ]; then
+        unified_ids+=("$uuid"); unified_summaries+=("$summary")
+        unified_total=$((unified_total + vram))
+        if [ "$unified_min" -eq 0 ] || [ "$vram" -lt "$unified_min" ]; then unified_min="$vram"; fi
+      elif [ "$role" = "dedicated" ]; then
         dedicated_ids+=("$uuid"); dedicated_summaries+=("$summary")
         dedicated_total=$((dedicated_total + vram))
         if [ "$dedicated_min" -eq 0 ] || [ "$vram" -lt "$dedicated_min" ]; then dedicated_min="$vram"; fi
@@ -293,7 +384,13 @@ detect_cuda_devices() {
     fi
   done <<< "$inventory"
 
-  if [ ${#dedicated_ids[@]} -gt 0 ]; then
+  # A unified accelerator is the host's primary compute device, not a fallback:
+  # prefer it over a discrete-looking bucket that cannot exist on the same part.
+  if [ ${#unified_ids[@]} -gt 0 ]; then
+    CUDA_IDS=("${unified_ids[@]}"); CUDA_SUMMARIES=("${unified_summaries[@]}")
+    CUDA_MIN_VRAM_MIB="$unified_min"; CUDA_TOTAL_VRAM_MIB="$unified_total"
+    CUDA_SHARED=0; CUDA_UNIFIED=1
+  elif [ ${#dedicated_ids[@]} -gt 0 ]; then
     CUDA_IDS=("${dedicated_ids[@]}"); CUDA_SUMMARIES=("${dedicated_summaries[@]}")
     CUDA_MIN_VRAM_MIB="$dedicated_min"; CUDA_TOTAL_VRAM_MIB="$dedicated_total"; CUDA_SHARED=0
   elif [ ${#shared_ids[@]} -gt 0 ]; then
@@ -302,9 +399,27 @@ detect_cuda_devices() {
   fi
   CUDA_COUNT=${#CUDA_IDS[@]}
   local uuid
-  for uuid in "${CUDA_IDS[@]}"; do
-    CUDA_PREFLIGHT+=("ExecStartPre=$CUDA_TOOL --id=$uuid --query-gpu=uuid,memory.total,compute_cap --format=csv,noheader,nounits")
-  done
+  if [ "$CUDA_UNIFIED" = 1 ]; then
+    # memory.total is [N/A] on Tegra, so a preflight that queries it proves
+    # nothing. Verify the device answers for compute capability instead, and
+    # only claim UUID scoping when nvidia-smi can actually select by UUID.
+    CUDA_DEVICE_SCOPING=1
+    for uuid in "${CUDA_IDS[@]}"; do
+      tegra_device_scoping_supported "$uuid" || { CUDA_DEVICE_SCOPING=0; break; }
+    done
+    if [ "$CUDA_DEVICE_SCOPING" = 1 ]; then
+      for uuid in "${CUDA_IDS[@]}"; do
+        CUDA_PREFLIGHT+=("ExecStartPre=$CUDA_TOOL --id=$uuid --query-gpu=uuid,compute_cap --format=csv,noheader,nounits")
+      done
+    else
+      CUDA_PREFLIGHT+=("ExecStartPre=$CUDA_TOOL --query-gpu=uuid,compute_cap --format=csv,noheader,nounits")
+    fi
+  else
+    CUDA_DEVICE_SCOPING=1
+    for uuid in "${CUDA_IDS[@]}"; do
+      CUDA_PREFLIGHT+=("ExecStartPre=$CUDA_TOOL --id=$uuid --query-gpu=uuid,memory.total,compute_cap --format=csv,noheader,nounits")
+    done
+  fi
 }
 
 detect_rocm_devices() {
@@ -450,8 +565,14 @@ select_safety_backend() {
       SAFETY_DEVICE_COUNT="$CUDA_COUNT"
       SAFETY_AGGREGATE_DEVICE_MEMORY_MIB="$CUDA_TOTAL_VRAM_MIB"; SAFETY_DEVICE_MEMORY_KNOWN=1
       SAFETY_MIN_DEVICE_MEMORY_MIB="$CUDA_MIN_VRAM_MIB"; SAFETY_SHARED_ACCELERATOR="$CUDA_SHARED"
-      SAFETY_BACKEND_CLASS=$([ "$CUDA_SHARED" = 1 ] && printf 'shared-display' || printf 'dedicated')
-      SAFETY_BACKEND_REASON="highest-confidence native NVIDIA backend"
+      SAFETY_UNIFIED_MEMORY="$CUDA_UNIFIED"
+      if [ "$CUDA_UNIFIED" = 1 ]; then
+        SAFETY_BACKEND_CLASS="unified-memory"
+        SAFETY_BACKEND_REASON="native NVIDIA backend on a unified-memory accelerator"
+      else
+        SAFETY_BACKEND_CLASS=$([ "$CUDA_SHARED" = 1 ] && printf 'shared-display' || printf 'dedicated')
+        SAFETY_BACKEND_REASON="highest-confidence native NVIDIA backend"
+      fi
       ;;
     rocm)
       [ "$ROCM_COUNT" -gt 0 ] || { err "ROCm was requested but no ROCm device was classified"; exit 2; }
@@ -587,6 +708,7 @@ build_resource_limits() {
   # reported, and the hard boundary is the largest installed inference payload.
   SAFETY_DEDICATED_VRAM_RATIO_PERCENT=0
   if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ] \
+    && [ "$SAFETY_UNIFIED_MEMORY" = 0 ] \
     && [ "$SAFETY_AGGREGATE_DEVICE_MEMORY_MIB" -gt 0 ]; then
     SAFETY_DEDICATED_VRAM_RATIO_PERCENT=$((SAFETY_AGGREGATE_DEVICE_MEMORY_MIB * 100 / SAFETY_HOST_TOTAL_MIB))
   fi
@@ -605,11 +727,29 @@ build_resource_limits() {
       err "install a model, set OLLAMA_SAFE_MODEL_STORE, or explicitly set OLLAMA_SAFE_HOST_RESERVE_MIB"
       exit 2
     }
-    host_max="$SAFETY_LARGEST_MODEL_MIB"
-    [ "$SAFETY_OBSERVED_HOST_MIB" -gt "$host_max" ] && host_max="$SAFETY_OBSERVED_HOST_MIB"
-    host_high="$SAFETY_OBSERVED_HOST_MIB"
-    [ "$host_high" -gt 0 ] || host_high="$host_max"
-    SAFETY_HOST_LIMIT_SOURCE="installed manifests and Ollama journal projections"
+    if [ "$SAFETY_UNIFIED_MEMORY" = 1 ]; then
+      # On a unified pool the model payload is host memory, so it is accounted
+      # inside the same cgroup as Ollama's working set. The two terms add; they
+      # are not alternatives. Taking the larger of them, as a discrete-VRAM host
+      # correctly does, would cap the service at exactly the weight of its own
+      # largest model and OOM-kill it during load.
+      local unified_overhead="$SAFETY_OBSERVED_HOST_MIB"
+      [ "$unified_overhead" -gt 0 ] || unified_overhead="$UNIFIED_WORKING_SET_FLOOR_MIB"
+      host_max=$((SAFETY_LARGEST_MODEL_MIB + unified_overhead))
+      host_high="$SAFETY_LARGEST_MODEL_MIB"
+      SAFETY_HOST_LIMIT_SOURCE="unified pool: installed manifest payload plus Ollama working set"
+      if [ "$host_max" -ge "$SAFETY_HOST_TOTAL_MIB" ]; then
+        err "largest installed payload (${SAFETY_LARGEST_MODEL_MIB} MiB) plus working set (${unified_overhead} MiB) exceeds unified memory (${SAFETY_HOST_TOTAL_MIB} MiB)"
+        err "remove the oversized model or set OLLAMA_SAFE_HOST_RESERVE_MIB explicitly"
+        exit 2
+      fi
+    else
+      host_max="$SAFETY_LARGEST_MODEL_MIB"
+      [ "$SAFETY_OBSERVED_HOST_MIB" -gt "$host_max" ] && host_max="$SAFETY_OBSERVED_HOST_MIB"
+      host_high="$SAFETY_OBSERVED_HOST_MIB"
+      [ "$host_high" -gt 0 ] || host_high="$host_max"
+      SAFETY_HOST_LIMIT_SOURCE="installed manifests and Ollama journal projections"
+    fi
   fi
   if [ -n "${OLLAMA_SAFE_HOST_MEMORY_MAX_MIB:-}" ]; then
     require_uint_value OLLAMA_SAFE_HOST_MEMORY_MAX_MIB "$OLLAMA_SAFE_HOST_MEMORY_MAX_MIB"
@@ -669,6 +809,17 @@ build_resource_limits() {
   if [ "$SAFETY_GPU_PREFERRED" = 1 ] && [ "$HOST_OS" = "Linux" ] \
     && [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     SAFETY_NEGOTIATOR_ENABLED=1
+    # A unified-memory host still has to prove the two capabilities the broker
+    # depends on. Refuse the guarantee rather than emit one it cannot keep.
+    if [ "$SAFETY_UNIFIED_MEMORY" = 1 ]; then
+      if [ "$CUDA_DEVICE_SCOPING" != 1 ]; then
+        SAFETY_NEGOTIATOR_ENABLED=0
+        SAFETY_NEGOTIATOR_BLOCKED_REASON="nvidia-smi cannot select this device by UUID; scoped leases would be unprovable"
+      elif ! tegra_compute_apps_supported; then
+        SAFETY_NEGOTIATOR_ENABLED=0
+        SAFETY_NEGOTIATOR_BLOCKED_REASON="nvidia-smi reports no numeric PID for CUDA processes; foreign allocations cannot be distinguished from Ollama"
+      fi
+    fi
   fi
 
   local default_context=8192 default_queue=64 default_models=1
@@ -729,6 +880,7 @@ build_resource_limits() {
 build_safety_profile() {
   [ "$SAFETY_READY" = 1 ] && return 0
   detect_host_profile
+  detect_tegra_platform
   detect_cuda_devices
   detect_rocm_devices
   detect_vulkan_devices
@@ -743,6 +895,7 @@ build_safety_profile() {
 print_safety_profile() {
   hdr "Host classification"
   say "  Platform: $HOST_NAME ($HOST_OS/$HOST_ARCH; $HOST_VIRTUALIZATION)"
+  [ "$HOST_TEGRA" = 1 ] && say "  Tegra: $HOST_TEGRA_MODEL (unified CPU/GPU memory)"
   say "  CPU: $HOST_CPU — $HOST_CPU_CORES logical cores"
   if [ "$SAFETY_PHYSICAL_MEMORY_MIB" -ne "$SAFETY_HOST_TOTAL_MIB" ]; then
     say "  Memory: ${SAFETY_PHYSICAL_MEMORY_MIB} MiB physical; ${SAFETY_HOST_TOTAL_MIB} MiB effective ($HOST_MEMORY_SOURCE)"
@@ -764,10 +917,19 @@ print_safety_profile() {
   printf '  Device: %s\n' "${SAFETY_SELECTED_SUMMARIES[@]}"
   if [ "$SAFETY_VRAM_RESERVE_MIB" -gt 0 ]; then
     say "  Device memory: explicit ${SAFETY_VRAM_RESERVE_MIB} MiB carve-out per selected accelerator"
+  elif [ "$SAFETY_UNIFIED_MEMORY" = 1 ]; then
+    say "  Device memory: unified with host memory; live /proc/meminfo availability drives placement"
   elif [ "$SAFETY_DEVICE_COUNT" -gt 0 ]; then
     say "  Device memory: live free-VRAM telemetry; no guessed fixed carve-out"
   fi
-  if [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
+  if [ "$SAFETY_UNIFIED_MEMORY" = 1 ]; then
+    say "  Unified memory pool: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB shared by CPU and GPU across ${SAFETY_DEVICE_COUNT} accelerator(s)"
+    if [ "$CUDA_DEVICE_SCOPING" = 1 ]; then
+      say "  Device scoping: nvidia-smi selects this device by UUID"
+    else
+      say "  Device scoping: unavailable (bare UUID); device isolation variables are omitted"
+    fi
+  elif [ "$SAFETY_DEVICE_MEMORY_KNOWN" = 1 ] && [ "$SAFETY_SHARED_ACCELERATOR" = 0 ]; then
     say "  Aggregate dedicated device memory: ${SAFETY_AGGREGATE_DEVICE_MEMORY_MIB} MiB across ${SAFETY_DEVICE_COUNT} accelerator(s); ${SAFETY_DEDICATED_VRAM_RATIO_PERCENT}% of host RAM"
   fi
   if [ "$SAFETY_LARGEST_MODEL_MIB" -gt 0 ]; then
@@ -785,9 +947,17 @@ print_safety_profile() {
   fi
   if [ "$SAFETY_NEGOTIATOR_ENABLED" = 1 ]; then
     say "  GPU negotiator: cooperative leases plus anonymous-process rebalance; Ollama refits after external allocation"
+  elif [ -n "$SAFETY_NEGOTIATOR_BLOCKED_REASON" ]; then
+    say "  GPU negotiator: unavailable — $SAFETY_NEGOTIATOR_BLOCKED_REASON"
   fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
     say "  Containment: memory PSI ${SAFETY_MEMORY_PRESSURE_LIMIT_PERCENT}%; CPU quota ${SAFETY_CPU_QUOTA_PERCENT}%; restart $SAFETY_RESTART_POLICY"
+  fi
+  if [ "$SAFETY_UNIFIED_MEMORY" = 1 ] && [ "$HOST_SERVICE_MANAGER" = "systemd" ]; then
+    say "  Unified containment: the cgroup boundary bounds the CPU-fallback path."
+    say "  GPU-resident weights are allocated through the driver and are not charged"
+    say "  to memory.current, so live-availability admission — not MemoryMax — is the"
+    say "  operative guard against accelerator exhaustion on this host."
   fi
   if [ "$HOST_SERVICE_MANAGER" = "systemd" ] && [ "$SYSTEMD_VERSION" -lt 231 ]; then
     warn "systemd $SYSTEMD_VERSION is too old for MemoryHigh/MemoryMax; scheduler limits still apply."
@@ -803,9 +973,17 @@ render_safety_environment_directives() {
   ids=$(csv_from_array "${SAFETY_DEVICE_IDS[@]}")
   case "$SAFETY_BACKEND" in
     cuda)
-      printf '%s\n' "Environment=\"CUDA_VISIBLE_DEVICES=$ids\"" "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
-        "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
-        "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\"" "Environment=\"OLLAMA_IGPU_ENABLE=0\""
+      # A unified device that nvidia-smi cannot select by UUID must not be pinned
+      # by UUID either: an unrecognised filter would hide the only accelerator.
+      if [ "$SAFETY_UNIFIED_MEMORY" = 1 ] && [ "$CUDA_DEVICE_SCOPING" != 1 ]; then
+        printf '%s\n' "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
+          "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
+          "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\""
+      else
+        printf '%s\n' "Environment=\"CUDA_VISIBLE_DEVICES=$ids\"" "Environment=\"HIP_VISIBLE_DEVICES=-1\"" \
+          "Environment=\"ROCR_VISIBLE_DEVICES=-1\"" "Environment=\"GPU_DEVICE_ORDINAL=-1\"" \
+          "Environment=\"GGML_VK_VISIBLE_DEVICES=-1\"" "Environment=\"OLLAMA_VULKAN=0\"" "Environment=\"OLLAMA_IGPU_ENABLE=0\""
+      fi
       ;;
     rocm)
       printf '%s\n' "Environment=\"ROCR_VISIBLE_DEVICES=$ids\"" \
@@ -1025,6 +1203,10 @@ FOREIGN_RELEASE_TOLERANCE_MIB = max(
     0, env_int("OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB", 256)
 )
 BACKEND_TYPE = os.environ.get("OLLAMA_UNIFY_BACKEND_TYPE", "unknown")
+# A unified-memory accelerator (NVIDIA Tegra) shares one physical pool with the
+# host. nvidia-smi reports memory.* as [N/A] there, so device capacity is read
+# from /proc/meminfo, which the CUDA runtime agrees with.
+UNIFIED_MEMORY = os.environ.get("OLLAMA_UNIFY_UNIFIED_MEMORY", "0") == "1"
 SELECTED_GPUS = [value for value in os.environ.get("OLLAMA_UNIFY_SELECTED_GPUS", "").split(",") if value]
 OWNER_GPU_SCOPES = env_owner_gpu_scopes("OLLAMA_UNIFY_OWNER_GPU_SCOPES")
 LEASE_STATE_PATH = Path(os.environ.get(
@@ -1232,7 +1414,40 @@ def unload_all_models(timeout: float = UNLOAD_TIMEOUT) -> list[str]:
     return unload_models_at(BACKEND_HOST, BACKEND_PORT, timeout)
 
 
+def unified_gpu_snapshot() -> list[dict[str, Any]]:
+    """Device capacity for a unified pool, measured from /proc/meminfo.
+
+    Tegra reports memory.total/used/free as [N/A]. The GPU allocates from system
+    memory, so MemTotal is the device total and MemAvailable is what a new
+    allocation can actually obtain. Ollama's own CUDA runtime reports the same
+    figures via cudaMemGetInfo.
+    """
+    host = host_memory_snapshot()
+    total = int(host.get("memtotal_mib", 0) or 0)
+    free = int(host.get("memavailable_mib", 0) or 0)
+    if total <= 0:
+        return []
+    try:
+        result = subprocess.run([
+            "nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader",
+        ], check=True, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    uuids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not uuids:
+        return []
+    # One physical pool backs every unified device; report it once per device
+    # rather than multiplying capacity that does not exist.
+    return [{
+        "uuid": uuid, "total_mib": total,
+        "used_mib": max(0, total - free), "free_mib": free,
+        "unified": True,
+    } for uuid in uuids]
+
+
 def gpu_snapshot() -> list[dict[str, Any]]:
+    if UNIFIED_MEMORY:
+        return unified_gpu_snapshot()
     try:
         result = subprocess.run([
             "nvidia-smi", "--query-gpu=uuid,memory.total,memory.used,memory.free",
@@ -1310,9 +1525,16 @@ def foreign_gpu_usage() -> dict[str, int]:
             continue
         try:
             pid = int(fields[0])
-            used = int(fields[2])
         except ValueError:
             continue
+        try:
+            used = int(fields[2])
+        except ValueError:
+            # Tegra reports per-process usage as 0 or [N/A]. Identity still
+            # carries signal even when the magnitude does not.
+            if not UNIFIED_MEMORY:
+                continue
+            used = 0
         if SELECTED_GPUS and fields[1] not in SELECTED_GPUS:
             continue
         if pid not in ollama_pids:
@@ -1323,6 +1545,16 @@ def foreign_gpu_usage() -> dict[str, int]:
 def increased_foreign_gpu_usage(previous: dict[str, int],
                                 current: dict[str, int]) -> dict[str, int]:
     """Return only new or larger foreign allocations on selected GPUs."""
+    if UNIFIED_MEMORY:
+        # Tegra reports used_gpu_memory as 0 (or [N/A]) for every process, so a
+        # growth comparison can never fire. The appearance of a new process
+        # identity is the only observable signal, and it is precisely the
+        # reactive contract this broker documents: detect a changed non-Ollama
+        # CUDA process set, drain, settle, and refit.
+        return {
+            key: used for key, used in current.items()
+            if key not in previous
+        }
     return {
         key: used for key, used in current.items()
         if used > previous.get(key, 0)
@@ -4975,6 +5207,7 @@ install_gpu_negotiator() {
     printf '# Managed by ollama-unify — generated %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'OLLAMA_UNIFY_BACKEND="%s"\n' "$SAFETY_OLLAMA_BACKEND"
     printf 'OLLAMA_UNIFY_BACKEND_TYPE="%s"\n' "$SAFETY_BACKEND"
+    printf 'OLLAMA_UNIFY_UNIFIED_MEMORY="%s"\n' "$SAFETY_UNIFIED_MEMORY"
     printf 'OLLAMA_UNIFY_SELECTED_GPUS="%s"\n' "$selected_ids"
     printf 'OLLAMA_UNIFY_LISTEN="%s"\n' "$proxy_listen"
     printf 'OLLAMA_UNIFY_SOCKET="%s"\n' "$SAFETY_NEGOTIATOR_SOCKET"
