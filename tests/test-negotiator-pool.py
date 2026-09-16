@@ -124,6 +124,16 @@ def control(path, payload):
     return response
 
 
+def control_raw(path, payload):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(10)
+    client.connect(path)
+    client.sendall(json.dumps(payload).encode() + b"\n")
+    response = json.loads(client.makefile("rb").readline())
+    client.close()
+    return response
+
+
 def events(path):
     try:
         with open(path, encoding="utf-8") as stream:
@@ -315,7 +325,8 @@ class PoolHarness:
                  release_tolerance_mib=256, resume_ttl=1.0,
                  completed_ttl=2.0, completed_max_entries=8,
                  completed_max_body_bytes=1024 * 1024,
-                 completed_max_total_bytes=4 * 1024 * 1024):
+                 completed_max_total_bytes=4 * 1024 * 1024,
+                 pending_timeout=300.0, revoke_timeout=300.0):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
@@ -328,6 +339,8 @@ class PoolHarness:
         self.completed_max_entries = completed_max_entries
         self.completed_max_body_bytes = completed_max_body_bytes
         self.completed_max_total_bytes = completed_max_total_bytes
+        self.pending_timeout = pending_timeout
+        self.revoke_timeout = revoke_timeout
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -379,6 +392,8 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_MODEL_OVERHEAD_PERCENT": "100",
             "OLLAMA_UNIFY_OLLAMA_BINARY": os.path.join(self.fixture_bin, "ollama"),
             "OLLAMA_UNIFY_DRAIN_TIMEOUT": "3",
+            "OLLAMA_UNIFY_PENDING_TIMEOUT": str(self.pending_timeout),
+            "OLLAMA_UNIFY_REVOKE_TIMEOUT": str(self.revoke_timeout),
             "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
             "OLLAMA_UNIFY_ANON_POLL": "0.05",
             "OLLAMA_UNIFY_ANON_SETTLE": "0.1",
@@ -1802,6 +1817,134 @@ def test_feasible_controlled_load_has_no_admission_loss_or_amplification(
         assert completed["replayed_total"] == replay_count
 
 
+def test_revoked_lease_with_dead_owner_is_abandoned(helper, fixture_bin):
+    """A revoked lease whose owner never returns must not pin its GPUs.
+
+    Revocation waits for the owner to free CUDA memory and release. An owner
+    that has already died never does either, and revocation had no deadline of
+    its own: the reaper's only remedy was to revoke an already-revoking lease,
+    which is a no-op. The scope stayed reserved, every admission parked on the
+    lease state, and inference hung until the broker was restarted.
+    """
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1,
+        pending_timeout=1.0, revoke_timeout=2.0,
+    ) as harness:
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "dead-owner-fixture",
+            "requested_mib": 4096,
+            "ttl": 1,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+        })
+        token = acquired["lease"]["token"]
+
+        # The owner dies here: it never calls ready, heartbeat, or release.
+        revoked = wait_until(
+            lambda: next(
+                (lease for lease in harness.status()["leases"]
+                 if lease["token"] == token
+                 and lease["state"] == "revoking"),
+                None,
+            ),
+            "the pending deadline to revoke the abandoned lease",
+            timeout=10,
+        )
+        # The revoke clock starts on entry to "revoking", not at creation.
+        assert revoked["transition_started_at"] >= revoked["created_at"]
+
+        wait_until(
+            lambda: harness.status()["leases"] == [],
+            "the revoke deadline to abandon the dead owner's lease",
+            timeout=15,
+        )
+        status = harness.status()
+        assert status["draining"] is False
+
+        # The reclaimed scope admits inference again without a restart.
+        code, payload, _ = chat(harness.proxy_port, MODEL, "after-abandon", 0, 20)
+        assert code == 200, payload
+
+
+def test_forced_release_reclaims_scope_when_owner_never_frees(
+    helper, fixture_bin,
+):
+    """`release --force` recovers a lease whose settle check can never pass.
+
+    Release is gated on foreign CUDA use on the scope returning to its
+    pre-lease baseline. An unrelated tenant that arrives on that GPU after
+    acquisition is counted against the departed owner forever, so the gate
+    can never clear. Without an override the scope stays reserved with no
+    supported way to reclaim it.
+    """
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        write_compute_apps(harness.compute_apps, [])
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "never-frees-fixture",
+            "requested_mib": 4096,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        token = acquired["lease"]["token"]
+        control(harness.socket_path, {"action": "ready", "token": token})
+
+        # An unrelated tenant lands on the leased GPU after the baseline was
+        # taken, and stays. It is not the lease owner's memory, but the
+        # release gate cannot tell the difference.
+        write_compute_apps(harness.compute_apps, [
+            (940101, "GPU-large-0", 4096),
+        ])
+        refused = control_raw(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert refused["ok"] is False
+        assert "baseline" in refused["error"].lower()
+        assert harness.status()["leases"] != []
+
+        forced = control(harness.socket_path, {
+            "action": "release", "token": token, "force": True,
+        })
+        assert forced["released"] == token
+        status = harness.status()
+        assert status["leases"] == []
+        assert status["draining"] is False
+
+
+def test_inference_request_without_json_content_type_is_served(
+    helper, fixture_bin,
+):
+    """A JSON body under another media type must route, not hang.
+
+    Ollama decodes these bodies whatever Content-Type the client declares, so
+    a client that omits the header still gets an answer from Ollama directly.
+    The broker read the routed model only when the declared type contained
+    "json", so the same request arrived with no model, waited for capacity for
+    a model named "" that no lane could serve, and hung until the client gave
+    up. It also skipped the clamp that pins num_gpu and caps num_ctx, which is
+    the bypass the clamp exists to prevent.
+    """
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        status, payload, _ = http_json(
+            harness.proxy_port, "POST", "/api/chat",
+            {
+                "model": MODEL,
+                "stream": False,
+                "mock_request_id": "no-content-type",
+                "mock_delay": 0,
+                "options": {"num_gpu": 999, "main_gpu": 2},
+            },
+            timeout=20,
+            extra_headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert status == 200, payload
+        # The model was recovered from the body, so a lane was placed for it.
+        assert [
+            lane for lane in managed_lanes(harness.status())
+            if lane["model"] == MODEL
+        ]
+
+
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
@@ -1846,12 +1989,20 @@ def main():
     test_feasible_controlled_load_has_no_admission_loss_or_amplification(
         helper, fixture_bin,
     )
+    test_inference_request_without_json_content_type_is_served(
+        helper, fixture_bin,
+    )
+    test_revoked_lease_with_dead_owner_is_abandoned(helper, fixture_bin)
+    test_forced_release_reclaims_scope_when_owner_never_frees(
+        helper, fixture_bin,
+    )
     print(
         "negotiator pool integration: PASS "
         "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
         "resumable logical admission, completed-response replay, cancellation, "
-        "terminal admission failures, controlled-load admission and replay bounds)"
+        "terminal admission failures, controlled-load admission and replay bounds, "
+        "dead-owner lease reclamation, content-type-independent routing)"
     )
 
 

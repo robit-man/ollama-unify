@@ -1012,6 +1012,11 @@ CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-ne
 DRAIN_TIMEOUT = env_float("OLLAMA_UNIFY_DRAIN_TIMEOUT", 300.0)
 PENDING_TIMEOUT = env_float("OLLAMA_UNIFY_PENDING_TIMEOUT", 300.0)
 UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
+# A revoked lease waits for its owner to free CUDA memory and release. A dead
+# owner never returns, so revocation needs its own deadline. Past it, the
+# broker abandons the lease and reclaims the scope; live free-VRAM telemetry,
+# not the lease table, remains authoritative for placement.
+REVOKE_TIMEOUT = env_float("OLLAMA_UNIFY_REVOKE_TIMEOUT", 300.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
 HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
 HEARTBEAT_RECONNECT_GRACE = env_float(
@@ -1113,8 +1118,17 @@ class BackendHTTPError(RuntimeError):
 
 
 def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
-    """Prevent clients from bypassing dynamic GPU fitting or the scanned context cap."""
-    if not body or not path.startswith(NATIVE_MODEL_PATHS) or "json" not in content_type.lower():
+    """Prevent clients from bypassing dynamic GPU fitting or the scanned context cap.
+
+    Ollama decodes a JSON body on these paths whatever the request declares as
+    its Content-Type, so a client that sends JSON under any other media type
+    still reaches the model. Trusting the declared type here let exactly that
+    client keep num_gpu, main_gpu, and an oversized num_ctx, which is the
+    bypass this clamp exists to prevent. The body is parsed on path alone and
+    left untouched when it does not decode.
+    """
+    del content_type
+    if not body or not path.startswith(NATIVE_MODEL_PATHS):
         return body
     try:
         payload = json.loads(body)
@@ -1493,7 +1507,7 @@ def discovery_document() -> dict[str, Any]:
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_by_gpu(
@@ -3347,6 +3361,10 @@ class Broker:
         if lease.state == "revoking":
             return
         lease.state = "revoking"
+        # Restart the transition clock on entry to "revoking". It previously
+        # kept the pending timestamp, so the revoke deadline below measured
+        # from lease creation and a lease revoked late never aged correctly.
+        lease.transition_started_at = time.time()
         self.last_reason = reason
         message = (
             f"GPU lease transition revoked for {lease.owner}: {reason}; "
@@ -3372,6 +3390,48 @@ class Broker:
         self._persist_leases_locked()
         self.cv.notify_all()
         LOG.error(message)
+
+    def _abandon_locked(self, lease: Lease, reason: str) -> None:
+        """Drop a revoked lease whose owner never came back to release it.
+
+        A reservation is a scheduling hint layered on live GPU telemetry. It
+        cannot protect memory that a dead owner has already freed, and while
+        it survives it blocks every Ollama admission on its scope forever.
+        Dropping it restores admission; measured free VRAM still governs
+        placement, so a still-resident allocation keeps its memory either way.
+        """
+        self.leases.pop(lease.token, None)
+        self.last_reason = reason
+        message = (
+            f"GPU lease abandoned for {lease.owner}: {reason}; "
+            "the reserved scope returns to live free-VRAM placement"
+        )
+        if not lease.gpu_uuids and self._global_transition_lease_locked() is None:
+            # This lease held the host-wide drain. No other global transition
+            # remains, so admission must resume with it.
+            self.draining = False
+        self._persist_leases_locked()
+        self.cv.notify_all()
+        LOG.error(message)
+
+    def _abandon_if_revoke_deadline_expired_locked(
+        self, lease: Lease, now: float | None = None,
+    ) -> bool:
+        if lease.state != "revoking" or REVOKE_TIMEOUT <= 0:
+            return False
+        current = time.time() if now is None else now
+        if lease.ttl > 0 and current - lease.heartbeat_at <= lease.ttl:
+            # The owner is still heartbeating, so it is alive and working
+            # through its release. Revocation waits for it.
+            return False
+        if current - lease.transition_started_at < REVOKE_TIMEOUT:
+            return False
+        self._abandon_locked(
+            lease,
+            f"revoke deadline of {REVOKE_TIMEOUT:g}s expired "
+            "with no owner heartbeat",
+        )
+        return True
 
     def _revoke_if_pending_deadline_expired_locked(
         self, lease: Lease, now: float | None = None,
@@ -3593,7 +3653,8 @@ class Broker:
                 self.end_drain()
                 raise
 
-    def release(self, token: str, reason: str = "lease release") -> dict[str, Any]:
+    def release(self, token: str, reason: str = "lease release",
+                force: bool = False) -> dict[str, Any]:
         with self.transition:
             with self.cv:
                 lease = self.leases.get(token)
@@ -3618,10 +3679,20 @@ class Broker:
                 else:
                     stopped = self.stop_pool_lanes(reason)
                     unloaded = unload_all_models()
-                wait_for_foreign_settle(
-                    lease.foreign_baseline,
-                    scoped_gpus if scoped_release else None,
-                )
+                if force:
+                    # Operator override for a lease whose owner is gone. The
+                    # settle check can never pass once the owner's allocation
+                    # is unverifiable, so refusing here would leave the scope
+                    # pinned with no supported way to reclaim it.
+                    LOG.error(
+                        "lease release forced owner=%s; foreign CUDA release "
+                        "is not verified", lease.owner,
+                    )
+                else:
+                    wait_for_foreign_settle(
+                        lease.foreign_baseline,
+                        scoped_gpus if scoped_release else None,
+                    )
                 with self.cv:
                     self.leases.pop(token, None)
                     self._persist_leases_locked()
@@ -3807,6 +3878,12 @@ class Broker:
             with self.cv:
                 for lease in list(self.leases.values()):
                     if self._revoke_if_pending_deadline_expired_locked(lease, now):
+                        # The lease is revoking. Its TTL branch below can only
+                        # re-revoke it, which is a no-op, so revocation itself
+                        # needs the deadline that reclaims a dead owner.
+                        self._abandon_if_revoke_deadline_expired_locked(
+                            lease, now,
+                        )
                         continue
                     if (lease.ttl > 0
                             and now - lease.heartbeat_at > lease.ttl):
@@ -4150,7 +4227,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 fingerprint = retained_request.fingerprint
             else:
                 body = clamp_request(self.path, content_type, body)
-                if body and "json" in content_type.lower():
+                # The routed model is read from the body on path alone, for the
+                # same reason the clamp above is. Keying this on the declared
+                # Content-Type left an inference request with a JSON body sent
+                # under any other media type with no model to place, and the
+                # broker then waited for capacity for a model named "" that no
+                # lane could ever serve, so the request hung until the client
+                # gave up while Ollama would have answered it.
+                if body and path in INFERENCE_PATHS:
                     try:
                         payload = json.loads(body)
                         if isinstance(payload, dict):
@@ -4410,7 +4494,10 @@ class ControlHandler(socketserver.StreamRequestHandler):
                 elif action == "prepare":
                     result = self.broker.prepare(str(request.get("token") or ""))
                 elif action == "release":
-                    result = self.broker.release(str(request.get("token") or ""))
+                    result = self.broker.release(
+                        str(request.get("token") or ""),
+                        force=bool(request.get("force")),
+                    )
                 elif action == "heartbeat":
                     result = self.broker.heartbeat(str(request.get("token") or ""))
                 elif action == "status":
@@ -4720,6 +4807,12 @@ def main() -> int:
     for name in ("ready", "prepare", "release"):
         command = sub.add_parser(name)
         command.add_argument("token")
+        if name == "release":
+            command.add_argument(
+                "--force", action="store_true",
+                help="reclaim the scope without verifying the owner's "
+                     "CUDA release; for an owner that is already gone",
+            )
     heartbeat = sub.add_parser("heartbeat")
     heartbeat.add_argument("token")
     heartbeat.add_argument("--watch", action="store_true")
@@ -4759,7 +4852,12 @@ def main() -> int:
             "action": "scope", "token": args.token, "gpu_uuids": args.gpu,
         })
     elif args.command_name in ("ready", "prepare", "release", "heartbeat"):
-        result = send_control({"action": args.command_name, "token": args.token})
+        control: dict[str, Any] = {
+            "action": args.command_name, "token": args.token,
+        }
+        if args.command_name == "release" and getattr(args, "force", False):
+            control["force"] = True
+        result = send_control(control)
     elif args.command_name == "run":
         if not args.command:
             parser.error("run requires a command after --")
@@ -4814,7 +4912,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 1. Run `docker gpu discover` and inspect the selected GPUs and current policy.
 2. Launch long-running CUDA services with `docker gpu run --owner NAME --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.
 3. For an independently supervised service, use scoped `acquire --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
-4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven.
+4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
 5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
 6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
 
@@ -4884,6 +4982,7 @@ install_gpu_negotiator() {
 
   drain_timeout="${OLLAMA_SAFE_NEGOTIATOR_DRAIN_TIMEOUT:-300}"
   pending_timeout="${OLLAMA_SAFE_NEGOTIATOR_PENDING_TIMEOUT:-300}"
+  revoke_timeout="${OLLAMA_SAFE_NEGOTIATOR_REVOKE_TIMEOUT:-300}"
   unload_timeout="${OLLAMA_SAFE_NEGOTIATOR_UNLOAD_TIMEOUT:-120}"
   lease_ttl="${OLLAMA_SAFE_NEGOTIATOR_LEASE_TTL:-300}"
   heartbeat_reconnect_grace="${OLLAMA_SAFE_HEARTBEAT_RECONNECT_GRACE:-90}"
@@ -4981,6 +5080,7 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_MAX_CONTEXT="%s"\n' "$SAFETY_CONTEXT_LENGTH"
     printf 'OLLAMA_UNIFY_DRAIN_TIMEOUT="%s"\n' "$drain_timeout"
     printf 'OLLAMA_UNIFY_PENDING_TIMEOUT="%s"\n' "$pending_timeout"
+    printf 'OLLAMA_UNIFY_REVOKE_TIMEOUT="%s"\n' "$revoke_timeout"
     printf 'OLLAMA_UNIFY_UNLOAD_TIMEOUT="%s"\n' "$unload_timeout"
     printf 'OLLAMA_UNIFY_LEASE_TTL="%s"\n' "$lease_ttl"
     printf 'OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE="%s"\n' "$heartbeat_reconnect_grace"
