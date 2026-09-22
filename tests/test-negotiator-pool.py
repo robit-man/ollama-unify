@@ -326,7 +326,8 @@ class PoolHarness:
                  completed_ttl=2.0, completed_max_entries=8,
                  completed_max_body_bytes=1024 * 1024,
                  completed_max_total_bytes=4 * 1024 * 1024,
-                 pending_timeout=300.0, revoke_timeout=300.0):
+                 pending_timeout=300.0, revoke_timeout=300.0,
+                 model_gpu_preferences=None):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
@@ -341,6 +342,7 @@ class PoolHarness:
         self.completed_max_total_bytes = completed_max_total_bytes
         self.pending_timeout = pending_timeout
         self.revoke_timeout = revoke_timeout
+        self.model_gpu_preferences = model_gpu_preferences
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -369,6 +371,9 @@ class PoolHarness:
             "OLLAMA_UNIFY_LEASE_STATE": os.path.join(self.temp_dir, "leases.json"),
             "OLLAMA_UNIFY_BACKEND_TYPE": "cuda",
             "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
+            "OLLAMA_UNIFY_MODEL_GPU_PREFERENCES": json.dumps(
+                self.model_gpu_preferences or {}
+            ),
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
             "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
@@ -597,6 +602,29 @@ def test_existing_pool_contract(helper, fixture_bin):
             assert started_pids <= stopped_pids
             backend.shutdown()
             backend.server_close()
+
+
+def test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        model_gpu_preferences={MODEL: ["GPU-large-1"]},
+    ) as harness:
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        lanes = managed_lanes(harness.status())
+        assert len(lanes) == 1
+        assert lanes[0]["gpu_uuid"] == "GPU-large-1"
+        discovery_status, discovery, _ = http_json(
+            harness.proxy_port,
+            "GET",
+            "/.well-known/ollama-unify-gpu-negotiator",
+        )
+        assert discovery_status == 200, discovery
+        assert discovery["parallel_pool"]["model_gpu_preferences"] == {
+            MODEL: ["GPU-large-1"],
+        }
 
 
 def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin):
@@ -1949,6 +1977,7 @@ def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
+    test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         helper, fixture_bin,

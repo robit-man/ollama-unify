@@ -972,6 +972,32 @@ def env_owner_gpu_scopes(name: str) -> dict[str, list[str]]:
     return scopes
 
 
+def env_model_gpu_preferences(
+    name: str, selected_gpus: list[str],
+) -> dict[str, list[str]]:
+    """Parse soft, ordered per-model GPU placement preferences."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    preferences = json.loads(raw)
+    if not isinstance(preferences, dict):
+        raise ValueError("model GPU preferences must be a JSON object")
+    selected = set(selected_gpus)
+    normalized: dict[str, list[str]] = {}
+    for model, values in preferences.items():
+        if not isinstance(model, str) or ":" not in model:
+            raise ValueError("model GPU preference requires an exact tagged model")
+        if not isinstance(values, list) or not values:
+            raise ValueError("model GPU preference requires a non-empty GPU list")
+        gpu_uuids = list(dict.fromkeys(values))
+        if any(not isinstance(value, str) or not value for value in gpu_uuids):
+            raise ValueError("model GPU preference contains an invalid GPU UUID")
+        if selected and any(value not in selected for value in gpu_uuids):
+            raise ValueError("model GPU preference contains an unselected GPU")
+        normalized[model] = gpu_uuids
+    return normalized
+
+
 def load_environment_file(path: str) -> None:
     """Load the installer's simple quoted KEY=VALUE file for standalone CLI calls."""
     try:
@@ -1031,6 +1057,9 @@ FOREIGN_RELEASE_TOLERANCE_MIB = max(
 )
 BACKEND_TYPE = os.environ.get("OLLAMA_UNIFY_BACKEND_TYPE", "unknown")
 SELECTED_GPUS = [value for value in os.environ.get("OLLAMA_UNIFY_SELECTED_GPUS", "").split(",") if value]
+MODEL_GPU_PREFERENCES = env_model_gpu_preferences(
+    "OLLAMA_UNIFY_MODEL_GPU_PREFERENCES", SELECTED_GPUS
+)
 OWNER_GPU_SCOPES = env_owner_gpu_scopes("OLLAMA_UNIFY_OWNER_GPU_SCOPES")
 LEASE_STATE_PATH = Path(os.environ.get(
     "OLLAMA_UNIFY_LEASE_STATE", "/var/lib/ollama-unify/leases.json"
@@ -1396,6 +1425,7 @@ def discovery_document() -> dict[str, Any]:
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
         "parallel_pool": {
             "enabled": POOL_ENABLED,
+            "model_gpu_preferences": MODEL_GPU_PREFERENCES,
             "max_managed_servers": POOL_MAX_SERVERS,
             "max_queue": POOL_MAX_QUEUE,
             "resume_ttl_seconds": POOL_RESUME_TTL,
@@ -2716,6 +2746,11 @@ class Broker:
                     )
                 placements: list[str] = []
                 devices: list[dict[str, Any]] = []
+                preferred_gpus = MODEL_GPU_PREFERENCES.get(model, [])
+                preference_rank = {
+                    gpu_uuid: index
+                    for index, gpu_uuid in enumerate(preferred_gpus)
+                }
                 while True:
                     devices = [device for device in gpu_snapshot()
                                if device.get("uuid") in SELECTED_GPUS
@@ -2728,13 +2763,30 @@ class Broker:
                     placements = []
                     for _ in range(missing):
                         candidates = [
-                            (free_mib, gpu_uuid)
+                            (gpu_uuid, free_mib)
                             for gpu_uuid, free_mib in virtual_free.items()
                             if free_mib >= required_mib
                         ]
                         if not candidates:
                             break
-                        _, chosen_uuid = max(candidates)
+                        preferred = [candidate for candidate in candidates
+                                     if candidate[0] in preference_rank]
+                        if preferred:
+                            chosen_uuid, _ = min(
+                                preferred,
+                                key=lambda candidate: (
+                                    preference_rank[candidate[0]],
+                                    -candidate[1],
+                                    candidate[0],
+                                ),
+                            )
+                        else:
+                            chosen_uuid, _ = max(
+                                candidates,
+                                key=lambda candidate: (
+                                    candidate[1], candidate[0]
+                                ),
+                            )
                         placements.append(chosen_uuid)
                         virtual_free[chosen_uuid] -= required_mib
                     if len(placements) == missing:
