@@ -365,6 +365,7 @@ class PoolHarness:
             "MOCK_NVIDIA_COMPUTE_APPS_FILE": self.compute_apps,
             "MOCK_OLLAMA_GPU_USAGE_DIR": self.gpu_usage_dir,
             "MOCK_OLLAMA_VRAM_MIB": str(self.runner_vram_mib),
+            "OLLAMA_UNIFY_CONFIG": os.path.join(self.temp_dir, "missing.conf"),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{self.backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{self.proxy_port}",
             "OLLAMA_UNIFY_SOCKET": self.socket_path,
@@ -454,6 +455,7 @@ def test_existing_pool_contract(helper, fixture_bin):
             "PATH": fixture_bin + os.pathsep + env.get("PATH", ""),
             "MOCK_PROFILE": "cuda_triple",
             "MOCK_OLLAMA_EVENT_LOG": event_log,
+            "OLLAMA_UNIFY_CONFIG": os.path.join(temp_dir, "missing.conf"),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{proxy_port}",
             "OLLAMA_UNIFY_SOCKET": socket_path,
@@ -625,6 +627,38 @@ def test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
         assert discovery["parallel_pool"]["model_gpu_preferences"] == {
             MODEL: ["GPU-large-1"],
         }
+
+
+def test_idle_lane_reservations_prevent_future_gpu_overcommit(helper, fixture_bin):
+    models = [f"fixture-reserved-{ordinal}:latest" for ordinal in range(3)]
+    tags = [{
+        "name": model,
+        "model": model,
+        "size": 30 * 1024**3,
+        "capabilities": ["completion"],
+    } for model in models]
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=3,
+        tags=tags,
+        runner_vram_mib=2048,
+        model_gpu_preferences={model: ["GPU-large-1"] for model in models},
+    ) as harness:
+        for model in models:
+            status, capacity, _ = harness.capacity(model)
+            assert status == 200, capacity
+
+        lanes = managed_lanes(harness.status())
+        assert len(lanes) == 3
+        placements = {lane["model"]: lane["gpu_uuid"] for lane in lanes}
+        assert placements[models[0]] == "GPU-large-1"
+        assert placements[models[1]] == "GPU-large-1"
+        # Each fixture runner consumes only 2 GiB, while each lane promises
+        # 31 GiB. Physical free memory would incorrectly admit all three on
+        # the preferred GPU after an idle unload; durable reservations leave
+        # only 18 GiB, so the soft preference must fall back.
+        assert placements[models[2]] == "GPU-large-0"
 
 
 def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin):
@@ -1978,6 +2012,7 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
+    test_idle_lane_reservations_prevent_future_gpu_overcommit(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
         helper, fixture_bin,
@@ -2027,7 +2062,7 @@ def main():
     )
     print(
         "negotiator pool integration: PASS "
-        "(fit, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
+        "(fit, durable lane reservations, bounded queue, lease accounting tolerance, endpoint-aware warm lanes, "
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
         "resumable logical admission, completed-response replay, cancellation, "
         "terminal admission failures, controlled-load admission and replay bounds, "

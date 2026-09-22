@@ -141,6 +141,7 @@ def main():
             {
                 "PATH": fixture_bin + os.pathsep + env.get("PATH", ""),
                 "MOCK_PROFILE": "cuda_triple",
+                "OLLAMA_UNIFY_CONFIG": os.path.join(temp_dir, "missing.conf"),
                 "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{backend.server_port}",
                 "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{proxy_port}",
                 "OLLAMA_UNIFY_SOCKET": socket_path,

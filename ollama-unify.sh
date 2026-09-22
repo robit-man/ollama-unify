@@ -2445,6 +2445,54 @@ class Broker:
             {str(capability).lower() for capability in capabilities},
         )
 
+    def _placement_devices(self, blocked: set[str]) -> list[dict[str, Any]]:
+        """Return capacity after honoring every live lane's promised VRAM.
+
+        Ollama may unload an idle lane's model while the lane process remains
+        ready.  Physical free VRAM then rises, but the lane can reload on its
+        next request.  Treat its reservation as still committed so another
+        lane cannot consume the same future capacity.
+        """
+        devices = [
+            device for device in gpu_snapshot()
+            if device.get("uuid") in SELECTED_GPUS
+            and device.get("uuid") not in blocked
+        ]
+        foreign_by_gpu: dict[str, int] = {}
+        for key, used_mib in foreign_gpu_usage().items():
+            _pid, separator, gpu_uuid = key.rpartition("@")
+            if separator:
+                foreign_by_gpu[gpu_uuid] = (
+                    foreign_by_gpu.get(gpu_uuid, 0) + int(used_mib)
+                )
+        with self.cv:
+            self._prune_dead_lanes_locked()
+            reserved_by_gpu: dict[str, int] = {}
+            for lane in self.lanes.values():
+                if lane.kind != "managed" or not lane.gpu_uuid or lane.retiring:
+                    continue
+                reserved_by_gpu[lane.gpu_uuid] = (
+                    reserved_by_gpu.get(lane.gpu_uuid, 0)
+                    + max(0, int(lane.reserved_mib))
+                )
+        available = []
+        for device in devices:
+            gpu_uuid = str(device.get("uuid") or "")
+            physical_free = max(0, int(device.get("free_mib") or 0))
+            promised_free = max(
+                0,
+                int(device.get("total_mib") or 0)
+                - foreign_by_gpu.get(gpu_uuid, 0)
+                - reserved_by_gpu.get(gpu_uuid, 0),
+            )
+            available.append({
+                **device,
+                "physical_free_mib": physical_free,
+                "reserved_mib": reserved_by_gpu.get(gpu_uuid, 0),
+                "free_mib": min(physical_free, promised_free),
+            })
+        return available
+
     @staticmethod
     def _warm_request(model: str, capabilities: set[str], request_path: str
                       ) -> tuple[str, dict[str, Any]]:
@@ -2752,9 +2800,7 @@ class Broker:
                     for index, gpu_uuid in enumerate(preferred_gpus)
                 }
                 while True:
-                    devices = [device for device in gpu_snapshot()
-                               if device.get("uuid") in SELECTED_GPUS
-                               and device.get("uuid") not in blocked]
+                    devices = self._placement_devices(blocked)
                     virtual_free = {
                         str(device.get("uuid") or ""):
                             int(device.get("free_mib") or 0)
