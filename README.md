@@ -168,6 +168,8 @@ For a long-running Docker ASR/TTS stack, launch it through the broker and use a 
 ```bash
 docker gpu run \
   --owner asr-tts \
+  --justification 'serve the shared ASR and TTS endpoints' \
+  --expected-duration 14400 \
   --vram-mib 8192 \
   --gpu GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
   --ready-command 'curl -fsS http://127.0.0.1:8080/health/ready' \
@@ -178,11 +180,20 @@ docker gpu run \
 
 For workloads managed by another supervisor, use the explicit lifecycle:
 
-1. `token=$(docker gpu acquire --owner <name> --gpu <uuid> --token-only)` — reserves the specified whole GPU. Add `--gpu` again for each additional device.
+1. `token=$(docker gpu acquire --owner <name> --justification '<purpose>' --expected-duration <seconds> --gpu <uuid> --token-only)` — reserves the specified whole GPU. Add `--gpu` again for each additional device.
 2. Start the external workload with `CUDA_VISIBLE_DEVICES` set to exactly those UUIDs, then wait until its CUDA models are fully loaded.
 3. `docker gpu ready <token>` — marks the external allocation active and stable. Scoped GPUs become eligible for live-free-VRAM Ollama placement; legacy unscoped leases reopen Ollama here.
 4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
+
+Lease registration is intentionally visible and requires a specific owner, a
+meaningful justification, and an expected duration. `docker gpu discover`, the
+HTTP discovery endpoint, and `docker gpu status` publish token-free summaries
+with the owner, purpose, GPU UUIDs, and expected release time. They also emit a
+prominent coordination warning. Agents must inspect those summaries before
+requesting a GPU; conflicting acquisition errors identify the current lessee
+and horizon. Existing pre-policy leases remain visible as legacy entries with
+unknown justification or release time until they end.
 
 Lease heartbeat clients tolerate a bounded negotiator service restart. They
 retry the same persisted token and never acquire a replacement scope or change

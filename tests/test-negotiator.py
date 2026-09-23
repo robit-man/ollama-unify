@@ -168,6 +168,10 @@ def main():
         assert discovery["selected_gpu_count"] == 3
         assert discovery["commands"]["discover"] == "docker gpu discover"
         assert "scope" in discovery["commands"]["manual"]
+        assert discovery["lease_policy"]["required_acquire_fields"] == [
+            "owner", "justification", "expected_duration_seconds",
+        ]
+        assert discovery["warnings"]
         instructions = subprocess.run(
             [helper, "agent-instructions"],
             env=env,
@@ -252,6 +256,10 @@ def main():
                     "acquire",
                     "--owner",
                     "fixture",
+                    "--justification",
+                    "exercise persisted lease lifecycle",
+                    "--expected-duration",
+                    "300",
                     "--vram-mib",
                     "4096",
                     "--ttl",
@@ -273,6 +281,13 @@ def main():
                 assert backend.models == []
             pending_discovery = well_known(proxy_port)
             assert pending_discovery["selected_gpu_count"] == 3
+            assert pending_discovery["active_leases"][0]["owner"] == "fixture"
+            assert pending_discovery["active_leases"][0]["justification"] == (
+                "exercise persisted lease lifecycle"
+            )
+            assert pending_discovery["active_leases"][0]["expected_release_utc"]
+            assert "token" not in json.dumps(pending_discovery["active_leases"])
+            assert "fixture until" in pending_discovery["warnings"][0]
 
             blocked_error = []
             blocked = threading.Thread(
@@ -425,6 +440,10 @@ def main():
                     "run",
                     "--owner",
                     "restart-safe-child",
+                    "--justification",
+                    "exercise restart-safe lease wrapper",
+                    "--expected-duration",
+                    "30",
                     "--vram-mib",
                     "1",
                     "--ttl",
@@ -523,6 +542,10 @@ def main():
                     "acquire",
                     "--owner",
                     "live-scope-fixture",
+                    "--justification",
+                    "exercise live scoped reservation",
+                    "--expected-duration",
+                    "300",
                     "--vram-mib",
                     "4096",
                     "--ttl",
@@ -589,7 +612,9 @@ def main():
                 assert stream.read() == healthy_manifest
 
             failed_acquire = subprocess.run(
-                [helper, "acquire", "--owner", "backend-down", "--vram-mib", "1"],
+                [helper, "acquire", "--owner", "backend-down",
+                 "--justification", "verify backend-down refusal",
+                 "--expected-duration", "60", "--vram-mib", "1"],
                 env=env,
                 capture_output=True,
                 text=True,

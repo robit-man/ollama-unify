@@ -576,6 +576,8 @@ def test_existing_pool_contract(helper, fixture_bin):
             acquired = control(socket_path, {
                 "action": "acquire", "owner": "pool-fixture",
                 "requested_mib": 1024, "ttl": 30,
+                "justification": "exercise pool drain behavior",
+                "expected_duration_seconds": 300,
             })
             assert len(acquired["stopped_lanes"]) == 2
             assert len([event for event in events(event_log)
@@ -668,6 +670,44 @@ def test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin):
         assert empty["reason_code"] == "gpu_constraint_empty"
 
 
+def test_lease_registration_requires_visible_coordination_metadata(
+    helper, fixture_bin,
+):
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        rejected = control_raw(harness.socket_path, {
+            "action": "acquire",
+            "owner": "tau-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+        })
+        assert rejected["ok"] is False
+        assert "justification" in rejected["error"]
+        assert harness.status()["leases"] == []
+
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "tau-fixture",
+            "requested_mib": 1024,
+            "ttl": 30,
+            "gpu_uuids": ["GPU-large-0"],
+            "justification": "run the Tau simulation workload",
+            "expected_duration_seconds": 900,
+        })
+        assert acquired["public_lease"]["owner"] == "tau-fixture"
+        assert acquired["public_lease"]["justification"] == (
+            "run the Tau simulation workload"
+        )
+        assert "token" not in acquired["public_lease"]
+        status = harness.status()
+        assert status["lease_summaries"][0]["expected_release_utc"]
+        assert "tau-fixture until" in status["warnings"][0]
+        control(harness.socket_path, {
+            "action": "release",
+            "token": acquired["lease"]["token"],
+        })
+
+
 def test_lazy_inference_gpu_constraint_ignores_wrong_gpu_lane(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=2) as harness:
         initial_status, initial, _ = harness.capacity(MODEL)
@@ -730,6 +770,8 @@ def test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin
             "owner": "scoped-fixture",
             "requested_mib": 1024,
             "ttl": 30,
+            "justification": "exercise scoped inference continuity",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0", "GPU-large-1"],
         })
         token = acquired["lease"]["token"]
@@ -791,6 +833,8 @@ def test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
             "owner": "scoped-pid-churn-fixture",
             "requested_mib": 4096,
             "ttl": 30,
+            "justification": "exercise scoped PID churn",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0"],
         })
         token = acquired["lease"]["token"]
@@ -827,6 +871,8 @@ def test_scoped_release_tolerates_small_foreign_accounting_drift(
             "owner": "scoped-accounting-drift-fixture",
             "requested_mib": 4096,
             "ttl": 30,
+            "justification": "exercise accounting drift tolerance",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0"],
         })
         token = acquired["lease"]["token"]
@@ -855,6 +901,8 @@ def test_broker_queue_has_hard_ceiling_during_all_gpu_lease(
             "owner": "all-gpu-queue-cap-fixture",
             "requested_mib": 4096,
             "ttl": 30,
+            "justification": "exercise bounded broker queue",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
         })
         token = acquired["lease"]["token"]
@@ -910,6 +958,8 @@ def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
             "owner": "active-shared-fixture",
             "requested_mib": 98304,
             "ttl": 30,
+            "justification": "exercise stable active sharing",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
         })
         token = acquired["lease"]["token"]
@@ -968,6 +1018,8 @@ def test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
             "owner": "fitting-scoped-fixture",
             "requested_mib": 98304,
             "ttl": 30,
+            "justification": "exercise fitting scoped reservation",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
         })
         token = acquired["lease"]["token"]
@@ -1957,6 +2009,8 @@ def test_revoked_lease_with_dead_owner_is_abandoned(helper, fixture_bin):
             "owner": "dead-owner-fixture",
             "requested_mib": 4096,
             "ttl": 1,
+            "justification": "exercise dead owner reclamation",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
         })
         token = acquired["lease"]["token"]
@@ -2006,6 +2060,8 @@ def test_forced_release_reclaims_scope_when_owner_never_frees(
             "owner": "never-frees-fixture",
             "requested_mib": 4096,
             "ttl": 30,
+            "justification": "exercise forced lease release",
+            "expected_duration_seconds": 300,
             "gpu_uuids": ["GPU-large-0"],
         })
         token = acquired["lease"]["token"]
@@ -2073,6 +2129,9 @@ def main():
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
     test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
+    test_lease_registration_requires_visible_coordination_metadata(
+        helper, fixture_bin,
+    )
     test_lazy_inference_gpu_constraint_ignores_wrong_gpu_lane(helper, fixture_bin)
     test_idle_lane_reservations_prevent_future_gpu_overcommit(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
