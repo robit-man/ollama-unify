@@ -1124,6 +1124,7 @@ SAFE_METADATA_PATHS = (
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
+GPU_UUIDS_HEADER = "X-Ollama-Unify-GPU-UUIDs"
 
 
 def canonical_model_tag(model: str) -> str:
@@ -1133,6 +1134,65 @@ def canonical_model_tag(model: str) -> str:
         return ""
     leaf = model.rsplit("/", 1)[-1]
     return model if ":" in leaf else f"{model}:latest"
+
+
+def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None:
+    """Parse a presence-sensitive, ordered hard GPU allowlist."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        values: list[Any] = [] if value.strip().lower() == "none" else value.split(",")
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise PermanentCapacityError(
+            f"{source} must be an array of GPU UUIDs",
+            400,
+            "invalid_gpu_constraint",
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in values:
+        if not isinstance(candidate, str):
+            raise PermanentCapacityError(
+                f"{source} entries must be GPU UUID strings",
+                400,
+                "invalid_gpu_constraint",
+            )
+        gpu_uuid = candidate.strip()
+        if (not gpu_uuid or "," in gpu_uuid
+                or any(ord(character) < 32 or ord(character) == 127
+                       for character in gpu_uuid)):
+            raise PermanentCapacityError(
+                f"{source} contains an invalid GPU UUID",
+                400,
+                "invalid_gpu_constraint",
+            )
+        if gpu_uuid not in seen:
+            seen.add(gpu_uuid)
+            normalized.append(gpu_uuid)
+    if not normalized:
+        raise PermanentCapacityError(
+            "GPU constraint is present but contains no allowed GPU UUIDs",
+            422,
+            "gpu_constraint_empty",
+        )
+    selected = set(SELECTED_GPUS)
+    if not selected:
+        selected = {
+            str(device.get("uuid") or "")
+            for device in gpu_snapshot()
+            if device.get("uuid")
+        }
+    unavailable = [gpu_uuid for gpu_uuid in normalized if gpu_uuid not in selected]
+    if unavailable:
+        raise PermanentCapacityError(
+            "GPU constraint includes UUIDs outside the broker-selected set: "
+            + ", ".join(unavailable),
+            422,
+            "gpu_constraint_unavailable",
+        )
+    return tuple(normalized)
 
 
 class BackendHTTPError(RuntimeError):
@@ -1456,6 +1516,8 @@ def discovery_document() -> dict[str, Any]:
                 "admission_wait_header": "X-Ollama-Unify-Admission-Wait-Ms",
                 "queue_policy_header": "X-Ollama-Unify-Queue-Policy",
                 "queue_policies": ["wait", "yield"],
+                "gpu_uuids_header": GPU_UUIDS_HEADER,
+                "gpu_constraint_semantics": "ordered hard allowlist",
                 "retry_after_json_field": "retry_after_ms",
                 "reason_codes": [
                     "queue_admission_timeout",
@@ -1478,6 +1540,9 @@ def discovery_document() -> dict[str, Any]:
                     "resume_body_forbidden",
                     "completed_response_unavailable",
                     "invalid_admission_header",
+                    "invalid_gpu_constraint",
+                    "gpu_constraint_empty",
+                    "gpu_constraint_unavailable",
                 ],
                 "completed_response_replay": {
                     "schema": "io.ollama-unify.completed-response-cache.v1",
@@ -1506,7 +1571,8 @@ def discovery_document() -> dict[str, Any]:
                 "acquire", "scope", "ready", "prepare", "release", "heartbeat",
             ],
             "request_capacity": (
-                f"POST {CAPACITY_PATH} with JSON {{\"model\":\"TAG\",\"parallel\":N}}"
+                f"POST {CAPACITY_PATH} with JSON "
+                "{\"model\":\"TAG\",\"parallel\":N,\"gpu_uuids\":[\"GPU-...\"]}"
             ),
         },
         "requirements": {
@@ -1763,6 +1829,7 @@ class RetainedRequest:
     body: bytes
     model: str
     fingerprint: str
+    gpu_uuids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1782,6 +1849,7 @@ class QueuedRequest:
     enqueued_at: float
     deadline: float
     connected: Callable[[], bool]
+    gpu_uuids: tuple[str, ...] | None = None
     request_path: str = ""
     retained_request: RetainedRequest | None = None
     queue_ticket: int = 0
@@ -1804,6 +1872,7 @@ class QueuedRequest:
             "request_id": self.request_id,
             "logical_request_id": self.logical_request_id or None,
             "model": self.model,
+            "gpu_uuids": list(self.gpu_uuids) if self.gpu_uuids is not None else None,
             "request_path": self.request_path or None,
             "workload_class": self.workload_class,
             "queue_policy": self.queue_policy,
@@ -2380,7 +2449,12 @@ class Broker:
             result["requests"] = requests
         return result
 
-    def _select_lane_locked(self, model: str, routable: bool) -> Lane | None:
+    def _select_lane_locked(
+        self,
+        model: str,
+        routable: bool,
+        gpu_uuids: tuple[str, ...] | None = None,
+    ) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
         blocked_gpus = self._ollama_blocked_gpus_locked()
@@ -2388,6 +2462,7 @@ class Broker:
             return base if base.in_flight < base.parallel else None
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
+                    and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)
                     and lane.gpu_uuid not in blocked_gpus
                     and not lane.retiring
                     and lane.in_flight < lane.parallel]
@@ -2396,7 +2471,14 @@ class Broker:
             for lane in self.lanes.values()
         )
         if matching:
-            return min(matching, key=lambda lane: (lane.in_flight, lane.created_at))
+            preference_rank = {
+                gpu_uuid: index for index, gpu_uuid in enumerate(gpu_uuids or ())
+            }
+            return min(matching, key=lambda lane: (
+                lane.in_flight,
+                preference_rank.get(lane.gpu_uuid, len(preference_rank)),
+                lane.created_at,
+            ))
         if managed_model_exists:
             return None
         if POOL_ENABLED:
@@ -2694,8 +2776,13 @@ class Broker:
         self._stop_lanes(lanes, reason)
         return [lane.lane_id for lane in lanes]
 
-    def ensure_capacity(self, model: str, parallel: int,
-                        request_path: str = "") -> dict[str, Any]:
+    def ensure_capacity(
+        self,
+        model: str,
+        parallel: int,
+        request_path: str = "",
+        gpu_uuids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
             raise PermanentCapacityError(
@@ -2727,13 +2814,15 @@ class Broker:
                     )
                 self._prune_dead_lanes_locked()
                 existing = [lane for lane in self.lanes.values()
-                            if lane.kind == "managed" and lane.model == model]
+                            if lane.kind == "managed" and lane.model == model
+                            and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 required_mib, capabilities = self._model_profile(model)
                 selected_devices = [
                     device for device in gpu_snapshot()
                     if device.get("uuid") in SELECTED_GPUS
+                    and (gpu_uuids is None or device.get("uuid") in gpu_uuids)
                 ]
                 if selected_devices and required_mib > max(
                     int(device.get("total_mib") or 0)
@@ -2763,7 +2852,10 @@ class Broker:
                     }
                     replaceable = sorted(
                         (lane for lane in managed
-                         if lane.model != model and lane.in_flight == 0
+                         if (lane.model != model
+                             or (gpu_uuids is not None
+                                 and lane.gpu_uuid not in gpu_uuids))
+                         and lane.in_flight == 0
                          and lane.model not in queued_models),
                         key=lambda lane: (lane.last_used, lane.created_at),
                     )
@@ -2794,13 +2886,22 @@ class Broker:
                     )
                 placements: list[str] = []
                 devices: list[dict[str, Any]] = []
-                preferred_gpus = MODEL_GPU_PREFERENCES.get(model, [])
+                preferred_gpus = (
+                    list(gpu_uuids)
+                    if gpu_uuids is not None
+                    else MODEL_GPU_PREFERENCES.get(model, [])
+                )
                 preference_rank = {
                     gpu_uuid: index
                     for index, gpu_uuid in enumerate(preferred_gpus)
                 }
                 while True:
                     devices = self._placement_devices(blocked)
+                    if gpu_uuids is not None:
+                        devices = [
+                            device for device in devices
+                            if device.get("uuid") in gpu_uuids
+                        ]
                     virtual_free = {
                         str(device.get("uuid") or ""):
                             int(device.get("free_mib") or 0)
@@ -2849,7 +2950,9 @@ class Broker:
                             (
                                 lane for lane in self.lanes.values()
                                 if lane.kind == "managed"
-                                and lane.model != model
+                                and (lane.model != model
+                                     or (gpu_uuids is not None
+                                         and lane.gpu_uuid not in gpu_uuids))
                                 and lane.in_flight == 0
                                 and lane.gpu_uuid in device_uuids
                                 and lane.model not in queued_models
@@ -2904,7 +3007,9 @@ class Broker:
                     raise
             with self.cv:
                 lanes = [lane for lane in self._lane_summaries_locked()
-                         if lane["kind"] == "managed" and lane["model"] == model]
+                         if lane["kind"] == "managed" and lane["model"] == model
+                         and (gpu_uuids is None
+                              or lane["gpu_uuid"] in gpu_uuids)]
                 admitted = sum(
                     int(lane["parallel"]) for lane in lanes
                     if lane["state"] == "ready"
@@ -2915,6 +3020,9 @@ class Broker:
                 "requested_model": model,
                 "canonical_model": model,
                 "requested_parallel": parallel,
+                "requested_gpu_uuids": (
+                    list(gpu_uuids) if gpu_uuids is not None else None
+                ),
                 "admitted_parallel": admitted,
                 "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
                 "lanes": lanes,
@@ -2986,7 +3094,8 @@ class Broker:
                     retained_request: RetainedRequest | None = None,
                     resume_request: bool = False,
                     workload_class: str = "unspecified",
-                    queue_policy: str = "wait") -> Admission:
+                    queue_policy: str = "wait",
+                    gpu_uuids: tuple[str, ...] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         enqueued_at = time.monotonic()
@@ -3021,7 +3130,7 @@ class Broker:
                                 logical_request_id=logical_request_id,
                             )
                         self.cv.wait(min(remaining, 0.25))
-                    lane = self._select_lane_locked(model, routable)
+                    lane = self._select_lane_locked(model, routable, gpu_uuids)
                     if lane is not None:
                         lane.in_flight += 1
                         lane.last_used = time.time()
@@ -3080,6 +3189,7 @@ class Broker:
                         waiter.request_fingerprint != request_fingerprint
                         or waiter.model != model
                         or waiter.request_path != request_path
+                        or waiter.gpu_uuids != gpu_uuids
                     ):
                         self.queue_duplicate_total += 1
                         raise PermanentCapacityError(
@@ -3187,6 +3297,7 @@ class Broker:
                     enqueued_at=enqueued_at,
                     deadline=deadline,
                     connected=connected,
+                    gpu_uuids=gpu_uuids,
                     request_path=request_path,
                     retained_request=retained_request,
                     queue_ticket=queue_ticket,
@@ -3261,7 +3372,7 @@ class Broker:
                     item.model == model for item in self.waiters[:waiter_index]
                 )
                 if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True)
+                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
@@ -3307,7 +3418,7 @@ class Broker:
                     continue
                 waiter = self.waiters[0]
                 blocked_gpus = self._ollama_blocked_gpus_locked()
-                selected_gpus = set(SELECTED_GPUS)
+                selected_gpus = set(waiter.gpu_uuids or SELECTED_GPUS)
                 if selected_gpus and selected_gpus.issubset(blocked_gpus):
                     # This state changes only when the lease changes. Repeated
                     # ensure_capacity calls cannot create a lane and previously
@@ -3327,6 +3438,8 @@ class Broker:
                 model = waiter.model
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
+                            and (waiter.gpu_uuids is None
+                                 or lane.gpu_uuid in waiter.gpu_uuids)
                             and not lane.retiring]
                 if any(lane.in_flight < lane.parallel for lane in matching):
                     waiter.phase = "ready"
@@ -3347,7 +3460,12 @@ class Broker:
                 self.reconciling_model = model
                 self.cv.notify_all()
             try:
-                self.ensure_capacity(model, desired_parallel, waiter.request_path)
+                self.ensure_capacity(
+                    model,
+                    desired_parallel,
+                    waiter.request_path,
+                    waiter.gpu_uuids,
+                )
                 with self.cv:
                     self.reconcile_retry_at = 0.0
                     self.reconcile_last_error = ""
@@ -4114,6 +4232,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
         return logical_request_id, workload_class, queue_policy
 
+    def _requested_gpu_uuids(self) -> tuple[str, ...] | None:
+        if GPU_UUIDS_HEADER not in self.headers:
+            return None
+        return parse_gpu_uuid_constraint(
+            self.headers.get(GPU_UUIDS_HEADER, ""),
+            GPU_UUIDS_HEADER,
+        )
+
     def _send_capacity_failure(
         self,
         failure: CapacityError,
@@ -4237,8 +4363,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError(
                         "endpoint must be a supported Ollama inference path"
                     )
+                gpu_uuids = parse_gpu_uuid_constraint(
+                    payload.get("gpu_uuids")
+                    if "gpu_uuids" in payload else None,
+                    "gpu_uuids",
+                )
                 result = self.broker.ensure_capacity(
-                    str(payload.get("model") or ""), parallel, endpoint,
+                    str(payload.get("model") or ""),
+                    parallel,
+                    endpoint,
+                    gpu_uuids,
                 )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
@@ -4276,6 +4410,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         workload_class = "unspecified"
         queue_policy = "wait"
         retained_request = None
+        gpu_uuids = None
         is_resume = False
         try:
             (
@@ -4283,6 +4418,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 workload_class,
                 queue_policy,
             ) = self._requested_admission_controls()
+            gpu_uuids = self._requested_gpu_uuids()
             resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
             if resume_header and resume_header.lower() != "true":
                 raise PermanentCapacityError(
@@ -4323,6 +4459,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 content_type = retained_request.content_type
                 model = retained_request.model
                 fingerprint = retained_request.fingerprint
+                if (
+                    gpu_uuids is not None
+                    and gpu_uuids != retained_request.gpu_uuids
+                ):
+                    raise PermanentCapacityError(
+                        "resume GPU constraint differs from the retained request",
+                        409,
+                        "logical_request_conflict",
+                        logical_request_id=logical_request_id,
+                    )
+                gpu_uuids = retained_request.gpu_uuids
             else:
                 body = clamp_request(self.path, content_type, body)
                 # The routed model is read from the body on path alone, for the
@@ -4348,6 +4495,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     + b"\0"
                     + content_type.lower().encode()
                     + b"\0"
+                    + ",".join(gpu_uuids or ()).encode()
+                    + b"\0"
                     + body
                 ).hexdigest()
                 if logical_request_id and path in INFERENCE_PATHS:
@@ -4364,6 +4513,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         body=body,
                         model=model,
                         fingerprint=fingerprint,
+                        gpu_uuids=gpu_uuids,
                     )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
@@ -4376,6 +4526,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 resume_request=is_resume,
                 workload_class=workload_class,
                 queue_policy=queue_policy,
+                gpu_uuids=gpu_uuids,
             )
         except ClientDisconnected:
             return
@@ -4420,6 +4571,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "x-ollama-unify-resume-request",
                 "x-ollama-unify-workload-class",
                 "x-ollama-unify-queue-policy",
+                "x-ollama-unify-gpu-uuids",
             }
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS
@@ -5013,6 +5165,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 4. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on those GPUs. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
 5. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
 6. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
+7. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker rejects unavailable UUIDs and never falls back outside the allowlist.
 
 Machine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.
 AGENT_INSTRUCTIONS
@@ -5293,6 +5446,8 @@ try:
     protocol = document.get("parallel_pool", {}).get("admission_protocol", {})
     if protocol.get("logical_request_header") != "X-Ollama-Unify-Logical-Request-Id":
         raise ValueError("installed broker lacks the logical admission protocol")
+    if protocol.get("gpu_uuids_header") != "X-Ollama-Unify-GPU-UUIDs":
+        raise ValueError("installed broker lacks hard per-request GPU selection")
     with open(sys.argv[2], "w", encoding="utf-8") as stream:
         json.dump(document, stream, indent=2, sort_keys=True)
         stream.write("\n")

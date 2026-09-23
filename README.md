@@ -204,10 +204,18 @@ Local clients that need concurrent model processes can ask the public broker to 
 ```bash
 curl -fsS http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator/capacity \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5:35b","parallel":3}'
+  -d '{"model":"qwen3.5:35b","parallel":3,"gpu_uuids":["GPU-uuid"]}'
 ```
 
 An embedding client can state its endpoint explicitly when it prewarms a lane by adding `"endpoint":"/api/embed"`. The broker validates this field. It also infers embedding-only and reranking-only warm-up contracts from local model capabilities when the field is absent. Lazy capacity for an ordinary inference request always uses that request's endpoint family. Discovery metadata publishes the reserved private port range so cooperating clients never start a competing Ollama process on a broker lane.
+
+`gpu_uuids` is an optional ordered hard allowlist. When present, the broker
+reuses and creates lanes only on those broker-selected UUIDs; it never falls
+back to another GPU. The first UUID is preferred. Ordinary inference requests
+use the equivalent `X-Ollama-Unify-GPU-UUIDs` comma-separated header, so lazy
+lane creation obeys the same constraint. An empty or unavailable allowlist is
+rejected instead of weakening the request. Omitting the field/header retains
+automatic placement.
 
 The broker looks up the installed model size and capabilities through `/api/tags`, adds configurable model and VRAM margins, checks each selected GPU independently against live free memory, reserves host headroom, and admits the request only if every missing lane fits. Each accepted lane is a broker-owned `ollama serve` process pinned to one selected GPU and a private loopback port. Placement spreads lanes across available GPUs first, then safely co-locates additional processes on the same GPU only while the conservative live-VRAM budget still fits. A lane's VRAM promise remains committed for the lifetime of the lane even when Ollama temporarily unloads its idle model, so the same future capacity cannot be admitted to another lane and overcommitted when both reload. The broker loads the requested model through its native completion, embedding, or reranking endpoint and verifies residency before it marks the lane ready. The response exposes only safe lane IDs/GPU assignments and the public API; clients continue sending all inference to port `11434` and cannot select or bypass a private lane. If a client skips the capacity call, its first ordinary inference request lazily starts one fitting lane and concurrent requests expand the pool only while additional lane reservations still fit. Model tags that omit `:latest` share the same lane identity; separately named aliases remain distinct.
 

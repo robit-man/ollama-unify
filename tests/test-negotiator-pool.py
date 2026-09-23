@@ -197,6 +197,7 @@ def chat(
     workload_class="foreground",
     queue_policy="wait",
     mock_body_size=None,
+    gpu_uuids=None,
 ):
     headers = {
         "X-Ollama-Unify-Workload-Class": workload_class,
@@ -206,6 +207,10 @@ def chat(
         headers["X-Ollama-Unify-Logical-Request-Id"] = logical_request_id
     if admission_wait_ms is not None:
         headers["X-Ollama-Unify-Admission-Wait-Ms"] = str(admission_wait_ms)
+    if gpu_uuids is not None:
+        headers["X-Ollama-Unify-GPU-UUIDs"] = (
+            ",".join(gpu_uuids) if gpu_uuids else "none"
+        )
     payload = {
         "model": model,
         "stream": False,
@@ -429,10 +434,12 @@ class PoolHarness:
     def status(self):
         return control(self.socket_path, {"action": "status"})
 
-    def capacity(self, model, parallel=1, endpoint=None):
+    def capacity(self, model, parallel=1, endpoint=None, gpu_uuids=None):
         payload = {"model": model, "parallel": parallel}
         if endpoint is not None:
             payload["endpoint"] = endpoint
+        if gpu_uuids is not None:
+            payload["gpu_uuids"] = gpu_uuids
         return http_json(
             self.proxy_port, "POST",
             "/.well-known/ollama-unify-gpu-negotiator/capacity",
@@ -492,6 +499,12 @@ def test_existing_pool_contract(helper, fixture_bin):
             admission_protocol = discovery["parallel_pool"]["admission_protocol"]
             assert admission_protocol["logical_request_header"] == (
                 "X-Ollama-Unify-Logical-Request-Id"
+            )
+            assert admission_protocol["gpu_uuids_header"] == (
+                "X-Ollama-Unify-GPU-UUIDs"
+            )
+            assert admission_protocol["gpu_constraint_semantics"] == (
+                "ordered hard allowlist"
             )
             assert admission_protocol["queue_policies"] == ["wait", "yield"]
             assert admission_protocol["retry_after_json_field"] == "retry_after_ms"
@@ -627,6 +640,53 @@ def test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
         assert discovery["parallel_pool"]["model_gpu_preferences"] == {
             MODEL: ["GPU-large-1"],
         }
+
+
+def test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
+        initial_status, initial, _ = harness.capacity(MODEL)
+        assert initial_status == 200, initial
+        assert initial["lanes"][0]["gpu_uuid"] != "GPU-large-1"
+
+        status, capacity, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-large-1"]
+        )
+        assert status == 200, capacity
+        assert capacity["requested_gpu_uuids"] == ["GPU-large-1"]
+        assert [lane["gpu_uuid"] for lane in capacity["lanes"]] == [
+            "GPU-large-1"
+        ]
+
+        invalid_status, invalid, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-display"]
+        )
+        assert invalid_status == 422, invalid
+        assert invalid["reason_code"] == "gpu_constraint_unavailable"
+
+        empty_status, empty, _ = harness.capacity(MODEL, gpu_uuids=[])
+        assert empty_status == 422, empty
+        assert empty["reason_code"] == "gpu_constraint_empty"
+
+
+def test_lazy_inference_gpu_constraint_ignores_wrong_gpu_lane(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=2) as harness:
+        initial_status, initial, _ = harness.capacity(MODEL)
+        assert initial_status == 200, initial
+        wrong_lane = initial["lanes"][0]
+        assert wrong_lane["gpu_uuid"] != "GPU-large-1"
+
+        status, payload, headers = chat(
+            harness.proxy_port,
+            MODEL,
+            "hard-gpu-lazy",
+            gpu_uuids=["GPU-large-1"],
+        )
+        assert status == 200, payload
+        selected_lane = next(
+            lane for lane in managed_lanes(harness.status())
+            if lane["id"] == headers["X-Ollama-Unify-Lane"]
+        )
+        assert selected_lane["gpu_uuid"] == "GPU-large-1"
 
 
 def test_idle_lane_reservations_prevent_future_gpu_overcommit(helper, fixture_bin):
@@ -2012,6 +2072,8 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
+    test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
+    test_lazy_inference_gpu_constraint_ignores_wrong_gpu_lane(helper, fixture_bin)
     test_idle_lane_reservations_prevent_future_gpu_overcommit(helper, fixture_bin)
     test_scoped_pending_lease_preserves_unreserved_inference(helper, fixture_bin)
     test_scoped_release_tolerates_baseline_pid_churn_without_global_drain(
