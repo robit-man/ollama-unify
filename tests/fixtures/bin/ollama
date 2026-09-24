@@ -24,6 +24,7 @@ host, port = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434").rsplit(":", 1)
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 gpu_usage_dir = os.environ.get("MOCK_OLLAMA_GPU_USAGE_DIR", "")
 gpu_usage_mib = int(os.environ.get("MOCK_OLLAMA_VRAM_MIB", "2048"))
+context_length = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "0") or "0")
 gpu_usage_path = (
     os.path.join(gpu_usage_dir, f"{os.getpid()}.csv") if gpu_usage_dir else ""
 )
@@ -83,7 +84,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         model = str(payload.get("model") or "")
         emit("request", host=f"{host}:{port}", gpu=gpu, path=self.path,
-             model=model, request_id=payload.get("mock_request_id"))
+             model=model, request_id=payload.get("mock_request_id"),
+             options=payload.get("options") or {})
         if self.path == "/api/generate" and model.startswith("fixture-embed:"):
             self.send_json({"error": f"{model!r} does not support generate"}, 400)
             return
@@ -137,7 +139,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.models = []
                 set_gpu_usage(False)
             elif model:
-                self.server.models = [{"name": model, "size_vram": 1024}]
+                self.server.models = [{
+                    "name": model,
+                    "size_vram": 1024,
+                    "context_length": context_length,
+                }]
                 set_gpu_usage(True)
         response_payload = {
             "done": True, "model": model, "gpu": gpu, "pid": os.getpid(),
@@ -165,7 +171,8 @@ def stop(_signum, _frame):
 
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
-emit("start", host=f"{host}:{port}", gpu=gpu, ppid=os.getppid())
+emit("start", host=f"{host}:{port}", gpu=gpu, ppid=os.getppid(),
+     context_length=context_length)
 try:
     server.serve_forever()
 finally:

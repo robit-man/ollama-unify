@@ -925,6 +925,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import select
 import signal
@@ -960,6 +961,44 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def model_context_profiles(raw: str) -> dict[str, dict[str, object]]:
+    """Parse operator-scoped fixed context and memory admission profiles."""
+    profiles = json.loads(raw or "{}")
+    if not isinstance(profiles, dict):
+        raise ValueError("model context profiles must be a JSON object")
+    for model, profile in profiles.items():
+        if not isinstance(model, str) or ":" not in model or not isinstance(profile, dict):
+            raise ValueError("model context profile requires an exact tagged model")
+        if set(profile) != {"context_length", "extra_vram_mib", "model_digest"}:
+            raise ValueError("model context profile has unexpected fields")
+        context = profile["context_length"]
+        reserve = profile["extra_vram_mib"]
+        digest = profile["model_digest"]
+        if type(context) is not int or not 8192 <= context <= 262144:
+            raise ValueError("model context profile length is outside supported bounds")
+        if type(reserve) is not int or reserve < math.ceil(context / 16):
+            raise ValueError("model context profile memory allowance is insufficient")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("model context profile requires an exact SHA-256 digest")
+    return profiles
+
+
+def verified_model_context(model: str, resident: list[dict]) -> int | None:
+    """Require runtime evidence of a profiled lane's admitted per-slot context."""
+    profile = MODEL_CONTEXT_PROFILES.get(model)
+    if profile is None:
+        return None
+    resolved = next((item for item in resident if isinstance(item, dict)
+                     and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model), {})
+    actual = resolved.get("context_length")
+    if type(actual) is not int or actual < profile["context_length"]:
+        raise PermanentCapacityError(
+            "managed model did not resolve the admitted per-slot context", 422,
+            "model_context_runtime_mismatch",
+        )
+    return actual
 
 
 def env_owner_gpu_scopes(name: str) -> dict[str, list[str]]:
@@ -1049,6 +1088,9 @@ HEARTBEAT_RECONNECT_GRACE = env_float(
     "OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE", 90.0
 )
 MAX_CONTEXT = env_int("OLLAMA_UNIFY_MAX_CONTEXT", 0)
+MODEL_CONTEXT_PROFILES = model_context_profiles(
+    os.environ.get("OLLAMA_UNIFY_MODEL_CONTEXT_PROFILES", "{}")
+)
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
 ANON_SETTLE = env_float("OLLAMA_UNIFY_ANON_SETTLE", 2.0)
 ANON_MAX_DRAIN = env_float("OLLAMA_UNIFY_ANON_MAX_DRAIN", 15.0)
@@ -1232,7 +1274,27 @@ def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
     if isinstance(options, dict):
         options["num_gpu"] = -1
         options.pop("main_gpu", None)
-        if MAX_CONTEXT > 0:
+        profile = MODEL_CONTEXT_PROFILES.get(
+            canonical_model_tag(str(payload.get("model") or ""))
+        )
+        if profile is not None:
+            if not POOL_ENABLED:
+                raise PermanentCapacityError(
+                    "model-specific context requires managed GPU admission", 503,
+                    "model_context_managed_pool_required",
+                )
+            requested = options.get("num_ctx")
+            if requested is not None and (
+                type(requested) is not int or requested > profile["context_length"]
+            ):
+                raise PermanentCapacityError(
+                    "request exceeds the model-specific context policy", 400,
+                    "model_context_policy_exceeded",
+                )
+            # The profiled lane always starts at the admitted context so a
+            # smaller request cannot create a later, unaccounted VRAM growth.
+            options["num_ctx"] = profile["context_length"]
+        elif MAX_CONTEXT > 0:
             requested = options.get("num_ctx")
             if isinstance(requested, (int, float)) and requested > MAX_CONTEXT:
                 options["num_ctx"] = MAX_CONTEXT
@@ -1486,6 +1548,11 @@ def discovery_document() -> dict[str, Any]:
         "warnings": [lease_visibility_warning([])],
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
+        "context_policy": {
+            "default_max_context": MAX_CONTEXT,
+            "model_profiles": MODEL_CONTEXT_PROFILES,
+            "profile_context_is_fixed": True,
+        },
         "parallel_pool": {
             "enabled": POOL_ENABLED,
             "model_gpu_preferences": MODEL_GPU_PREFERENCES,
@@ -1783,6 +1850,7 @@ class Lane:
     process: Any = None
     in_flight: int = 0
     retiring: bool = False
+    resolved_context_length: int | None = None
 
     def public_summary(self) -> dict[str, Any]:
         alive = self.kind == "system" or (
@@ -1799,6 +1867,8 @@ class Lane:
             "parallel": self.parallel,
             "in_flight": self.in_flight,
             "reserved_mib": self.reserved_mib,
+            "context_profile": MODEL_CONTEXT_PROFILES.get(self.model),
+            "resolved_context_length": self.resolved_context_length,
         }
 
 
@@ -2630,12 +2700,30 @@ class Broker:
                 "model_metadata_invalid",
             )
         model_mib = math.ceil(size_bytes / (1024 * 1024))
+        profile = MODEL_CONTEXT_PROFILES.get(model)
+        extra_context_mib = 0
+        if profile is not None:
+            if match.get("digest") != profile["model_digest"]:
+                raise PermanentCapacityError(
+                    "model context profile digest differs from installed artifact", 422,
+                    "model_context_identity_mismatch",
+                )
+            metadata = backend_json("POST", "/api/show", {"model": model}, timeout=10.0)
+            info = metadata.get("model_info", {})
+            architecture = info.get("general.architecture", "")
+            model_limit = info.get(f"{architecture}.context_length")
+            if type(model_limit) is not int or model_limit < profile["context_length"]:
+                raise PermanentCapacityError(
+                    "model context profile exceeds verified model context metadata", 422,
+                    "model_context_limit_unverified",
+                )
+            extra_context_mib = profile["extra_vram_mib"] * POOL_INSTANCE_PARALLEL
         capabilities = match.get("capabilities")
         if not isinstance(capabilities, list):
             capabilities = []
         return (
             math.ceil(model_mib * POOL_MODEL_OVERHEAD_PERCENT / 100)
-            + POOL_VRAM_RESERVE_MIB,
+            + POOL_VRAM_RESERVE_MIB + extra_context_mib,
             {str(capability).lower() for capability in capabilities},
         )
 
@@ -2708,12 +2796,15 @@ class Broker:
                 "documents": ["warmup"],
                 "keep_alive": keep_alive,
             }
+        options = {"num_predict": 0}
+        if model in MODEL_CONTEXT_PROFILES:
+            options["num_ctx"] = MODEL_CONTEXT_PROFILES[model]["context_length"]
         return "/api/generate", {
             "model": model,
             "prompt": "",
             "stream": False,
             "keep_alive": keep_alive,
-            "options": {"num_predict": 0},
+            "options": options,
         }
 
     def _available_port_locked(self) -> int:
@@ -2790,8 +2881,11 @@ class Broker:
             "GGML_CUDA_NO_PINNED": "1",
             "LLAMA_ARG_FIT": "on",
         })
-        if MAX_CONTEXT > 0:
-            env["OLLAMA_CONTEXT_LENGTH"] = str(MAX_CONTEXT)
+        lane_context = MODEL_CONTEXT_PROFILES.get(
+            model, {}
+        ).get("context_length", MAX_CONTEXT)
+        if lane_context > 0:
+            env["OLLAMA_CONTEXT_LENGTH"] = str(lane_context)
         if OLLAMA_MODELS:
             env["OLLAMA_MODELS"] = OLLAMA_MODELS
         process = subprocess.Popen(
@@ -2840,6 +2934,7 @@ class Broker:
                 raise CapacityError(
                     f"managed Ollama lane did not make model {model!r} resident"
                 )
+            actual_context = verified_model_context(model, resident)
         except Exception as exc:
             self._terminate_process(process)
             if (isinstance(exc, BackendHTTPError)
@@ -2854,6 +2949,7 @@ class Broker:
             lane_id, "managed", "127.0.0.1", port, gpu_uuid, model,
             POOL_INSTANCE_PARALLEL, required_mib, now, now, process,
         )
+        lane.resolved_context_length = actual_context
         with self.cv:
             self.lanes[lane_id] = lane
             self.cv.notify_all()

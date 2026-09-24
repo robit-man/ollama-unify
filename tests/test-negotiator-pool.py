@@ -19,6 +19,7 @@ OTHER_MODEL = "fixture-other:latest"
 EMBED_MODEL = "fixture-embed:latest"
 REJECT_MODEL = "fixture-reject:latest"
 RETRY_MODEL = "fixture-retry:latest"
+MODEL_DIGEST = "a" * 64
 
 
 class Backend(http.server.ThreadingHTTPServer):
@@ -70,6 +71,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         payload = json.loads(self.rfile.read(length) or b"{}")
+        if self.path == "/api/show":
+            self.send_json({
+                "model_info": {
+                    "general.architecture": "fixture",
+                    "fixture.context_length": 262144,
+                },
+            })
+            return
         with self.server.lock:
             if payload.get("keep_alive") == 0:
                 self.server.models = []
@@ -332,7 +341,7 @@ class PoolHarness:
                  completed_max_body_bytes=1024 * 1024,
                  completed_max_total_bytes=4 * 1024 * 1024,
                  pending_timeout=300.0, revoke_timeout=300.0,
-                 model_gpu_preferences=None):
+                 model_gpu_preferences=None, model_context_profiles=None):
         self.helper = helper
         self.fixture_bin = fixture_bin
         self.max_servers = max_servers
@@ -348,6 +357,7 @@ class PoolHarness:
         self.pending_timeout = pending_timeout
         self.revoke_timeout = revoke_timeout
         self.model_gpu_preferences = model_gpu_preferences
+        self.model_context_profiles = model_context_profiles
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -379,6 +389,9 @@ class PoolHarness:
             "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
             "OLLAMA_UNIFY_MODEL_GPU_PREFERENCES": json.dumps(
                 self.model_gpu_preferences or {}
+            ),
+            "OLLAMA_UNIFY_MODEL_CONTEXT_PROFILES": json.dumps(
+                self.model_context_profiles or {}
             ),
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
@@ -642,6 +655,99 @@ def test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
         assert discovery["parallel_pool"]["model_gpu_preferences"] == {
             MODEL: ["GPU-large-1"],
         }
+
+
+def test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin):
+    profile = {
+        "context_length": 131072,
+        "extra_vram_mib": 8192,
+        "model_digest": MODEL_DIGEST,
+    }
+    tag = {
+        "name": MODEL,
+        "model": MODEL,
+        "digest": MODEL_DIGEST,
+        "size": 1024**3,
+        "capabilities": ["completion"],
+    }
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        tags=[tag],
+        model_context_profiles={MODEL: profile},
+    ) as harness:
+        status, discovery, _ = http_json(
+            harness.proxy_port,
+            "GET",
+            "/.well-known/ollama-unify-gpu-negotiator",
+        )
+        assert status == 200, discovery
+        assert discovery["context_policy"] == {
+            "default_max_context": 0,
+            "model_profiles": {MODEL: profile},
+            "profile_context_is_fixed": True,
+        }
+
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        assert capacity["lanes"][0]["context_profile"] == profile
+        assert capacity["lanes"][0]["resolved_context_length"] == 131072
+        assert capacity["lanes"][0]["reserved_mib"] == 1024 + 1024 + 8192
+        warm = next(
+            event for event in events(harness.event_log)
+            if event["kind"] == "request"
+            and event["model"] == MODEL
+            and event["request_id"] is None
+        )
+        assert warm["options"]["num_ctx"] == 131072
+        started = next(
+            event for event in events(harness.event_log)
+            if event["kind"] == "start"
+        )
+        assert started["context_length"] == 131072
+
+        status, _, _ = http_json(
+            harness.proxy_port,
+            "POST",
+            "/api/chat",
+            {
+                "model": MODEL,
+                "stream": False,
+                "mock_request_id": "profiled-request",
+                "options": {"num_ctx": 8192},
+            },
+        )
+        assert status == 200
+        profiled = next(
+            event for event in request_events(harness.event_log)
+            if event["request_id"] == "profiled-request"
+        )
+        assert profiled["options"]["num_ctx"] == 131072
+
+        status, rejected, _ = http_json(
+            harness.proxy_port,
+            "POST",
+            "/api/chat",
+            {
+                "model": MODEL,
+                "stream": False,
+                "mock_request_id": "oversized-profiled-request",
+                "options": {"num_ctx": 131073},
+            },
+        )
+        assert status == 400, rejected
+        assert rejected["reason_code"] == "model_context_policy_exceeded"
+
+    wrong_tag = dict(tag, digest="b" * 64)
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        tags=[wrong_tag],
+        model_context_profiles={MODEL: profile},
+    ) as harness:
+        status, rejected, _ = harness.capacity(MODEL)
+        assert status == 422, rejected
+        assert rejected["reason_code"] == "model_context_identity_mismatch"
 
 
 def test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin):
@@ -2128,6 +2234,7 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
+    test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin)
     test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
     test_lease_registration_requires_visible_coordination_metadata(
         helper, fixture_bin,
