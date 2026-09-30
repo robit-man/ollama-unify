@@ -1062,31 +1062,34 @@ def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
         acquired = control(harness.socket_path, {
             "action": "acquire",
             "owner": "active-shared-fixture",
-            "requested_mib": 98304,
+            "requested_mib": 32768,
             "ttl": 30,
             "justification": "exercise stable active sharing",
             "expected_duration_seconds": 300,
-            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+            "gpu_uuids": ["GPU-large-0"],
         })
         token = acquired["lease"]["token"]
 
-        pending_status, pending_payload, _ = harness.capacity(MODEL)
+        pending_status, pending_payload, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-large-0"]
+        )
         assert pending_status == 503, pending_payload
         assert "free=[]" in pending_payload["error"]
 
         ready = control(harness.socket_path, {"action": "ready", "token": token})
         assert ready["lease"]["state"] == "active"
 
-        active_status, active_capacity, _ = harness.capacity(MODEL)
+        active_status, active_capacity, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-large-0"]
+        )
         assert active_status == 200, active_capacity
         assert active_capacity["admitted_parallel"] == 1
         assert len(active_capacity["lanes"]) == 1
-        assert active_capacity["lanes"][0]["gpu_uuid"] in {
-            "GPU-large-0", "GPU-large-1", "GPU-large-2",
-        }
+        assert active_capacity["lanes"][0]["gpu_uuid"] == "GPU-large-0"
 
         response = chat(
-            harness.proxy_port, MODEL, "during-active-scoped-lease", timeout=10
+            harness.proxy_port, MODEL, "during-active-scoped-lease", timeout=10,
+            gpu_uuids=["GPU-large-0"],
         )
         assert response[0] == 200, response[1]
         assert response[2]["X-Ollama-Unify-Lane"].startswith("lane-")
@@ -1114,6 +1117,7 @@ def test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
         initial_status, initial_capacity, _ = harness.capacity(MODEL)
         assert initial_status == 200, initial_capacity
         lane_id = initial_capacity["lanes"][0]["id"]
+        lane_gpu = initial_capacity["lanes"][0]["gpu_uuid"]
         starts_before = len([
             event for event in events(harness.event_log)
             if event["kind"] == "start"
@@ -1122,11 +1126,11 @@ def test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
         acquired = control(harness.socket_path, {
             "action": "acquire",
             "owner": "fitting-scoped-fixture",
-            "requested_mib": 98304,
+            "requested_mib": 32768,
             "ttl": 30,
             "justification": "exercise fitting scoped reservation",
             "expected_duration_seconds": 300,
-            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+            "gpu_uuids": [lane_gpu],
         })
         token = acquired["lease"]["token"]
         assert acquired["stopped_lanes"] == []
@@ -1148,6 +1152,89 @@ def test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
             harness.socket_path, {"action": "release", "token": token}
         )
         assert released["released"] == token
+
+
+def test_multi_gpu_lease_is_exclusive_for_its_lifetime(helper, fixture_bin):
+    # Regression for a fatal NVLink Xid 74 host lockup: a tensor-parallel
+    # owner held GPU0+GPU2 while the broker reclaimed and reloaded Ollama
+    # lanes on GPU2 during live peer-to-peer traffic.
+    scope = ["GPU-large-0", "GPU-large-2"]
+    with PoolHarness(
+        helper, fixture_bin, max_servers=4, tags=[MODEL, OTHER_MODEL],
+    ) as harness:
+        placed = {}
+        for gpu_uuid in ["GPU-large-0", "GPU-large-1", "GPU-large-2"]:
+            status, capacity, _ = harness.capacity(
+                MODEL if gpu_uuid != "GPU-large-1" else OTHER_MODEL,
+                gpu_uuids=[gpu_uuid],
+            )
+            assert status == 200, capacity
+            placed[gpu_uuid] = {
+                lane["id"] for lane in capacity["lanes"]
+                if lane["gpu_uuid"] == gpu_uuid
+            }
+
+        acquired = control(harness.socket_path, {
+            "action": "acquire",
+            "owner": "tensor-parallel-fixture",
+            "requested_mib": 98304,
+            "ttl": 30,
+            "justification": "exercise exclusive multi-GPU peer scope",
+            "expected_duration_seconds": 300,
+            "gpu_uuids": scope,
+        })
+        token = acquired["lease"]["token"]
+        assert set(acquired["stopped_lanes"]) == (
+            placed["GPU-large-0"] | placed["GPU-large-2"]
+        )
+        surviving = managed_lanes(harness.status())
+        assert {lane["gpu_uuid"] for lane in surviving} == {"GPU-large-1"}
+
+        ready = control(harness.socket_path, {"action": "ready", "token": token})
+        assert ready["lease"]["state"] == "active"
+        lifecycle_at_ready = len(events(harness.event_log))
+
+        for gpu_uuid in scope:
+            status, payload, _ = harness.capacity(MODEL, gpu_uuids=[gpu_uuid])
+            assert status == 503, payload
+            assert "free=[]" in payload["error"]
+            status, payload, _ = chat(
+                harness.proxy_port, MODEL, f"blocked-{gpu_uuid}", timeout=10,
+                gpu_uuids=[gpu_uuid],
+            )
+            assert status == 503, payload
+
+        # Unconstrained demand for a model with no lane must be placed off
+        # the scope, never by reclaiming or loading on the peer GPUs.
+        status, payload, headers = chat(
+            harness.proxy_port, MODEL, "unconstrained-during-peer-lease",
+            timeout=10,
+        )
+        assert status == 200, payload
+        served = next(
+            lane for lane in managed_lanes(harness.status())
+            if lane["id"] == headers["X-Ollama-Unify-Lane"]
+        )
+        assert served["gpu_uuid"] == "GPU-large-1"
+        assert not [
+            event for event in events(harness.event_log)[lifecycle_at_ready:]
+            if event["kind"] in ("start", "stop")
+            and event.get("gpu") in scope
+        ]
+        assert not [
+            lane for lane in managed_lanes(harness.status())
+            if lane["gpu_uuid"] in scope
+        ]
+
+        released = control(
+            harness.socket_path, {"action": "release", "token": token}
+        )
+        assert released["released"] == token
+        status, capacity, _ = harness.capacity(MODEL, gpu_uuids=["GPU-large-2"])
+        assert status == 200, capacity
+        assert [lane["gpu_uuid"] for lane in capacity["lanes"]] == [
+            "GPU-large-2"
+        ]
 
 
 def capacity_when_ready(harness, model, parallel=1):
@@ -2255,6 +2342,7 @@ def main():
     test_scoped_acquire_preserves_managed_lanes_when_allocation_fits(
         helper, fixture_bin,
     )
+    test_multi_gpu_lease_is_exclusive_for_its_lifetime(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
@@ -2294,7 +2382,8 @@ def main():
         "stable watcher, aliases, replacement, per-model FIFO, warm-lane bypass, "
         "resumable logical admission, completed-response replay, cancellation, "
         "terminal admission failures, controlled-load admission and replay bounds, "
-        "dead-owner lease reclamation, content-type-independent routing)"
+        "dead-owner lease reclamation, exclusive multi-GPU leases, "
+        "content-type-independent routing)"
     )
 
 
