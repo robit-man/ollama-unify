@@ -43,9 +43,24 @@ agent_instructions=$(
 [[ "$agent_instructions" == *'docker gpu discover'* ]] \
   || { printf 'global agent instructions lack Docker discovery command\n' >&2; exit 1; }
 
+(
+  # shellcheck disable=SC1091
+  source "$repo_dir/ollama-unify.sh"
+  render_gpu_tray_indicator
+) > "$test_tmp/ollama-unify-tray"
+tray_unit=$(
+  # shellcheck disable=SC1091
+  source "$repo_dir/ollama-unify.sh"
+  render_gpu_tray_user_unit
+)
+[[ "$tray_unit" == *'ExecStart=/usr/local/libexec/ollama-unify-tray'* ]] \
+  || { printf 'tray user unit does not launch the indicator\n' >&2; exit 1; }
+
 python3 -m py_compile "$test_tmp/ollama-unify-gpu-negotiator"
+python3 -m py_compile "$test_tmp/ollama-unify-tray"
+python3 "$repo_dir/tests/test-tray.py" "$test_tmp/ollama-unify-tray"
 python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
-  "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/fixtures/bin/ollama"
+  "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/test-tray.py" "$repo_dir/tests/fixtures/bin/ollama"
 "$test_tmp/ollama-unify-gpu-negotiator" self-test
 python3 "$repo_dir/tests/test-negotiator.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin" \

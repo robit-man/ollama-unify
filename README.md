@@ -249,6 +249,18 @@ A pending lease transition also has an absolute `OLLAMA_UNIFY_PENDING_TIMEOUT` d
 
 The same discovery document is installed at `/usr/local/share/ollama-unify/gpu-negotiator.json` and served at `/.well-known/ollama-unify-gpu-negotiator` on the public Ollama address. Human-readable cross-agent instructions are installed at `/usr/local/share/ollama-unify/AGENTS.md`. If the invoking account already has `~/.codex`, the installer maintains a marked block in `~/.codex/AGENTS.md`; set `OLLAMA_SAFE_INSTALL_AGENT_DISCOVERY=0` to opt out without disabling Docker or machine-readable discovery.
 
+### Tray indicator
+
+On desktop hosts the installer adds a system tray indicator (`/usr/local/libexec/ollama-unify-tray`, GTK with Ayatana AppIndicator) that shows who is using the broker. Each GPU, lease, and broker-owned Ollama lane gets a submenu:
+
+- **GPUs** — every CUDA device the broker reports, whatever its size or count, with used and free VRAM, PCI bus, lease holder, Ollama lanes, and other CUDA processes labelled by their systemd unit or container.
+- **Leases** — owner, state, GPUs (multi-GPU scopes are marked exclusive), requested VRAM, justification, age, expected release, and heartbeat. Actions follow the lease's state: *Mark ready*, *Prepare for resize*, *Renew heartbeat*, *Remove GPU n from lease* (one entry per GPU in a multi-GPU scope), *Revoke lease*, *Release lease*, and *Force release*.
+- **Ollama lanes** — model, GPU, in-flight requests, and reserved VRAM, with *Stop lane* (idle lanes only) and *Force stop lane*.
+
+Destructive actions ask for confirmation, and failures open a dialog that shows the broker's error. Release and prepare wait as long as the broker's configured drain, unload, and settle deadlines allow. The icon switches to a warning when a lease is pending, revoking, or overdue, when the broker is draining, or when the Ollama backend is down.
+
+The indicator talks to the control socket, so only members of the broker's access group can use it. That group already has full lease control through the socket. The socket also accepts `revoke` (by token) and `stop_lane` (by lane id, `force` to interrupt in-flight requests). The user unit `ollama-unify-tray.service` is enabled globally for `graphical-session.target`, and the broker unit's `ExecStartPost` starts it in every active desktop session of an access-group member, so the indicator comes up with the broker. Choosing *Quit indicator* stops it until the next login or broker start.
+
 ### Surviving Ollama upgrades
 
 The official Ollama installer rewrites `/etc/systemd/system/ollama.service` and restarts the daemon. The unit it writes carries no `OLLAMA_HOST`, so the pinned loopback backend exists only in the late-priority ollama-unify drop-in. If that drop-in is cleared or drifts, Ollama falls back to its built-in `0.0.0.0:11434` and collides head-on with the negotiator that already owns that address — whichever process loses the bind race dies.
