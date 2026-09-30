@@ -922,11 +922,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import ipaddress
 import http.server
 import json
 import logging
 import math
 import os
+import pwd
 import re
 import secrets
 import select
@@ -937,7 +939,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1743,6 +1745,225 @@ def wait_for_foreign_settle(
         )
 
 
+CLIENT_HEADER = "X-Ollama-Unify-Client"
+CLIENT_HISTORY_LIMIT = 256
+LANE_CLIENT_LIMIT = 8
+DOCKER_SOCKET = "/var/run/docker.sock"
+DOCKER_CACHE_SECONDS = 30.0
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def clean_client_text(value: Any, limit: int = 128) -> str:
+    text = "".join(ch for ch in str(value or "") if ch.isprintable()).strip()
+    return text[:limit]
+
+
+def parse_socket_owner(output: str) -> dict[str, Any] | None:
+    """Parse one `ss -tne` line into the owning uid, inode, and cgroup."""
+    for line in output.splitlines():
+        uid = re.search(r"\buid:(\d+)", line)
+        inode = re.search(r"\bino:(\d+)", line)
+        if not uid:
+            continue
+        cgroup = re.search(r"\bcgroup:(\S+)", line)
+        return {
+            "uid": int(uid.group(1)),
+            "inode": int(inode.group(1)) if inode else 0,
+            "cgroup": cgroup.group(1) if cgroup else "",
+        }
+    return None
+
+
+def socket_owner(peer: tuple[str, int], local: tuple[str, int]
+                 ) -> dict[str, Any] | None:
+    """Find the host process side of a proxy connection without privileges.
+
+    Socket diagnostics report the uid and cgroup of any socket in this
+    network namespace. Clients in another namespace (bridge-network
+    containers, remote hosts) are not found here.
+    """
+    def endpoint(host: str, port: int) -> str:
+        return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    try:
+        output = subprocess.run([
+            "ss", "-tneH", "state", "established",
+            "src", endpoint(*peer), "dst", endpoint(*local),
+        ], capture_output=True, text=True, timeout=2, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_socket_owner(output)
+
+
+def cgroup_unit(cgroup: str) -> tuple[str, str]:
+    """Return the systemd unit and any Docker container id for a cgroup."""
+    for part in reversed([part for part in cgroup.split("/") if part]):
+        if part.startswith("docker-") and part.endswith(".scope"):
+            return part, part[len("docker-"):-len(".scope")]
+        if part.endswith((".service", ".scope")):
+            return part, ""
+    return "", ""
+
+
+def process_name(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as stream:
+            return stream.read().strip()
+    except OSError:
+        return ""
+
+
+def socket_process(cgroup: str, inode: int) -> tuple[int | None, list[int]]:
+    """Return the pid holding a socket inode, else the cgroup's pids.
+
+    A socket's own process is found by its descriptors, which are readable
+    for this broker's own user; other users' processes are narrowed to
+    their cgroup members instead.
+    """
+    try:
+        with open(f"{CGROUP_ROOT}{cgroup}/cgroup.procs", encoding="utf-8") as stream:
+            pids = [int(value) for value in stream.read().split()]
+    except (OSError, ValueError):
+        return None, []
+    wanted = f"socket:[{inode}]"
+    for pid in pids:
+        try:
+            descriptors = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                if os.readlink(f"/proc/{pid}/fd/{descriptor}") == wanted:
+                    return pid, pids
+            except OSError:
+                continue
+    return (pids[0] if len(pids) == 1 else None), pids
+
+
+class DockerDirectory:
+    """Map container IPs and ids to names through the Docker API."""
+
+    def __init__(self, socket_path: str = DOCKER_SOCKET) -> None:
+        self.socket_path = socket_path
+        self.lock = threading.Lock()
+        self.loaded_at = 0.0
+        self.by_ip: dict[str, str] = {}
+        self.by_id: dict[str, str] = {}
+
+    def _refresh(self) -> None:
+        connection = http.client.HTTPConnection("localhost", timeout=2)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        try:
+            client.connect(self.socket_path)
+            connection.sock = client
+            connection.request("GET", "/containers/json")
+            containers = json.loads(connection.getresponse().read())
+        finally:
+            connection.close()
+        by_ip, by_id = {}, {}
+        for container in containers:
+            name = str((container.get("Names") or ["?"])[0]).lstrip("/")
+            by_id[str(container.get("Id") or "")] = name
+            networks = (container.get("NetworkSettings") or {}).get("Networks") or {}
+            for network in networks.values():
+                for key in ("IPAddress", "GlobalIPv6Address"):
+                    if network.get(key):
+                        by_ip[str(network[key])] = name
+        self.by_ip, self.by_id = by_ip, by_id
+
+    def lookup(self, ip: str = "", container_id: str = "") -> str:
+        with self.lock:
+            def cached() -> str:
+                if container_id:
+                    return next((name for key, name in self.by_id.items()
+                                 if key.startswith(container_id)), "")
+                return self.by_ip.get(ip, "")
+
+            found = cached()
+            # Refresh on a miss so new containers resolve, at most once per
+            # cache period to keep lookups cheap for unknown peers.
+            if not found and time.monotonic() - self.loaded_at > DOCKER_CACHE_SECONDS:
+                self.loaded_at = time.monotonic()
+                try:
+                    self._refresh()
+                except (OSError, ValueError, http.client.HTTPException):
+                    return ""
+                found = cached()
+            return found
+
+
+DOCKER_DIRECTORY = DockerDirectory()
+
+
+def identify_client(peer: tuple[str, int], local: tuple[str, int],
+                    declared: str = "", user_agent: str = "") -> dict[str, Any]:
+    """Describe which application is on the other end of a proxy connection.
+
+    Records process names but never command lines, which can carry secrets.
+    """
+    host = peer[0].removeprefix("::ffff:")
+    identity: dict[str, Any] = {
+        "address": host,
+        "declared": clean_client_text(declared),
+        "user_agent": clean_client_text(user_agent, 160),
+    }
+    owner = socket_owner((host, peer[1]), (local[0].removeprefix("::ffff:"), local[1]))
+    if owner is not None:
+        identity["uid"] = owner["uid"]
+        try:
+            identity["user"] = pwd.getpwuid(owner["uid"]).pw_name
+        except KeyError:
+            identity["user"] = str(owner["uid"])
+        unit, container_id = cgroup_unit(owner["cgroup"])
+        identity["unit"] = unit
+        if container_id:
+            identity["container"] = (
+                DOCKER_DIRECTORY.lookup(container_id=container_id)
+                or container_id[:12]
+            )
+        pid, candidates = socket_process(owner["cgroup"], owner["inode"])
+        if pid is not None:
+            identity["pid"] = pid
+            identity["process"] = process_name(pid)
+        elif candidates:
+            identity["candidate_processes"] = sorted({
+                name for name in (process_name(value) for value in candidates[:16])
+                if name
+            })
+    else:
+        container = DOCKER_DIRECTORY.lookup(ip=host)
+        if container:
+            identity["container"] = container
+        else:
+            try:
+                identity["remote"] = not ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                identity["remote"] = True
+    identity["key"], identity["label"] = client_key_and_label(identity)
+    return identity
+
+
+def client_key_and_label(identity: dict[str, Any]) -> tuple[str, str]:
+    user = identity.get("user")
+    by = f" ({user})" if user else ""
+    if identity.get("declared"):
+        return f"app:{identity['declared']}", f"{identity['declared']}{by}"
+    if identity.get("container"):
+        return (f"container:{identity['container']}",
+                f"container {identity['container']}")
+    unit = str(identity.get("unit") or "")
+    if unit.endswith(".service"):
+        return f"unit:{user}:{unit}", f"{unit}{by}"
+    if identity.get("process"):
+        return (f"process:{user}:{identity['process']}",
+                f"{identity['process']}{by}")
+    if unit:
+        return f"unit:{user}:{unit}", f"{unit}{by}"
+    agent = identity.get("user_agent") or "unknown client"
+    return f"remote:{identity['address']}", f"{identity['address']} · {agent}"
+
+
 @dataclass
 class Lease:
     token: str
@@ -1865,6 +2086,9 @@ class Lane:
     in_flight: int = 0
     retiring: bool = False
     resolved_context_length: int | None = None
+    # Which client's request started this lane, and who has used it since.
+    triggered_by: dict[str, str] | None = None
+    clients: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def public_summary(self) -> dict[str, Any]:
         alive = self.kind == "system" or (
@@ -1883,6 +2107,11 @@ class Lane:
             "reserved_mib": self.reserved_mib,
             "context_profile": MODEL_CONTEXT_PROFILES.get(self.model),
             "resolved_context_length": self.resolved_context_length,
+            "triggered_by": self.triggered_by,
+            "clients": sorted(
+                ({"key": key, **usage} for key, usage in self.clients.items()),
+                key=lambda usage: -usage["last_seen"],
+            ),
         }
 
 
@@ -2034,6 +2263,7 @@ class QueuedRequest:
     terminal_retry_after: int | None = None
     attached: bool = True
     resume_deadline: float | None = None
+    client: dict[str, str] | None = None
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
@@ -2139,6 +2369,7 @@ class Broker:
             )
         }
         self.next_lane_id = 1
+        self.clients: dict[str, dict[str, Any]] = {}
         if any(lease.state == "revoking" for lease in self.leases.values()):
             with self.cv:
                 self._persist_leases_locked()
@@ -2865,7 +3096,8 @@ class Broker:
                 pass
 
     def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int,
-                    capabilities: set[str], request_path: str) -> Lane:
+                    capabilities: set[str], request_path: str,
+                    triggered_by: dict[str, str] | None = None) -> Lane:
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise PermanentCapacityError(
@@ -2968,12 +3200,15 @@ class Broker:
             POOL_INSTANCE_PARALLEL, required_mib, now, now, process,
         )
         lane.resolved_context_length = actual_context
+        lane.triggered_by = triggered_by
         with self.cv:
             self.lanes[lane_id] = lane
             self.cv.notify_all()
         LOG.info(
-            "managed Ollama lane warm and ready id=%s gpu=%s model=%s reserved_mib=%s",
+            "managed Ollama lane warm and ready id=%s gpu=%s model=%s "
+            "reserved_mib=%s triggered_by=%s",
             lane_id, gpu_uuid, model, required_mib,
+            (triggered_by or {}).get("label", "unknown"),
         )
         return lane
 
@@ -3008,6 +3243,7 @@ class Broker:
         parallel: int,
         request_path: str = "",
         gpu_uuids: tuple[str, ...] | None = None,
+        triggered_by: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
@@ -3222,7 +3458,7 @@ class Broker:
                     for chosen_uuid in placements:
                         created.append(self._spawn_lane(
                             model, chosen_uuid, required_mib,
-                            capabilities, request_path,
+                            capabilities, request_path, triggered_by,
                         ))
                 except Exception:
                     with self.cv:
@@ -3321,7 +3557,8 @@ class Broker:
                     resume_request: bool = False,
                     workload_class: str = "unspecified",
                     queue_policy: str = "wait",
-                    gpu_uuids: tuple[str, ...] | None = None) -> Admission:
+                    gpu_uuids: tuple[str, ...] | None = None,
+                    client: dict[str, str] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         if routable and model and gpu_uuids is not None and not POOL_ENABLED:
@@ -3538,6 +3775,7 @@ class Broker:
                     workload_class=workload_class,
                     queue_policy=queue_policy,
                     initial_position=len(self.waiters) + 1,
+                    client=client,
                 )
                 self.waiters.append(waiter)
                 if retained_request is not None:
@@ -3700,6 +3938,7 @@ class Broker:
                     desired_parallel,
                     waiter.request_path,
                     waiter.gpu_uuids,
+                    triggered_by=waiter.client,
                 )
                 with self.cv:
                     self.reconcile_retry_at = 0.0
@@ -4255,6 +4494,59 @@ class Broker:
         self._stop_lanes([lane], "operator stop")
         return {"ok": True, "stopped_lanes": [lane_id], "gpus": gpu_snapshot()}
 
+    def record_client_use(self, client: dict[str, Any], lane: Lane,
+                          model: str) -> None:
+        """Account an admitted request to its client, model, and lane."""
+        now = time.time()
+        key = str(client.get("key") or "unknown")
+        with self.cv:
+            record = self.clients.get(key)
+            if record is None:
+                record = self.clients[key] = {
+                    "first_seen": now, "requests": 0, "models": {}, "lanes": {},
+                }
+            record["identity"] = client
+            record["last_seen"] = now
+            record["requests"] += 1
+            if model:
+                record["models"][model] = record["models"].get(model, 0) + 1
+            usage = record["lanes"].setdefault(lane.lane_id, {
+                "model": model or lane.model, "gpu_uuid": lane.gpu_uuid,
+                "kind": lane.kind, "requests": 0,
+            })
+            usage["requests"] += 1
+            usage["last_seen"] = now
+            lane_usage = lane.clients.setdefault(key, {
+                "label": client.get("label", key), "requests": 0,
+            })
+            lane_usage["requests"] += 1
+            lane_usage["last_seen"] = now
+            if len(lane.clients) > LANE_CLIENT_LIMIT:
+                oldest = min(lane.clients,
+                             key=lambda item: lane.clients[item]["last_seen"])
+                lane.clients.pop(oldest)
+            if len(self.clients) > CLIENT_HISTORY_LIMIT:
+                oldest = min(self.clients,
+                             key=lambda item: self.clients[item]["last_seen"])
+                self.clients.pop(oldest)
+
+    def _client_summaries_locked(self) -> list[dict[str, Any]]:
+        live = set(self.lanes)
+        summaries = []
+        for key, record in self.clients.items():
+            lanes = [
+                {"id": lane_id, "live": lane_id in live, **usage}
+                for lane_id, usage in record["lanes"].items()
+            ]
+            summaries.append({
+                "key": key, "identity": record["identity"],
+                "first_seen": record["first_seen"],
+                "last_seen": record["last_seen"],
+                "requests": record["requests"], "models": dict(record["models"]),
+                "lanes": sorted(lanes, key=lambda usage: -usage["last_seen"]),
+            })
+        return sorted(summaries, key=lambda summary: -summary["last_seen"])
+
     def heartbeat(self, token: str) -> dict[str, Any]:
         with self.cv:
             lease = self.leases.get(token)
@@ -4307,6 +4599,7 @@ class Broker:
             lanes = self._lane_summaries_locked()
             queue = self._queue_summary_locked(include_requests=True)
             completed_responses = self._completed_response_summary_locked()
+            clients = self._client_summaries_locked()
         backend = probe_backend()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
@@ -4328,6 +4621,7 @@ class Broker:
                     "queue": queue,
                     "completed_responses": completed_responses,
                 },
+                "clients": clients,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
@@ -4471,6 +4765,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _client_identity(self) -> dict[str, Any]:
+        """Resolve the calling application once per connection.
+
+        A declared name may change between requests on one connection, so
+        it is refreshed without repeating the socket and process lookups.
+        """
+        declared = clean_client_text(self.headers.get(CLIENT_HEADER))
+        agent = clean_client_text(self.headers.get("User-Agent"), 160)
+        cached = getattr(self, "_identity", None)
+        if (cached is None or cached.get("declared") != declared
+                or cached.get("user_agent") != agent):
+            try:
+                cached = identify_client(
+                    self.client_address[:2], self.connection.getsockname()[:2],
+                    declared, agent,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail a request
+                LOG.warning("client identification failed: %s", exc)
+                cached = {"address": str(self.client_address[0]),
+                          "declared": declared, "user_agent": agent}
+                cached["key"], cached["label"] = client_key_and_label(cached)
+            self._identity = cached
+        return cached
+
+    def _client_reference(self) -> dict[str, str]:
+        identity = self._client_identity()
+        return {"key": identity["key"], "label": identity["label"]}
 
     def _client_connected(self) -> bool:
         try:
@@ -4698,6 +5020,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     parallel,
                     endpoint,
                     gpu_uuids,
+                    triggered_by=self._client_reference(),
                 )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
@@ -4852,6 +5175,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 workload_class=workload_class,
                 queue_policy=queue_policy,
                 gpu_uuids=gpu_uuids,
+                client=self._client_reference(),
             )
         except ClientDisconnected:
             return
@@ -4880,6 +5204,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         lane = admission.lane
+        self.broker.record_client_use(self._client_identity(), lane, model)
         if not self._client_connected():
             self.broker.proxy_exit(
                 lane, model, False, admission.logical_request_id
@@ -5560,6 +5885,8 @@ ICON_OFFLINE = "network-offline-symbolic"
 SPARE_SLOTS = 2
 # Groups whose size is fixed by construction never need spares.
 FIXED_GROUPS = ("copy", "commands")
+# Most recently active clients shown; the broker keeps a longer history.
+CLIENT_MENU_LIMIT = 20
 
 Gtk: Any = None
 Gdk: Any = None
@@ -5795,6 +6122,53 @@ def lane_actions(lane: dict[str, Any], gpu: str) -> list[dict[str, Any]]:
     return actions
 
 
+def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
+                 inventory: dict[str, dict[str, str]], now: float
+                 ) -> dict[str, Any]:
+    identity = client.get("identity") or {}
+    live = {lane.get("id") for lane in lanes}
+    details = []
+    for label, value in (
+        ("Declared as", identity.get("declared")),
+        ("User", identity.get("user")),
+        ("Container", identity.get("container")),
+        ("Unit", identity.get("unit")),
+        ("Process", f"{identity.get('process')} (pid {identity.get('pid')})"
+         if identity.get("pid") else None),
+        ("Processes", ", ".join(identity.get("candidate_processes") or [])),
+        ("Address", identity.get("address")),
+        ("User agent", identity.get("user_agent")),
+    ):
+        if value:
+            details += wrapped(f"{label}: ", str(value))
+    details.append(
+        f"Requests: {client.get('requests')} · last "
+        f"{age(now - float(client.get('last_seen') or now))}"
+    )
+    details += [
+        f"Model: {model} · {count} req"
+        for model, count in sorted((client.get("models") or {}).items(),
+                                   key=lambda item: -item[1])
+    ]
+    for usage in client.get("lanes") or []:
+        where = (gpu_name(usage.get("gpu_uuid"), inventory)
+                 if usage.get("kind") == "managed" else "base Ollama")
+        state = "live" if usage.get("id") in live else "ended"
+        details.append(
+            f"Lane {usage.get('id')}: {usage.get('model')} on {where} · "
+            f"{usage.get('requests')} req · {state}"
+        )
+    models = ", ".join(list(client.get("models") or {})[:2])
+    return {
+        "key": str(client.get("key")),
+        "title": (f"{identity.get('label', client.get('key'))} · "
+                  f"{client.get('requests')} req"
+                  + (f" · {models}" if models else "")),
+        "details": details,
+        "actions": [],
+    }
+
+
 def lease_details(lease: dict[str, Any], summary: dict[str, Any],
                   inventory: dict[str, dict[str, str]], now: float) -> list[str]:
     details = [
@@ -5836,7 +6210,7 @@ def build_menu_model(
         return {
             "icon": ICON_OFFLINE, "label": "offline",
             "summary": [f"Broker unreachable: {error or 'no status'}"],
-            "gpus": [], "leases": [], "lanes": [],
+            "gpus": [], "leases": [], "lanes": [], "clients": [],
         }
     leases = status.get("leases") or []
     summaries = status.get("lease_summaries") or []
@@ -5887,9 +6261,20 @@ def build_menu_model(
                 f"Serving: {lane.get('in_flight') or 0} of {lane.get('parallel')}",
                 f"Reserved: {memory(lane.get('reserved_mib'))}",
             ] + ([f"Context: {lane['resolved_context_length']} tokens"]
-                 if lane.get("resolved_context_length") else []),
+                 if lane.get("resolved_context_length") else [])
+            + [f"Started for: {(lane.get('triggered_by') or {}).get('label', 'unknown')}"]
+            + [
+                f"Used by: {usage.get('label')} · {usage.get('requests')} req · "
+                f"{age(now - float(usage.get('last_seen') or now))}"
+                for usage in lane.get("clients") or []
+            ],
             "actions": lane_actions(lane, gpu),
         })
+
+    client_entries = [
+        client_entry(client, lanes, inventory, now)
+        for client in (status.get("clients") or [])[:CLIENT_MENU_LIMIT]
+    ]
 
     gpu_entries = []
     for device in status.get("gpus") or []:
@@ -5943,6 +6328,7 @@ def build_menu_model(
         "gpus": gpu_entries,
         "leases": lease_entries,
         "lanes": lane_entries,
+        "clients": client_entries,
     }
 
 
@@ -5979,6 +6365,7 @@ def menu_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
         ("GPUs", "gpus", "No GPUs reported"),
         ("Leases", "leases", "No active leases"),
         ("Ollama lanes", "lanes", "No Ollama lanes running"),
+        ("Clients", "clients", "No clients seen since broker start"),
     ):
         rows += [
             row(f"{section}:separator", "separator", "separator"),

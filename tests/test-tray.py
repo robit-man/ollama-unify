@@ -70,11 +70,35 @@ def status_fixture():
             for gpu, total, used in DEVICES
         ],
         "foreign_gpu_processes": {f"4242@{GPU0}": 30720},
+        "clients": [
+            {"key": "app:eval", "requests": 12, "first_seen": NOW - 900,
+             "last_seen": NOW - 30,
+             "identity": {"label": "eval (roctinam)", "declared": "eval",
+                          "user": "roctinam", "unit": "matric-tau.service",
+                          "pid": 777, "process": "python3",
+                          "address": "127.0.0.1", "user_agent": "ollama-python"},
+             "models": {"fixture_small:latest": 12},
+             "lanes": [
+                 {"id": "lane-1", "model": "fixture_small:latest",
+                  "gpu_uuid": GPU1, "kind": "managed", "requests": 11},
+                 {"id": "lane-0", "model": "fixture_small:latest",
+                  "gpu_uuid": GPU0, "kind": "managed", "requests": 1},
+                 {"id": "base", "model": "fixture_small:latest",
+                  "gpu_uuid": None, "kind": "system", "requests": 0},
+             ]},
+        ],
         "parallel_pool": {"lanes": [
             {"id": "base", "kind": "system", "gpu_uuid": None},
             {"id": "lane-1", "kind": "managed", "gpu_uuid": GPU1,
              "state": "ready", "model": "fixture_small:latest",
-             "parallel": 1, "in_flight": 0, "reserved_mib": 8192},
+             "parallel": 1, "in_flight": 0, "reserved_mib": 8192,
+             "triggered_by": {"key": "app:eval", "label": "eval (roctinam)"},
+             "clients": [
+                 {"key": "app:eval", "label": "eval (roctinam)",
+                  "requests": 12, "last_seen": NOW - 30},
+                 {"key": "container:voryn", "label": "container voryn",
+                  "requests": 3, "last_seen": NOW - 600},
+             ]},
             {"id": "lane-2", "kind": "managed", "gpu_uuid": GPU1,
              "state": "ready", "model": "fixture-busy:latest",
              "parallel": 1, "in_flight": 1, "reserved_mib": 8192},
@@ -131,6 +155,24 @@ def test_menu_model(tray):
 
     idle, busy = model["lanes"]
     assert idle["title"] == "fixture_small:latest · GPU1 · ready"
+    assert "Started for: eval (roctinam)" in idle["details"]
+    assert ("Used by: eval (roctinam) · 12 req · under a minute ago"
+            in idle["details"])
+    assert "Used by: container voryn · 3 req · 10 min ago" in idle["details"]
+    assert "Started for: unknown" in busy["details"]
+
+    (client,) = model["clients"]
+    assert client["title"] == "eval (roctinam) · 12 req · fixture_small:latest"
+    assert client["actions"] == []
+    for line in (
+        "Declared as: eval", "User: roctinam", "Unit: matric-tau.service",
+        "Process: python3 (pid 777)", "User agent: ollama-python",
+        "Model: fixture_small:latest · 12 req",
+        "Lane lane-1: fixture_small:latest on GPU1 · 11 req · live",
+        "Lane lane-0: fixture_small:latest on GPU0 · 1 req · ended",
+        "Lane base: fixture_small:latest on base Ollama · 0 req · ended",
+    ):
+        assert line in client["details"], line
     assert labels(idle) == ["Stop lane…", "Force stop lane…"]
     assert labels(busy) == ["Force stop lane…"]
     assert requests(busy)["Force stop lane…"] == {
@@ -360,7 +402,8 @@ def main():
     test_open_menu_survives_updates(tray)
     print(
         "tray indicator model: PASS (heterogeneous devices, N-GPU leases, "
-        "per-state actions, lanes, units, configured timeouts, offline, "
+        "per-state actions, lanes, client attribution, units, configured "
+        "timeouts, offline, "
         "stable row keys)"
     )
 

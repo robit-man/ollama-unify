@@ -261,6 +261,17 @@ Destructive actions ask for confirmation, and failures open a dialog that shows 
 
 The indicator talks to the control socket, so only members of the broker's access group can use it. That group already has full lease control through the socket. The socket also accepts `revoke` (by token) and `stop_lane` (by lane id, `force` to interrupt in-flight requests). The user unit `ollama-unify-tray.service` is enabled globally for `graphical-session.target`, and the broker unit's `ExecStartPost` starts it in every active desktop session of an access-group member, so the indicator comes up with the broker. Choosing *Quit indicator* stops it until the next login or broker start.
 
+### Client attribution
+
+The broker records which application sends each request and which Ollama lane serves it. Each client connection is identified once, without extra privileges:
+
+- **Declared name** — a client can send `X-Ollama-Unify-Client: NAME` to name itself. The name takes precedence over everything else.
+- **Local processes** — socket diagnostics (`ss -e`) give the caller's UID and cgroup, which identifies its systemd unit, login scope, or Docker container. The exact PID is resolved for the broker's own user; other users' callers are narrowed to the processes in their unit.
+- **Bridge-network containers** — the peer IP is mapped to a container name through the Docker API when the broker's user can read the Docker socket.
+- **Anything else** — the remote address and `User-Agent`.
+
+Only process names are recorded, never command lines, which can contain secrets. Broker status (`clients`) lists up to 256 recent clients with request counts per model and per lane. Each lane reports `triggered_by`, the client whose request started it, and its most recent clients. The tray shows *Started for* and *Used by* in each lane's submenu, and a *Clients* section lists the 20 most recent applications with their identity and the lanes they used.
+
 ### Surviving Ollama upgrades
 
 The official Ollama installer rewrites `/etc/systemd/system/ollama.service` and restarts the daemon. The unit it writes carries no `OLLAMA_HOST`, so the pinned loopback backend exists only in the late-priority ollama-unify drop-in. If that drop-in is cleared or drifts, Ollama falls back to its built-in `0.0.0.0:11434` and collides head-on with the negotiator that already owns that address — whichever process loses the bind race dies.

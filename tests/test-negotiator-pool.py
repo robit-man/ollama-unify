@@ -207,6 +207,7 @@ def chat(
     queue_policy="wait",
     mock_body_size=None,
     gpu_uuids=None,
+    client=None,
 ):
     headers = {
         "X-Ollama-Unify-Workload-Class": workload_class,
@@ -220,6 +221,8 @@ def chat(
         headers["X-Ollama-Unify-GPU-UUIDs"] = (
             ",".join(gpu_uuids) if gpu_uuids else "none"
         )
+    if client is not None:
+        headers["X-Ollama-Unify-Client"] = client
     payload = {
         "model": model,
         "stream": False,
@@ -1330,6 +1333,56 @@ def test_operator_revoke_and_lane_stop(helper, fixture_bin):
         assert released["released"] == token
 
 
+def test_client_attribution(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=2, tags=[MODEL, OTHER_MODEL],
+    ) as harness:
+        status, payload, headers = chat(
+            harness.proxy_port, MODEL, "declared-client", client="fixture-app",
+        )
+        assert status == 200, payload
+        first_lane = headers["X-Ollama-Unify-Lane"]
+        status, payload, headers = chat(
+            harness.proxy_port, MODEL, "declared-client-again",
+            client="fixture-app",
+        )
+        assert status == 200, payload
+        status, payload, headers = chat(
+            harness.proxy_port, OTHER_MODEL, "undeclared-client",
+        )
+        assert status == 200, payload
+        other_lane = headers["X-Ollama-Unify-Lane"]
+
+        current = harness.status()
+        clients = {client["key"]: client for client in current["clients"]}
+        declared = clients["app:fixture-app"]
+        assert declared["requests"] == 2
+        assert declared["models"] == {MODEL: 2}
+        assert [usage["id"] for usage in declared["lanes"]] == [first_lane]
+        assert declared["lanes"][0]["live"] is True
+
+        undeclared = next(
+            client for key, client in clients.items() if key != "app:fixture-app"
+        )
+        identity = undeclared["identity"]
+        assert identity["address"] == "127.0.0.1"
+        assert identity["label"] and undeclared["key"] != "app:fixture-app"
+        # Socket diagnostics resolve local callers without privileges; the
+        # test process owns the connection, so it resolves to exactly us.
+        if "uid" in identity:
+            assert identity["uid"] == os.getuid()
+            assert identity.get("pid") == os.getpid(), identity
+            assert identity["label"].startswith(identity["process"])
+
+        lanes = {lane["id"]: lane for lane in managed_lanes(current)}
+        assert lanes[first_lane]["triggered_by"] == {
+            "key": "app:fixture-app", "label": declared["identity"]["label"],
+        }
+        assert lanes[first_lane]["clients"][0]["key"] == "app:fixture-app"
+        assert lanes[first_lane]["clients"][0]["requests"] == 2
+        assert lanes[other_lane]["triggered_by"]["key"] == undeclared["key"]
+
+
 def capacity_when_ready(harness, model, parallel=1):
     status, payload, headers = harness.capacity(model, parallel)
     return (status, payload, headers) if status == 200 else None
@@ -2437,6 +2490,7 @@ def main():
     )
     test_multi_gpu_lease_is_exclusive_for_its_lifetime(helper, fixture_bin)
     test_operator_revoke_and_lane_stop(helper, fixture_bin)
+    test_client_attribution(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
@@ -2477,7 +2531,7 @@ def main():
         "resumable logical admission, completed-response replay, cancellation, "
         "terminal admission failures, controlled-load admission and replay bounds, "
         "dead-owner lease reclamation, exclusive multi-GPU leases, "
-        "operator revoke and lane stop, "
+        "operator revoke and lane stop, client attribution, "
         "content-type-independent routing)"
     )
 
