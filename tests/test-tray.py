@@ -194,6 +194,96 @@ def test_units_and_timeouts(tray):
             os.environ.pop(name, None)
 
 
+def row_keys(rows):
+    keys = [row["key"] for row in rows]
+    assert len(keys) == len(set(keys)), keys
+    for row in rows:
+        if row["kind"] == "entry":
+            row_keys(row["rows"])
+    return keys
+
+
+def changed_status():
+    """Same host a poll later: values moved, one lease left, one lane added."""
+    status = status_fixture()
+    status["leases"] = [
+        item for item in status["leases"] if item["owner"] != "revoked-owner"
+    ]
+    status["lease_summaries"] = [
+        item for item in status["lease_summaries"]
+        if item["owner"] != "revoked-owner"
+    ]
+    status["leases"][0]["heartbeat_at"] = NOW - 600
+    status["gpus"][0]["used_mib"] = 45056
+    status["parallel_pool"]["lanes"].append({
+        "id": "lane-3", "kind": "managed", "gpu_uuid": GPU1,
+        "state": "ready", "model": "fixture-new:latest", "parallel": 1,
+        "in_flight": 0, "reserved_mib": 4096,
+    })
+    return status
+
+
+def build(tray, status):
+    return tray.build_menu_model(
+        status, None, INVENTORY, [GPU0, GPU1, GPU2, GPU4], {}, NOW,
+    )
+
+
+def test_menu_rows_are_stably_keyed(tray):
+    before = tray.menu_rows(build(tray, status_fixture()))
+    after = tray.menu_rows(build(tray, changed_status()))
+    before_keys, after_keys = row_keys(before), row_keys(after)
+    peer = "leases:tensor-parallel@" + str(NOW - 3600)
+    assert peer in before_keys and peer in after_keys
+    assert "lanes:lane-3" in after_keys and "lanes:lane-3" not in before_keys
+    assert not [key for key in after_keys if "revoked-owner" in key]
+    peer_before = next(row for row in before if row["key"] == peer)
+    peer_after = next(row for row in after if row["key"] == peer)
+    assert [row["key"] for row in peer_before["rows"]] == [
+        row["key"] for row in peer_after["rows"]
+    ]
+    assert peer_before["rows"] != peer_after["rows"]
+
+
+def test_open_menu_survives_updates(tray):
+    """Reuse live GTK items across updates; skip without a display."""
+    try:
+        tray.load_toolkit()
+        if not tray.Gtk.init_check(sys.argv)[0]:
+            raise RuntimeError("no display")
+        app = tray.TrayApp(poll=False)
+    except Exception as exc:  # noqa: BLE001 - any toolkit failure means skip
+        print(f"tray GTK reconciliation: SKIP ({exc})")
+        return
+    app.render(build(tray, status_fixture()))
+    peer = ("leases:tensor-parallel@" + str(NOW - 3600),)
+    heartbeat = next(path for path, row in app.rows.items()
+                     if path[:1] == peer and row.get("label", "").startswith("Heartbeat"))
+    revoke = peer + ("action:Revoke lease…",)
+    kept = {path: app.widgets[path] for path in (peer, heartbeat, revoke)}
+    submenu = app.widgets[peer].get_submenu()
+    gone = ("leases:revoked-owner@" + str(NOW - 30),)
+    gone_widget = app.widgets[gone]
+
+    app.render(build(tray, changed_status()))
+    for path, widget in kept.items():
+        assert app.widgets[path] is widget, path
+    assert app.widgets[peer].get_submenu() is submenu
+    assert kept[heartbeat].get_label() == "Heartbeat: 10 min ago (TTL 300s)"
+    assert gone not in app.widgets
+    assert gone_widget not in app.menu.get_children()
+    labels = [child.get_label() for child in app.menu.get_children()
+              if not isinstance(child, tray.Gtk.SeparatorMenuItem)]
+    assert "fixture-new:latest · GPU1 · ready" in labels
+    assert labels.index("fixture-new:latest · GPU1 · ready") > labels.index(
+        "fixture-busy:latest · GPU1 · ready"
+    )
+    # A reused action item acts on the current lease data at click time.
+    assert app.rows[revoke]["spec"]["request"]["token"] == "lease_tensor-parallel"
+    print("tray GTK reconciliation: PASS (open items reused, relabelled, "
+          "rows added and removed in place)")
+
+
 def test_offline_and_idle_models(tray):
     offline = tray.build_menu_model(None, "connection refused", {}, [], {}, NOW)
     assert offline["icon"] == tray.ICON_OFFLINE
@@ -214,9 +304,12 @@ def main():
     test_single_device_host(tray)
     test_units_and_timeouts(tray)
     test_offline_and_idle_models(tray)
+    test_menu_rows_are_stably_keyed(tray)
+    test_open_menu_survives_updates(tray)
     print(
         "tray indicator model: PASS (heterogeneous devices, N-GPU leases, "
-        "per-state actions, lanes, units, configured timeouts, offline)"
+        "per-state actions, lanes, units, configured timeouts, offline, "
+        "stable row keys)"
     )
 
 

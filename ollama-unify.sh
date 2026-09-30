@@ -5857,6 +5857,7 @@ def build_menu_model(
             attention = True
         flag = " ⚠" if lease.get("state") == "revoking" or overdue else ""
         lease_entries.append({
+            "key": f"{lease.get('owner')}@{float(lease.get('created_at') or 0)}",
             "title": (
                 f"{lease.get('owner')} · "
                 f"{gpu_list(lease.get('gpu_uuids') or [], inventory)} · "
@@ -5870,6 +5871,7 @@ def build_menu_model(
     for lane in sorted(lanes, key=lambda item: str(item.get("id"))):
         gpu = gpu_name(lane.get("gpu_uuid"), inventory)
         lane_entries.append({
+            "key": str(lane.get("id")),
             "title": f"{lane.get('model')} · {gpu} · {lane.get('state')}",
             "details": [
                 f"Lane: {lane.get('id')}",
@@ -5914,7 +5916,9 @@ def build_menu_model(
             for pid, used in sorted(foreign.get(gpu_uuid, []),
                                     key=lambda item: -item[1])
         ]
-        gpu_entries.append({"title": title, "details": details, "actions": []})
+        gpu_entries.append({
+            "key": gpu_uuid, "title": title, "details": details, "actions": [],
+        })
 
     state = "draining" if status.get("draining") else "running"
     summary_lines = [
@@ -5936,6 +5940,58 @@ def build_menu_model(
     }
 
 
+def menu_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """Describe the menu as keyed rows so updates can be applied in place."""
+    def info(key: str, label: str) -> dict[str, Any]:
+        return {"key": key, "kind": "info", "label": label}
+
+    def separator(key: str) -> dict[str, Any]:
+        return {"key": key, "kind": "separator"}
+
+    def entry_rows(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = [info(f"detail:{index}", line)
+                for index, line in enumerate(entry["details"])]
+        if entry["actions"]:
+            rows.append(separator("separator:actions"))
+        rows += [
+            {"key": f"action:{spec['label']}", "kind": "action",
+             "label": spec["label"], "spec": spec}
+            for spec in entry["actions"]
+        ]
+        rows.append({
+            "key": "copy", "kind": "copy", "label": "Copy details",
+            "text": "\n".join([entry["title"]] + entry["details"]),
+        })
+        return rows
+
+    rows = [info(f"summary:{index}", line)
+            for index, line in enumerate(model["summary"])]
+    for heading, section, empty in (
+        ("GPUs", "gpus", None),
+        ("Leases", "leases", "No active leases"),
+        ("Ollama lanes", "lanes", "No Ollama lanes running"),
+    ):
+        if not model[section] and empty is None:
+            continue
+        rows += [separator(f"separator:{section}"),
+                 info(f"heading:{section}", heading)]
+        if not model[section]:
+            rows.append(info(f"empty:{section}", "    " + empty))
+        rows += [
+            {"key": f"{section}:{entry['key']}", "kind": "entry",
+             "label": entry["title"], "rows": entry_rows(entry)}
+            for entry in model[section]
+        ]
+    rows += [
+        separator("separator:commands"),
+        {"key": "refresh", "kind": "command", "command": "refresh",
+         "label": "Refresh now"},
+        {"key": "quit", "kind": "command", "command": "quit",
+         "label": "Quit indicator"},
+    ]
+    return rows
+
+
 def load_toolkit() -> None:
     global Gtk, Gdk, GLib, AppIndicator
     import gi
@@ -5945,15 +6001,8 @@ def load_toolkit() -> None:
     Gtk, Gdk, GLib, AppIndicator = gtk, gdk, glib, AyatanaAppIndicator3
 
 
-def menu_item(text: str, sensitive: bool = True) -> Any:
-    # Double underscores so model names are not read as mnemonics.
-    item = Gtk.MenuItem.new_with_mnemonic(text.replace("_", "__"))
-    item.set_sensitive(sensitive)
-    return item
-
-
 class TrayApp:
-    def __init__(self) -> None:
+    def __init__(self, poll: bool = True) -> None:
         self.indicator = AppIndicator.Indicator.new(
             "ollama-unify-gpu-broker", ICON_OFFLINE,
             AppIndicator.IndicatorCategory.SYSTEM_SERVICES,
@@ -5963,6 +6012,12 @@ class TrayApp:
         self.menu = Gtk.Menu()
         self.indicator.set_menu(self.menu)
         self.signature: str | None = None
+        self.icon: str | None = None
+        self.label: str | None = None
+        # Widgets and their latest row, keyed by the path of stable row keys
+        # from the top menu down. Reusing them keeps an open menu open.
+        self.widgets: dict[tuple[str, ...], Any] = {}
+        self.rows: dict[tuple[str, ...], dict[str, Any]] = {}
         self.inventory: dict[str, dict[str, str]] = {}
         self.inventory_at = 0.0
         self.selected_gpus = [
@@ -5971,7 +6026,8 @@ class TrayApp:
         ]
         self.wake = threading.Event()
         self.render(build_menu_model(None, "connecting", {}, [], {}, time.time()))
-        threading.Thread(target=self.poll_loop, daemon=True).start()
+        if poll:
+            threading.Thread(target=self.poll_loop, daemon=True).start()
 
     def poll_loop(self) -> None:
         while True:
@@ -6002,57 +6058,96 @@ class TrayApp:
         if signature == self.signature:
             return False
         self.signature = signature
-        self.indicator.set_icon_full(model["icon"], "ollama-unify GPU broker")
-        self.indicator.set_label(model.get("label") or "", "00L · 00O")
-        for child in self.menu.get_children():
-            self.menu.remove(child)
-        for line in model["summary"]:
-            self.menu.append(menu_item(line, sensitive=False))
-        for heading, key, empty in (
-            ("GPUs", "gpus", "No GPUs reported"),
-            ("Leases", "leases", "No active leases"),
-            ("Ollama lanes", "lanes", "No Ollama lanes running"),
-        ):
-            if key != "gpus" or model[key]:
-                self.menu.append(Gtk.SeparatorMenuItem())
-                self.menu.append(menu_item(heading, sensitive=False))
-            if not model[key] and key != "gpus":
-                self.menu.append(menu_item("    " + empty, sensitive=False))
-            for entry in model[key]:
-                self.menu.append(self.entry_item(entry))
-        self.menu.append(Gtk.SeparatorMenuItem())
-        refresh = menu_item("Refresh now")
-        refresh.connect("activate", lambda _item: self.wake.set())
-        self.menu.append(refresh)
-        quit_item = menu_item("Quit indicator")
-        quit_item.connect("activate", lambda _item: Gtk.main_quit())
-        self.menu.append(quit_item)
-        self.menu.show_all()
+        if model["icon"] != self.icon:
+            self.icon = model["icon"]
+            self.indicator.set_icon_full(self.icon, "ollama-unify GPU broker")
+        if model.get("label") != self.label:
+            self.label = model.get("label")
+            self.indicator.set_label(self.label or "", "00L · 00O")
+        self.sync_menu(self.menu, menu_rows(model), ())
         return False
 
-    def entry_item(self, entry: dict[str, Any]) -> Any:
-        item = menu_item(entry["title"])
-        submenu = Gtk.Menu()
-        for line in entry["details"]:
-            submenu.append(menu_item(line, sensitive=False))
-        if entry["actions"]:
-            submenu.append(Gtk.SeparatorMenuItem())
-        for spec in entry["actions"]:
-            action_item = menu_item(spec["label"])
-            action_item.connect(
-                "activate", lambda _item, spec=spec: self.trigger(spec)
-            )
-            submenu.append(action_item)
-        copy_item = menu_item("Copy details")
-        copy_item.connect(
-            "activate",
-            lambda _item: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(
-                "\n".join([entry["title"]] + entry["details"]), -1
-            ),
-        )
-        submenu.append(copy_item)
-        item.set_submenu(submenu)
-        return item
+    def sync_menu(self, menu: Any, rows: list[dict[str, Any]],
+                  path: tuple[str, ...]) -> None:
+        """Reconcile menu children with rows in place.
+
+        Replacing the children would close a menu the user has open, so
+        existing items are kept, relabelled, and reordered; only rows that
+        appear or disappear add or remove items.
+        """
+        wanted = {row["key"] for row in rows}
+        keys_by_widget = {
+            id(widget): item_path[-1]
+            for item_path, widget in self.widgets.items()
+            if item_path[:-1] == path
+        }
+        for child in list(menu.get_children()):
+            key = keys_by_widget.get(id(child))
+            if key not in wanted:
+                menu.remove(child)
+                if key is not None:
+                    self.forget(path + (key,))
+        for position, row in enumerate(rows):
+            item_path = path + (row["key"],)
+            widget = self.widgets.get(item_path)
+            previous = self.rows.get(item_path)
+            if widget is not None and previous and previous["kind"] != row["kind"]:
+                menu.remove(widget)
+                self.forget(item_path)
+                widget = None
+            if widget is None:
+                widget = self.create_item(row, item_path)
+                menu.insert(widget, position)
+                self.widgets[item_path] = widget
+            elif menu.get_children().index(widget) != position:
+                menu.reorder_child(widget, position)
+            self.rows[item_path] = row
+            if row["kind"] == "separator":
+                continue
+            text = row["label"].replace("_", "__")
+            if widget.get_label() != text:
+                widget.set_label(text)
+            sensitive = row["kind"] != "info"
+            if widget.get_sensitive() != sensitive:
+                widget.set_sensitive(sensitive)
+            if row["kind"] == "entry":
+                submenu = widget.get_submenu()
+                if submenu is None:
+                    submenu = Gtk.Menu()
+                    widget.set_submenu(submenu)
+                self.sync_menu(submenu, row["rows"], item_path)
+
+    def create_item(self, row: dict[str, Any], item_path: tuple[str, ...]) -> Any:
+        if row["kind"] == "separator":
+            widget = Gtk.SeparatorMenuItem()
+        else:
+            widget = Gtk.MenuItem.new_with_mnemonic("")
+            if row["kind"] in ("action", "copy", "command"):
+                widget.connect(
+                    "activate", lambda _item: self.activate(item_path)
+                )
+        widget.show()
+        return widget
+
+    def forget(self, item_path: tuple[str, ...]) -> None:
+        for stored in [key for key in self.widgets
+                       if key[:len(item_path)] == item_path]:
+            self.widgets.pop(stored, None)
+            self.rows.pop(stored, None)
+
+    def activate(self, item_path: tuple[str, ...]) -> None:
+        # Look up the row at click time so a reused item acts on current data.
+        row = self.rows.get(item_path)
+        if row is None:
+            return
+        if row["kind"] == "action":
+            self.trigger(row["spec"])
+        elif row["kind"] == "copy":
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(row["text"], -1)
+        elif row["command"] == "refresh":
+            self.wake.set()
+        elif row["command"] == "quit":
+            Gtk.main_quit()
 
     def trigger(self, spec: dict[str, Any]) -> None:
         if spec["confirm"] and not self.confirm(spec["label"], spec["confirm"]):
