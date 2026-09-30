@@ -5,6 +5,8 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
+import tempfile
+import time
 
 
 def load_negotiator(path):
@@ -73,6 +75,34 @@ def test_keys_and_labels(negotiator):
     assert len(negotiator.clean_client_text("x" * 500)) == 128
 
 
+def test_process_names_and_inference(negotiator, tmp):
+    import subprocess
+    script = os.path.join(tmp, "worker_app.py")
+    with open(script, "w", encoding="utf-8") as stream:
+        stream.write("import time\ntime.sleep(30)\n")
+    child = subprocess.Popen([sys.executable, script, "--token", "secret"])
+    try:
+        # The kernel fills /proc/PID/cmdline once the exec completes.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with open(f"/proc/{child.pid}/cmdline", "rb") as stream:
+                if stream.read():
+                    break
+            time.sleep(0.02)
+        name = negotiator.process_name(child.pid)
+        interpreter = os.path.basename(sys.executable)
+        assert name == f"{interpreter} worker_app.py", name
+        assert "secret" not in name
+    finally:
+        child.kill()
+        child.wait()
+    key = negotiator.client_key_and_label
+    assert key({"unit": "vte-spawn-1.scope", "user": "roko",
+                "candidate_processes": ["claude", "curl"]}) == (
+        "unit:roko:vte-spawn-1.scope", "claude / curl (roko)",
+    )
+
+
 def test_docker_directory_cache(negotiator):
     directory = negotiator.DockerDirectory("/nonexistent/docker.sock")
     # An unreachable Docker API degrades to "unknown", never an error.
@@ -88,8 +118,11 @@ def main():
     test_parse_socket_owner(negotiator)
     test_cgroup_unit(negotiator)
     test_keys_and_labels(negotiator)
+    with tempfile.TemporaryDirectory() as tmp:
+        test_process_names_and_inference(negotiator, tmp)
     test_docker_directory_cache(negotiator)
     print("client identity: PASS (socket owner, cgroup units, keys, labels, "
+          "process names without arguments, "
           "docker directory)")
 
 

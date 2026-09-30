@@ -1805,7 +1805,33 @@ def cgroup_unit(cgroup: str) -> tuple[str, str]:
     return "", ""
 
 
+# Programs that host other programs in a login or terminal scope.
+SESSION_PROGRAMS = frozenset({
+    "bash", "sh", "dash", "zsh", "fish", "ksh", "tcsh", "tmux", "screen",
+    "login", "su", "sudo", "sshd", "systemd", "(sd-pam)",
+})
+SCRIPT_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".sh")
+
+
 def process_name(pid: int) -> str:
+    """Name a process by its program, plus its script for interpreters.
+
+    Reads only argv[0] and a script-path argv[1] from the world-readable
+    cmdline, never other arguments, which can carry secrets. Thread renames
+    make /proc/PID/comm misleading, so it is only the fallback.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            argv = [part.decode(errors="replace")
+                    for part in stream.read().split(b"\0") if part]
+    except OSError:
+        argv = []
+    if argv:
+        name = os.path.basename(argv[0])
+        if (len(argv) > 1 and not argv[1].startswith("-")
+                and argv[1].endswith(SCRIPT_SUFFIXES)):
+            name += " " + os.path.basename(argv[1])
+        return name[:96]
     try:
         with open(f"/proc/{pid}/comm", encoding="utf-8") as stream:
             return stream.read().strip()
@@ -1927,10 +1953,18 @@ def identify_client(peer: tuple[str, int], local: tuple[str, int],
             identity["pid"] = pid
             identity["process"] = process_name(pid)
         elif candidates:
-            identity["candidate_processes"] = sorted({
+            names = sorted({
                 name for name in (process_name(value) for value in candidates[:16])
                 if name
             })
+            identity["candidate_processes"] = names
+            # Descriptors of processes in another group are unreadable, so a
+            # scope holding one program besides its shells names the caller.
+            programs = [name for name in names
+                        if name.split(" ", 1)[0] not in SESSION_PROGRAMS]
+            if len(programs) == 1:
+                identity["process"] = programs[0]
+                identity["process_inferred"] = True
     else:
         container = DOCKER_DIRECTORY.lookup(ip=host)
         if container:
@@ -1958,6 +1992,9 @@ def client_key_and_label(identity: dict[str, Any]) -> tuple[str, str]:
     if identity.get("process"):
         return (f"process:{user}:{identity['process']}",
                 f"{identity['process']}{by}")
+    if identity.get("candidate_processes"):
+        return (f"unit:{user}:{unit}",
+                f"{' / '.join(identity['candidate_processes'])}{by}")
     if unit:
         return f"unit:{user}:{unit}", f"{unit}{by}"
     agent = identity.get("user_agent") or "unknown client"
@@ -6134,7 +6171,9 @@ def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
         ("Container", identity.get("container")),
         ("Unit", identity.get("unit")),
         ("Process", f"{identity.get('process')} (pid {identity.get('pid')})"
-         if identity.get("pid") else None),
+         if identity.get("pid") else (
+             f"{identity.get('process')} (inferred from its unit)"
+             if identity.get("process") else None)),
         ("Processes", ", ".join(identity.get("candidate_processes") or [])),
         ("Address", identity.get("address")),
         ("User agent", identity.get("user_agent")),
