@@ -1110,6 +1110,10 @@ OWNER_GPU_SCOPES = env_owner_gpu_scopes("OLLAMA_UNIFY_OWNER_GPU_SCOPES")
 LEASE_STATE_PATH = Path(os.environ.get(
     "OLLAMA_UNIFY_LEASE_STATE", "/var/lib/ollama-unify/leases.json"
 ))
+MODEL_POLICY_PATH = Path(os.environ.get(
+    "OLLAMA_UNIFY_MODEL_POLICY_STATE",
+    str(LEASE_STATE_PATH.with_name("model-gpu-policy.json")),
+))
 POOL_ENABLED = env_bool(
     "OLLAMA_UNIFY_POOL_ENABLED", BACKEND_TYPE == "cuda" and bool(SELECTED_GPUS)
 )
@@ -2364,6 +2368,8 @@ class Broker:
         self.cv = threading.Condition()
         self.transition = threading.Lock()
         self.leases = self._load_leases()
+        # Operator allowlists of GPUs per model; absent means every GPU.
+        self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
         self.draining = any(
             lease.state in ("pending", "revoking") and not lease.gpu_uuids
             for lease in self.leases.values()
@@ -2466,6 +2472,44 @@ class Broker:
         if leases:
             LOG.warning("restored %s persisted GPU lease(s)", len(leases))
         return leases
+
+    def _load_model_policy(self) -> dict[str, list[str]]:
+        try:
+            raw = json.loads(MODEL_POLICY_PATH.read_text()).get("models", {})
+        except (OSError, ValueError, AttributeError):
+            return {}
+        return {
+            canonical_model_tag(str(model)): [str(value) for value in gpus]
+            for model, gpus in raw.items()
+            if isinstance(gpus, list) and gpus
+        }
+
+    def _persist_model_policy_locked(self) -> None:
+        MODEL_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = MODEL_POLICY_PATH.with_name(
+            f".{MODEL_POLICY_PATH.name}.{os.getpid()}.tmp"
+        )
+        payload = {
+            "schema": "io.ollama-unify.gpu-negotiator.model-gpu-policy.v1",
+            "models": self.model_gpu_policy,
+        }
+        temp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, MODEL_POLICY_PATH)
+
+    def _policy_constraint_locked(
+        self, model: str, gpu_uuids: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        """Narrow a request's GPU constraint by the model's operator policy.
+
+        Returns an empty tuple when the request and the policy share no GPU.
+        """
+        allowed = self.model_gpu_policy.get(canonical_model_tag(model))
+        if allowed is None:
+            return gpu_uuids
+        if gpu_uuids is None:
+            return tuple(allowed)
+        return tuple(gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid in allowed)
 
     def _persist_leases_locked(self) -> None:
         LEASE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2930,6 +2974,7 @@ class Broker:
         blocked_gpus = self._ollama_blocked_gpus_locked()
         if not routable:
             return base if base.in_flight < base.parallel else None
+        gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
                     and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)
@@ -3289,6 +3334,17 @@ class Broker:
             raise PermanentCapacityError(
                 "capacity request requires a model tag", 400, "invalid_capacity_request"
             )
+        with self.cv:
+            requested_gpu_uuids = gpu_uuids
+            gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
+        if gpu_uuids == ():
+            raise PermanentCapacityError(
+                f"model {model!r} is restricted to GPUs "
+                f"{self.model_gpu_policy.get(model)}, none of which the request "
+                f"allows ({list(requested_gpu_uuids or ())})",
+                409,
+                "gpu_policy_conflict",
+            )
         if parallel < 1:
             raise PermanentCapacityError(
                 "parallel must be at least 1", 400, "invalid_capacity_request"
@@ -3608,6 +3664,19 @@ class Broker:
                 request_id=request_id,
                 logical_request_id=logical_request_id,
             )
+        if routable and model and POOL_ENABLED:
+            with self.cv:
+                narrowed = self._policy_constraint_locked(model, gpu_uuids)
+            if narrowed == ():
+                raise PermanentCapacityError(
+                    f"model {model!r} is restricted to GPUs "
+                    f"{self.model_gpu_policy.get(model)}, none of which the "
+                    "request allows",
+                    409,
+                    "gpu_policy_conflict",
+                    request_id=request_id,
+                    logical_request_id=logical_request_id,
+                )
         enqueued_at = time.monotonic()
         wait_seconds = DRAIN_TIMEOUT
         if admission_wait is not None:
@@ -4037,6 +4106,7 @@ class Broker:
         succeeded: bool,
         logical_request_id: str = "",
     ) -> None:
+        retired = None
         with self.cv:
             lane.in_flight = max(0, lane.in_flight - 1)
             lane.last_used = time.time()
@@ -4045,7 +4115,18 @@ class Broker:
             self.active_requests = max(0, self.active_requests - 1)
             if logical_request_id:
                 self.logical_in_flight.pop(logical_request_id, None)
+            if (lane.kind == "managed" and lane.retiring and not lane.in_flight
+                    and self.lanes.get(lane.lane_id) is lane):
+                # A lane moved off a disallowed GPU finishes its requests
+                # first, then stops.
+                self.lanes.pop(lane.lane_id)
+                retired = lane
             self.cv.notify_all()
+        if retired is not None:
+            threading.Thread(
+                target=self._stop_lanes, args=([retired], "operator GPU policy"),
+                daemon=True,
+            ).start()
 
     def begin_drain(self, reason: str) -> None:
         deadline = time.monotonic() + DRAIN_TIMEOUT
@@ -4514,6 +4595,82 @@ class Broker:
             self._revoke_locked(lease, reason)
             return {"ok": True, "lease": asdict(lease)}
 
+    def set_model_gpus(self, model: str,
+                       gpu_uuids: list[str] | None) -> dict[str, Any]:
+        """Set which GPUs may host a model's lanes, moving lanes that break it.
+
+        Idle lanes on a now-disallowed GPU stop at once, busy ones after
+        their in-flight requests. Replacements start on allowed GPUs in the
+        background under normal capacity rules; if none fits, the next
+        request for the model queues for capacity as usual.
+        """
+        model = canonical_model_tag(model)
+        if not model:
+            raise ValueError("model GPU policy requires a model tag")
+        known = SELECTED_GPUS or [
+            str(device.get("uuid")) for device in gpu_snapshot()
+        ]
+        allowed = None
+        if gpu_uuids is not None:
+            allowed = list(dict.fromkeys(str(value) for value in gpu_uuids))
+            if not allowed:
+                raise ValueError(
+                    "at least one GPU must stay allowed; clear the policy "
+                    "to allow every GPU"
+                )
+            unknown = [value for value in allowed if value not in known]
+            if unknown:
+                raise ValueError(f"GPUs are not brokered here: {unknown}")
+            if set(allowed) >= set(known):
+                allowed = None
+        with self.cv:
+            if allowed is None:
+                self.model_gpu_policy.pop(model, None)
+            else:
+                self.model_gpu_policy[model] = allowed
+            self._persist_model_policy_locked()
+            moved, retiring = [], []
+            for lane in list(self.lanes.values()):
+                if (lane.kind != "managed" or lane.model != model
+                        or allowed is None or lane.gpu_uuid in allowed
+                        or lane.retiring):
+                    continue
+                lane.retiring = True
+                if lane.in_flight:
+                    retiring.append(lane.lane_id)
+                else:
+                    self.lanes.pop(lane.lane_id)
+                    moved.append(lane)
+            staying = sum(
+                lane.parallel for lane in self.lanes.values()
+                if lane.kind == "managed" and lane.model == model
+                and not lane.retiring
+            )
+            wanted = staying + sum(lane.parallel for lane in moved) + (
+                len(retiring) * POOL_INSTANCE_PARALLEL
+            )
+            self.cv.notify_all()
+        LOG.warning("model GPU policy model=%s allowed=%s moving=%s",
+                    model, allowed or "all", [lane.lane_id for lane in moved] + retiring)
+
+        def migrate() -> None:
+            self._stop_lanes(moved, "operator GPU policy")
+            if not moved and not retiring:
+                return
+            try:
+                self.ensure_capacity(
+                    model, max(1, wanted),
+                    triggered_by={"key": "operator", "label": "operator GPU policy"},
+                )
+            except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
+                LOG.warning("model %s could not move to allowed GPUs yet: %s",
+                            model, exc)
+
+        threading.Thread(target=migrate, daemon=True).start()
+        return {"ok": True, "model": model, "allowed_gpu_uuids": allowed,
+                "stopping_lanes": [lane.lane_id for lane in moved],
+                "retiring_lanes": retiring}
+
     def stop_lane(self, lane_id: str, force: bool = False) -> dict[str, Any]:
         with self.cv:
             self._prune_dead_lanes_locked()
@@ -4639,6 +4796,9 @@ class Broker:
             queue = self._queue_summary_locked(include_requests=True)
             completed_responses = self._completed_response_summary_locked()
             clients = self._client_summaries_locked()
+            model_gpu_policy = {
+                model: list(gpus) for model, gpus in self.model_gpu_policy.items()
+            }
         backend = probe_backend()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
@@ -4661,6 +4821,7 @@ class Broker:
                     "completed_responses": completed_responses,
                 },
                 "clients": clients,
+                "model_gpu_policy": model_gpu_policy,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
@@ -5446,6 +5607,13 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         str(request.get("token") or ""),
                         str(request.get("reason") or "operator revoke"),
                     )
+                elif action == "set_model_gpus":
+                    requested = request.get("gpu_uuids")
+                    result = self.broker.set_model_gpus(
+                        str(request.get("model") or ""),
+                        None if requested is None
+                        else [str(value) for value in requested],
+                    )
                 elif action == "stop_lane":
                     result = self.broker.stop_lane(
                         str(request.get("lane_id") or ""),
@@ -6085,7 +6253,6 @@ def lease_actions(lease: dict[str, Any], inventory: dict[str, dict[str, str]]
     token = lease.get("token") or ""
     owner = lease.get("owner") or "unknown"
     state = lease.get("state")
-    gpu_uuids = list(lease.get("gpu_uuids") or [])
     actions = []
     if state == "pending":
         actions.append(action(
@@ -6106,18 +6273,6 @@ def lease_actions(lease: dict[str, Any], inventory: dict[str, dict[str, str]]
         actions.append(action(
             "Renew heartbeat", {"action": "heartbeat", "token": token},
         ))
-        if len(gpu_uuids) > 1:
-            for gpu_uuid in gpu_uuids:
-                remaining = [value for value in gpu_uuids if value != gpu_uuid]
-                actions.append(action(
-                    f"Remove {gpu_name(gpu_uuid, inventory)} from lease…",
-                    {"action": "scope", "token": token, "gpu_uuids": remaining},
-                    f"Remove {gpu_name(gpu_uuid, inventory)} from {owner}'s "
-                    f"lease, leaving {gpu_list(remaining, inventory)}?\n\n"
-                    "The broker refuses if the owner's CUDA memory grew on "
-                    "the removed GPU. A lease narrowed to one GPU is no "
-                    "longer exclusive and can share its free VRAM with Ollama.",
-                ))
         actions.append(action(
             "Revoke lease…",
             {"action": "revoke", "token": token, "reason": "operator revoke from tray"},
@@ -6159,6 +6314,117 @@ def lane_actions(lane: dict[str, Any], gpu: str) -> list[dict[str, Any]]:
         f"({lane.get('in_flight') or 0}) fail immediately.",
     ))
     return actions
+
+
+def toggle(key: str, label: str, active: bool, enabled: bool,
+           spec: dict[str, Any]) -> dict[str, Any]:
+    return {"key": key, "label": label, "active": active, "enabled": enabled,
+            "spec": spec}
+
+
+def gpu_toggle_label(gpu_uuid: str, inventory: dict[str, dict[str, str]],
+                     note: str = "") -> str:
+    name = inventory.get(gpu_uuid, {}).get("name")
+    label = gpu_name(gpu_uuid, inventory) + (f" · {name}" if name else "")
+    return label + (f" ({note})" if note else "")
+
+
+def flipped(brokered: list[str], current: list[str], gpu_uuid: str) -> list[str]:
+    """Return current with gpu_uuid toggled, in brokered order."""
+    return [value for value in brokered
+            if (value in current) != (value == gpu_uuid)]
+
+
+def model_gpu_submenu(model: str, policy: dict[str, list[str]],
+                      brokered: list[str], reserved: dict[str, str],
+                      inventory: dict[str, dict[str, str]]) -> dict[str, Any]:
+    allowed = policy.get(model)
+    effective = [value for value in brokered if allowed is None or value in allowed]
+    toggles = []
+    for gpu_uuid in brokered:
+        active = gpu_uuid in effective
+        verb = "Disallow" if active else "Allow"
+        toggles.append(toggle(
+            gpu_uuid,
+            gpu_toggle_label(gpu_uuid, inventory, (
+                f"exclusive to {reserved[gpu_uuid]}" if gpu_uuid in reserved else ""
+            )),
+            active,
+            # The last allowed GPU cannot be switched off; clear instead.
+            not (active and len(effective) == 1),
+            action(
+                f"{verb} {gpu_name(gpu_uuid, inventory)} for {model}",
+                {"action": "set_model_gpus", "model": model,
+                 "gpu_uuids": flipped(brokered, effective, gpu_uuid)},
+            ),
+        ))
+    return {
+        "key": "gpu-policy",
+        "title": "Allowed GPUs: " + (
+            "all" if allowed is None else gpu_list(allowed, inventory)
+        ),
+        "details": wrapped("", f"Applies to every {model} lane; lanes on a "
+                           "disallowed GPU move once their requests finish."),
+        "toggles": toggles,
+        "actions": [action(
+            "Allow all GPUs",
+            {"action": "set_model_gpus", "model": model, "gpu_uuids": None},
+        )] if allowed is not None else [],
+    }
+
+
+def lease_gpu_submenu(lease: dict[str, Any], leases: list[dict[str, Any]],
+                      brokered: list[str],
+                      inventory: dict[str, dict[str, str]]) -> dict[str, Any]:
+    token = lease.get("token") or ""
+    owner = lease.get("owner") or "unknown"
+    scope = [str(value) for value in lease.get("gpu_uuids") or []]
+    held = {
+        gpu_uuid: other.get("owner")
+        for other in leases if other is not lease
+        and other.get("state") in ("pending", "active", "revoking")
+        for gpu_uuid in other.get("gpu_uuids") or []
+    }
+    toggles = []
+    for gpu_uuid in brokered:
+        active = gpu_uuid in scope
+        name = gpu_name(gpu_uuid, inventory)
+        new_scope = flipped(brokered, scope, gpu_uuid)
+        if active:
+            confirm = (
+                f"Remove {name} from {owner}'s lease?\n\nThe broker refuses if "
+                "the owner's CUDA memory grew on that GPU. A lease narrowed to "
+                "one GPU is no longer exclusive and shares free VRAM with Ollama."
+            )
+        else:
+            confirm = (
+                f"Add {name} to {owner}'s lease?\n\nThe broker reserves it for "
+                "this lease; the owner only uses it once its process sees that "
+                "GPU. A lease of two or more GPUs is exclusive, so Ollama lanes "
+                "on its GPUs stop."
+            )
+        toggles.append(toggle(
+            gpu_uuid,
+            gpu_toggle_label(gpu_uuid, inventory, (
+                f"leased by {held[gpu_uuid]}" if gpu_uuid in held else ""
+            )),
+            active,
+            gpu_uuid not in held and not (active and len(scope) == 1),
+            action(
+                f"{'Remove' if active else 'Add'} {name} "
+                f"{'from' if active else 'to'} lease",
+                {"action": "scope", "token": token, "gpu_uuids": new_scope},
+                confirm,
+            ),
+        ))
+    return {
+        "key": "lease-gpus",
+        "title": "GPUs in lease: " + (gpu_list(scope, inventory) if scope
+                                      else "host-wide (unscoped)"),
+        "details": [],
+        "toggles": toggles,
+        "actions": [],
+    }
 
 
 def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
@@ -6267,6 +6533,15 @@ def build_menu_model(
         if separator and pid.isdigit():
             foreign.setdefault(gpu_uuid, []).append((int(pid), int(used_mib)))
 
+    brokered = list(selected_gpus) or [
+        str(device.get("uuid")) for device in status.get("gpus") or []
+    ]
+    policy = status.get("model_gpu_policy") or {}
+    reserved = {
+        gpu_uuid: str(lease.get("owner"))
+        for lease in leases if len(lease.get("gpu_uuids") or []) > 1
+        for gpu_uuid in lease.get("gpu_uuids") or []
+    }
     attention = bool(status.get("draining"))
     lease_entries = []
     for lease in sorted(leases, key=lambda item: float(item.get("created_at") or 0)):
@@ -6286,6 +6561,8 @@ def build_menu_model(
             ),
             "details": lease_details(lease, summary, inventory, now),
             "actions": lease_actions(lease, inventory),
+            "submenus": [lease_gpu_submenu(lease, leases, brokered, inventory)]
+            if lease.get("state") in ("pending", "active") else [],
         })
 
     lane_entries = []
@@ -6310,6 +6587,9 @@ def build_menu_model(
                 for usage in lane.get("clients") or []
             ],
             "actions": lane_actions(lane, gpu),
+            "submenus": [model_gpu_submenu(
+                str(lane.get("model")), policy, brokered, reserved, inventory,
+            )] if lane.get("model") else [],
         })
 
     client_entries = [
@@ -6384,20 +6664,34 @@ def menu_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
         return {"group": group, "key": key, "kind": kind, "label": label,
                 **extra}
 
-    def entry_rows(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    def entry_rows(entry: dict[str, Any], copy: bool = True
+                   ) -> list[dict[str, Any]]:
         rows = [row("details", f"detail:{index}", "info", line)
                 for index, line in enumerate(entry["details"])]
-        if entry["actions"]:
+        rows += [
+            row("toggles", item["key"], "toggle", item["label"],
+                active=item["active"], enabled=item["enabled"],
+                spec=item["spec"])
+            for item in entry.get("toggles") or []
+        ]
+        submenus = entry.get("submenus") or []
+        if entry["actions"] or submenus:
             rows.append(row("actions:separator", "separator", "separator"))
+        rows += [
+            row("submenus", sub["key"], "entry", sub["title"],
+                rows=entry_rows(sub, copy=False))
+            for sub in submenus
+        ]
         rows += [
             row("actions", f"action:{spec['label']}", "action", spec["label"],
                 spec=spec)
             for spec in entry["actions"]
         ]
-        rows.append(row(
-            "copy", "copy", "copy", "Copy details",
-            text="\n".join([entry["title"]] + entry["details"]),
-        ))
+        if copy:
+            rows.append(row(
+                "copy", "copy", "copy", "Copy details",
+                text="\n".join([entry["title"]] + entry["details"]),
+            ))
         return rows
 
     rows = [row("summary", f"summary:{index}", "info", line)
@@ -6458,6 +6752,9 @@ class TrayApp:
         self.group_order: dict[tuple, list[str]] = {}
         self.generation = 0
         self.layout_changed = False
+        # Set while the tray itself changes a check item, whose GTK
+        # set_active emits the same activate signal as a user click.
+        self.applying = False
         self.inventory: dict[str, dict[str, str]] = {}
         self.inventory_at = 0.0
         self.selected_gpus = [
@@ -6602,6 +6899,9 @@ class TrayApp:
     def create_slot(self, kind: str, slot_path: tuple) -> dict[str, Any]:
         if kind == "separator":
             widget = Gtk.SeparatorMenuItem()
+        elif kind == "toggle":
+            widget = Gtk.CheckMenuItem.new_with_mnemonic("")
+            widget.connect("activate", lambda _item: self.activate(slot_path))
         else:
             widget = Gtk.MenuItem.new_with_mnemonic("")
             if kind == "entry":
@@ -6619,13 +6919,23 @@ class TrayApp:
             text = row["label"].replace("_", "__")
             if widget.get_label() != text:
                 widget.set_label(text)
-            sensitive = row["kind"] != "info"
+            sensitive = row.get("enabled", row["kind"] != "info")
             if widget.get_sensitive() != sensitive:
                 widget.set_sensitive(sensitive)
+            if row["kind"] == "toggle":
+                self.set_toggle(widget, row["active"])
         if not widget.get_visible():
             widget.show()
         if row["kind"] == "entry":
             self.sync_menu(widget.get_submenu(), row["rows"], slot["path"])
+
+    def set_toggle(self, widget: Any, active: bool) -> None:
+        if widget.get_active() != active:
+            self.applying = True
+            try:
+                widget.set_active(active)
+            finally:
+                self.applying = False
 
     def slot_at(self, slot_path: tuple) -> dict[str, Any] | None:
         *parent, (group, index) = slot_path
@@ -6635,11 +6945,18 @@ class TrayApp:
     def activate(self, slot_path: tuple) -> None:
         # Read the slot's row at click time so a reused item acts on the
         # entry it currently shows.
+        if self.applying:
+            return
         slot = self.slot_at(slot_path)
         row = slot["row"] if slot else None
         if row is None:
             return
-        if row["kind"] == "action":
+        if row["kind"] == "toggle":
+            # Show the broker's state until it confirms the change; the next
+            # poll renders the result.
+            self.set_toggle(slot["widget"], row["active"])
+            self.trigger(row["spec"])
+        elif row["kind"] == "action":
             self.trigger(row["spec"])
         elif row["kind"] == "copy":
             Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(row["text"], -1)

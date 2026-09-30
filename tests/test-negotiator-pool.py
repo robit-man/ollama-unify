@@ -1383,6 +1383,90 @@ def test_client_attribution(helper, fixture_bin):
         assert lanes[other_lane]["triggered_by"]["key"] == undeclared["key"]
 
 
+def model_lane_gpus(harness, model):
+    return sorted(
+        lane["gpu_uuid"] for lane in managed_lanes(harness.status())
+        if lane["model"] == model and lane["state"] == "ready"
+    )
+
+
+def test_operator_model_gpu_policy(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=3, tags=[MODEL],
+    ) as harness:
+        status, capacity, _ = harness.capacity(MODEL, gpu_uuids=["GPU-large-0"])
+        assert status == 200, capacity
+        first_lane = capacity["lanes"][0]["id"]
+
+        # An idle lane on a newly disallowed GPU moves to an allowed one.
+        moved = control(harness.socket_path, {
+            "action": "set_model_gpus", "model": MODEL_WITHOUT_TAG,
+            "gpu_uuids": ["GPU-large-1"],
+        })
+        assert moved["allowed_gpu_uuids"] == ["GPU-large-1"]
+        assert moved["stopping_lanes"] == [first_lane]
+        wait_until(
+            lambda: model_lane_gpus(harness, MODEL) == ["GPU-large-1"],
+            "lane moved to the allowed GPU", timeout=20,
+        )
+        assert harness.status()["model_gpu_policy"] == {MODEL: ["GPU-large-1"]}
+        with open(os.path.join(harness.temp_dir, "model-gpu-policy.json"),
+                  encoding="utf-8") as stream:
+            assert json.load(stream)["models"] == {MODEL: ["GPU-large-1"]}
+
+        status, payload, headers = chat(harness.proxy_port, MODEL, "on-policy")
+        assert status == 200, payload
+        served = next(lane for lane in managed_lanes(harness.status())
+                      if lane["id"] == headers["X-Ollama-Unify-Lane"])
+        assert served["gpu_uuid"] == "GPU-large-1"
+
+        status, payload, _ = harness.capacity(MODEL, gpu_uuids=["GPU-large-0"])
+        assert status == 409, payload
+        assert payload["reason_code"] == "gpu_policy_conflict"
+        status, payload, _ = chat(
+            harness.proxy_port, MODEL, "off-policy", gpu_uuids=["GPU-large-0"],
+        )
+        assert status == 409, payload
+
+        for bad in ([], ["GPU-missing"]):
+            refused = control_raw(harness.socket_path, {
+                "action": "set_model_gpus", "model": MODEL, "gpu_uuids": bad,
+            })
+            assert refused["ok"] is False, refused
+
+        # A busy lane finishes its request before it moves.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            busy = executor.submit(
+                chat, harness.proxy_port, MODEL, "busy-during-move", delay=2,
+            )
+            wait_until(
+                lambda: any(lane["in_flight"] for lane in
+                            managed_lanes(harness.status())),
+                "request in flight",
+            )
+            retired = control(harness.socket_path, {
+                "action": "set_model_gpus", "model": MODEL,
+                "gpu_uuids": ["GPU-large-2"],
+            })
+            assert retired["retiring_lanes"] and not retired["stopping_lanes"]
+            status, payload, _ = busy.result(timeout=20)
+            assert status == 200, payload
+        wait_until(
+            lambda: model_lane_gpus(harness, MODEL) == ["GPU-large-2"],
+            "busy lane moved after its request", timeout=20,
+        )
+
+        # Allowing every brokered GPU clears the policy.
+        cleared = control(harness.socket_path, {
+            "action": "set_model_gpus", "model": MODEL,
+            "gpu_uuids": ["GPU-large-0", "GPU-large-1", "GPU-large-2"],
+        })
+        assert cleared["allowed_gpu_uuids"] is None
+        assert harness.status()["model_gpu_policy"] == {}
+        status, capacity, _ = harness.capacity(MODEL, gpu_uuids=["GPU-large-0"])
+        assert status == 200, capacity
+
+
 def capacity_when_ready(harness, model, parallel=1):
     status, payload, headers = harness.capacity(model, parallel)
     return (status, payload, headers) if status == 200 else None
@@ -2491,6 +2575,7 @@ def main():
     test_multi_gpu_lease_is_exclusive_for_its_lifetime(helper, fixture_bin)
     test_operator_revoke_and_lane_stop(helper, fixture_bin)
     test_client_attribution(helper, fixture_bin)
+    test_operator_model_gpu_policy(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
@@ -2532,6 +2617,7 @@ def main():
         "terminal admission failures, controlled-load admission and replay bounds, "
         "dead-owner lease reclamation, exclusive multi-GPU leases, "
         "operator revoke and lane stop, client attribution, "
+        "operator model GPU policy, "
         "content-type-independent routing)"
     )
 

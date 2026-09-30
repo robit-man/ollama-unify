@@ -129,17 +129,24 @@ def test_menu_model(tray):
     assert f"GPUs: GPU0 + GPU2 + {unlisted} (exclusive)" in peer["details"]
     assert labels(peer) == [
         "Prepare for resize…", "Renew heartbeat",
-        "Remove GPU0 from lease…", "Remove GPU2 from lease…",
-        f"Remove {unlisted} from lease…",
         "Revoke lease…", "Release lease…", "Force release…",
     ]
     peer_requests = requests(peer)
+    (scope_menu,) = peer["submenus"]
+    assert scope_menu["title"] == f"GPUs in lease: GPU0 + GPU2 + {unlisted}"
+    toggles = {item["key"]: item for item in scope_menu["toggles"]}
+    assert list(toggles) == [GPU0, GPU1, GPU2, GPU4]
+    assert [toggles[gpu]["active"] for gpu in toggles] == [True, False, True, True]
+    # GPU1 belongs to another lease, so it cannot be added here.
+    assert toggles[GPU1]["enabled"] is False
+    assert toggles[GPU1]["label"] == "GPU1 · Mock CUDA 24GB (leased by single-gpu)"
     for removed in (GPU0, GPU2, GPU4):
-        label = f"Remove {tray.gpu_name(removed, INVENTORY)} from lease…"
-        assert peer_requests[label] == {
+        assert toggles[removed]["enabled"] is True
+        assert toggles[removed]["spec"]["request"] == {
             "action": "scope", "token": "lease_tensor-parallel",
             "gpu_uuids": [gpu for gpu in (GPU0, GPU2, GPU4) if gpu != removed],
         }
+        assert toggles[removed]["spec"]["confirm"]
     assert peer_requests["Force release…"]["force"] is True
     assert peer_requests["Revoke lease…"]["action"] == "revoke"
     assert all(action["confirm"] for action in peer["actions"]
@@ -148,10 +155,15 @@ def test_menu_model(tray):
     assert pending["title"] == "single-gpu · GPU1 · pending ⚠"
     assert "Expected release: overdue by 2 min" in pending["details"]
     assert labels(pending)[0] == "Mark ready"
-    assert not [label for label in labels(pending) if label.startswith("Remove")]
+    pending_toggles = {item["key"]: item for item in pending["submenus"][0]["toggles"]}
+    # The only GPU in a lease cannot be switched off.
+    assert pending_toggles[GPU1]["active"] and not pending_toggles[GPU1]["enabled"]
+    # GPU3 is not brokered, so it is not offered.
+    assert GPU3 not in pending_toggles
 
     assert revoking["title"] == "revoked-owner · all GPUs · revoking ⚠"
     assert labels(revoking) == ["Release lease…", "Force release…"]
+    assert revoking["submenus"] == []
 
     idle, busy = model["lanes"]
     assert idle["title"] == "fixture_small:latest · GPU1 · ready"
@@ -174,6 +186,18 @@ def test_menu_model(tray):
     ):
         assert line in client["details"], line
     assert labels(idle) == ["Stop lane…", "Force stop lane…"]
+    (policy_menu,) = idle["submenus"]
+    assert policy_menu["title"] == "Allowed GPUs: all"
+    assert policy_menu["actions"] == []
+    lane_toggles = {item["key"]: item for item in policy_menu["toggles"]}
+    assert all(item["active"] and item["enabled"] for item in lane_toggles.values())
+    assert lane_toggles[GPU0]["label"] == (
+        "GPU0 · Mock CUDA 48GB (exclusive to tensor-parallel)"
+    )
+    assert lane_toggles[GPU1]["spec"]["request"] == {
+        "action": "set_model_gpus", "model": "fixture_small:latest",
+        "gpu_uuids": [GPU0, GPU2, GPU4],
+    }
     assert labels(busy) == ["Force stop lane…"]
     assert requests(busy)["Force stop lane…"] == {
         "action": "stop_lane", "lane_id": "lane-2", "force": True,
@@ -193,6 +217,28 @@ def test_menu_model(tray):
     assert "PCI bus: unknown" in gpus[unlisted]["details"]
 
 
+def test_model_gpu_policy_menu(tray):
+    status = status_fixture()
+    status["model_gpu_policy"] = {"fixture_small:latest": [GPU1]}
+    model = build(tray, status)
+    idle = model["lanes"][0]
+    (policy_menu,) = idle["submenus"]
+    assert policy_menu["title"] == "Allowed GPUs: GPU1"
+    toggles = {item["key"]: item for item in policy_menu["toggles"]}
+    assert [gpu for gpu, item in toggles.items() if item["active"]] == [GPU1]
+    assert toggles[GPU1]["enabled"] is False
+    assert toggles[GPU2]["spec"]["request"]["gpu_uuids"] == [GPU1, GPU2]
+    assert policy_menu["actions"][0]["request"] == {
+        "action": "set_model_gpus", "model": "fixture_small:latest",
+        "gpu_uuids": None,
+    }
+    rows = tray.menu_rows(model)
+    lane_row = next(row for row in rows if row["key"] == "lane-1")
+    sub_row = next(row for row in lane_row["rows"] if row["kind"] == "entry")
+    assert [row["kind"] for row in sub_row["rows"]].count("toggle") == 4
+    assert not [row for row in sub_row["rows"] if row["kind"] == "copy"]
+
+
 def test_single_device_host(tray):
     status = {
         "ok": True, "draining": False, "backend_available": True,
@@ -206,7 +252,9 @@ def test_single_device_host(tray):
     (solo,) = model["leases"]
     assert "(exclusive)" not in " ".join(solo["details"])
     assert "Expected release: unknown (legacy lease)" in solo["details"]
-    assert not [label for label in labels(solo) if label.startswith("Remove")]
+    solo_toggles = solo["submenus"][0]["toggles"]
+    assert [(item["key"], item["active"], item["enabled"])
+            for item in solo_toggles] == [(GPU3, True, False)]
     assert model["gpus"][0]["title"] == f"{GPU3[:12]} · GPU · 1.9 GB / 2.0 GB · leased"
 
 
@@ -373,8 +421,27 @@ def test_open_menu_survives_updates(tray):
     assert slot_for(app, "lane-9")["widget"].get_label() == (
         "fixture-swapped:latest · GPU2 · ready"
     )
+    # Toggles: rendering a new policy flips check items without firing
+    # actions; a click fires exactly one and shows broker state until it
+    # confirms.
+    fired = []
+    app.trigger = fired.append
+    app.render(first)
+    lane_slot = slot_for(app, "lane-1")
+    policy_slot = slot_for(app, "gpu-policy", lane_slot["path"])
+    gpu1 = slot_for(app, GPU1, policy_slot["path"])
+    assert gpu1["widget"].get_active() is True
+    restricted = status_fixture()
+    restricted["model_gpu_policy"] = {"fixture_small:latest": [GPU0]}
+    app.render(build(tray, restricted))
+    assert gpu1["widget"].get_active() is False and fired == []
+    gpu1["widget"].activate()
+    assert [spec["request"]["gpu_uuids"] for spec in fired] == [[GPU0, GPU1]]
+    assert gpu1["widget"].get_active() is False
+
     print("tray GTK reconciliation: PASS (items reused and relabelled, "
           "vanished rows hidden in place, entry swaps absorbed by spares, "
+          "guarded GPU toggles, "
           "no layout change in steady state)")
 
 
@@ -395,6 +462,7 @@ def test_offline_and_idle_models(tray):
 def main():
     tray = load_tray(sys.argv[1])
     test_menu_model(tray)
+    test_model_gpu_policy_menu(tray)
     test_single_device_host(tray)
     test_units_and_timeouts(tray)
     test_offline_and_idle_models(tray)
