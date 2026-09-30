@@ -98,8 +98,12 @@ def test_process_names_and_inference(negotiator, tmp):
         child.wait()
     key = negotiator.client_key_and_label
     assert key({"unit": "vte-spawn-1.scope", "user": "roko",
-                "candidate_processes": ["claude", "curl"]}) == (
+                "candidate_processes": ["bash", "claude", "curl"]}) == (
         "unit:roko:vte-spawn-1.scope", "claude / curl (roko)",
+    )
+    assert key({"unit": "session-3.scope", "user": "roko",
+                "candidate_processes": ["bash", "sshd"]}) == (
+        "unit:roko:session-3.scope", "bash / sshd (roko)",
     )
 
 

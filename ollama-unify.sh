@@ -1993,8 +1993,10 @@ def client_key_and_label(identity: dict[str, Any]) -> tuple[str, str]:
         return (f"process:{user}:{identity['process']}",
                 f"{identity['process']}{by}")
     if identity.get("candidate_processes"):
-        return (f"unit:{user}:{unit}",
-                f"{' / '.join(identity['candidate_processes'])}{by}")
+        names = identity["candidate_processes"]
+        programs = [name for name in names
+                    if name.split(" ", 1)[0] not in SESSION_PROGRAMS]
+        return f"unit:{user}:{unit}", f"{' / '.join(programs or names)}{by}"
     if unit:
         return f"unit:{user}:{unit}", f"{unit}{by}"
     agent = identity.get("user_agent") or "unknown client"
