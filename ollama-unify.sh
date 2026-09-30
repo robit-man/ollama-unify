@@ -5941,53 +5941,54 @@ def build_menu_model(
 
 
 def menu_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
-    """Describe the menu as keyed rows so updates can be applied in place."""
-    def info(key: str, label: str) -> dict[str, Any]:
-        return {"key": key, "kind": "info", "label": label}
+    """Describe the menu as keyed rows in fixed, homogeneous groups.
 
-    def separator(key: str) -> dict[str, Any]:
-        return {"key": key, "kind": "separator"}
+    The tray maps each group to a pool of reusable items, so the order and
+    kind of groups never change and updates stay property-only.
+    """
+    def row(group: str, key: str, kind: str, label: str = "",
+            **extra: Any) -> dict[str, Any]:
+        return {"group": group, "key": key, "kind": kind, "label": label,
+                **extra}
 
     def entry_rows(entry: dict[str, Any]) -> list[dict[str, Any]]:
-        rows = [info(f"detail:{index}", line)
+        rows = [row("details", f"detail:{index}", "info", line)
                 for index, line in enumerate(entry["details"])]
         if entry["actions"]:
-            rows.append(separator("separator:actions"))
+            rows.append(row("actions:separator", "separator", "separator"))
         rows += [
-            {"key": f"action:{spec['label']}", "kind": "action",
-             "label": spec["label"], "spec": spec}
+            row("actions", f"action:{spec['label']}", "action", spec["label"],
+                spec=spec)
             for spec in entry["actions"]
         ]
-        rows.append({
-            "key": "copy", "kind": "copy", "label": "Copy details",
-            "text": "\n".join([entry["title"]] + entry["details"]),
-        })
+        rows.append(row(
+            "copy", "copy", "copy", "Copy details",
+            text="\n".join([entry["title"]] + entry["details"]),
+        ))
         return rows
 
-    rows = [info(f"summary:{index}", line)
+    rows = [row("summary", f"summary:{index}", "info", line)
             for index, line in enumerate(model["summary"])]
     for heading, section, empty in (
-        ("GPUs", "gpus", None),
+        ("GPUs", "gpus", "No GPUs reported"),
         ("Leases", "leases", "No active leases"),
         ("Ollama lanes", "lanes", "No Ollama lanes running"),
     ):
-        if not model[section] and empty is None:
-            continue
-        rows += [separator(f"separator:{section}"),
-                 info(f"heading:{section}", heading)]
-        if not model[section]:
-            rows.append(info(f"empty:{section}", "    " + empty))
         rows += [
-            {"key": f"{section}:{entry['key']}", "kind": "entry",
-             "label": entry["title"], "rows": entry_rows(entry)}
+            row(f"{section}:separator", "separator", "separator"),
+            row(f"{section}:heading", "heading", "info", heading),
+        ]
+        if not model[section]:
+            rows.append(row(f"{section}:heading", "empty", "info", "    " + empty))
+        rows += [
+            row(section, entry["key"], "entry", entry["title"],
+                rows=entry_rows(entry))
             for entry in model[section]
         ]
     rows += [
-        separator("separator:commands"),
-        {"key": "refresh", "kind": "command", "command": "refresh",
-         "label": "Refresh now"},
-        {"key": "quit", "kind": "command", "command": "quit",
-         "label": "Quit indicator"},
+        row("commands:separator", "separator", "separator"),
+        row("commands", "refresh", "command", "Refresh now", command="refresh"),
+        row("commands", "quit", "command", "Quit indicator", command="quit"),
     ]
     return rows
 
@@ -6014,10 +6015,14 @@ class TrayApp:
         self.signature: str | None = None
         self.icon: str | None = None
         self.label: str | None = None
-        # Widgets and their latest row, keyed by the path of stable row keys
-        # from the top menu down. Reusing them keeps an open menu open.
-        self.widgets: dict[tuple[str, ...], Any] = {}
-        self.rows: dict[tuple[str, ...], dict[str, Any]] = {}
+        # Per menu (identified by the slot path leading to it), each row group
+        # owns an ordered pool of item slots. Slots are hidden and reused
+        # rather than removed, so steady-state updates never change the
+        # exported menu layout; a layout change would make the shell rebuild
+        # every submenu item and close whatever the user has open.
+        self.slots: dict[tuple, dict[str, list[dict[str, Any]]]] = {}
+        self.group_order: dict[tuple, list[str]] = {}
+        self.generation = 0
         self.inventory: dict[str, dict[str, str]] = {}
         self.inventory_at = 0.0
         self.selected_gpus = [
@@ -6064,80 +6069,92 @@ class TrayApp:
         if model.get("label") != self.label:
             self.label = model.get("label")
             self.indicator.set_label(self.label or "", "00L · 00O")
+        self.generation += 1
         self.sync_menu(self.menu, menu_rows(model), ())
         return False
 
     def sync_menu(self, menu: Any, rows: list[dict[str, Any]],
-                  path: tuple[str, ...]) -> None:
-        """Reconcile menu children with rows in place.
+                  path: tuple) -> None:
+        """Apply rows to a menu using only property changes when possible.
 
-        Replacing the children would close a menu the user has open, so
-        existing items are kept, relabelled, and reordered; only rows that
-        appear or disappear add or remove items.
+        A row keeps its slot while its key lives. A vanished row hides its
+        slot; a new row takes a slot hidden in an earlier update, so an open
+        submenu never switches to another entry's data. Only a group growing
+        past every size it has had creates an item.
         """
-        wanted = {row["key"] for row in rows}
-        keys_by_widget = {
-            id(widget): item_path[-1]
-            for item_path, widget in self.widgets.items()
-            if item_path[:-1] == path
-        }
-        for child in list(menu.get_children()):
-            key = keys_by_widget.get(id(child))
-            if key not in wanted:
-                menu.remove(child)
-                if key is not None:
-                    self.forget(path + (key,))
-        for position, row in enumerate(rows):
-            item_path = path + (row["key"],)
-            widget = self.widgets.get(item_path)
-            previous = self.rows.get(item_path)
-            if widget is not None and previous and previous["kind"] != row["kind"]:
-                menu.remove(widget)
-                self.forget(item_path)
-                widget = None
-            if widget is None:
-                widget = self.create_item(row, item_path)
-                menu.insert(widget, position)
-                self.widgets[item_path] = widget
-            elif menu.get_children().index(widget) != position:
-                menu.reorder_child(widget, position)
-            self.rows[item_path] = row
-            if row["kind"] == "separator":
-                continue
+        by_group: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_group.setdefault(row["group"], []).append(row)
+        order = self.group_order.setdefault(path, [])
+        previous = None
+        for group in by_group:
+            if group not in order:
+                order.insert(order.index(previous) + 1 if previous else 0, group)
+            previous = group
+        pools = self.slots.setdefault(path, {})
+        offset = 0
+        for group in order:
+            pool = pools.setdefault(group, [])
+            wanted = by_group.get(group, [])
+            keys = {row["key"] for row in wanted}
+            for slot in pool:
+                if slot["row"] is not None and slot["row"]["key"] not in keys:
+                    slot["row"] = None
+                    slot["freed"] = self.generation
+                    slot["widget"].hide()
+            for row in wanted:
+                slot = next(
+                    (slot for slot in pool if slot["row"] is not None
+                     and slot["row"]["key"] == row["key"]), None,
+                ) or next(
+                    (slot for slot in pool if slot["row"] is None
+                     and slot["freed"] < self.generation), None,
+                )
+                if slot is None:
+                    slot = self.create_slot(row["kind"], path + ((group, len(pool)),))
+                    menu.insert(slot["widget"], offset + len(pool))
+                    pool.append(slot)
+                slot["row"] = row
+                self.apply_row(slot)
+            offset += len(pool)
+
+    def create_slot(self, kind: str, slot_path: tuple) -> dict[str, Any]:
+        if kind == "separator":
+            widget = Gtk.SeparatorMenuItem()
+        else:
+            widget = Gtk.MenuItem.new_with_mnemonic("")
+            if kind == "entry":
+                widget.set_submenu(Gtk.Menu())
+            elif kind != "info":
+                widget.connect(
+                    "activate", lambda _item: self.activate(slot_path)
+                )
+        return {"widget": widget, "row": None, "freed": 0, "path": slot_path}
+
+    def apply_row(self, slot: dict[str, Any]) -> None:
+        widget, row = slot["widget"], slot["row"]
+        if row["kind"] != "separator":
             text = row["label"].replace("_", "__")
             if widget.get_label() != text:
                 widget.set_label(text)
             sensitive = row["kind"] != "info"
             if widget.get_sensitive() != sensitive:
                 widget.set_sensitive(sensitive)
-            if row["kind"] == "entry":
-                submenu = widget.get_submenu()
-                if submenu is None:
-                    submenu = Gtk.Menu()
-                    widget.set_submenu(submenu)
-                self.sync_menu(submenu, row["rows"], item_path)
+        if not widget.get_visible():
+            widget.show()
+        if row["kind"] == "entry":
+            self.sync_menu(widget.get_submenu(), row["rows"], slot["path"])
 
-    def create_item(self, row: dict[str, Any], item_path: tuple[str, ...]) -> Any:
-        if row["kind"] == "separator":
-            widget = Gtk.SeparatorMenuItem()
-        else:
-            widget = Gtk.MenuItem.new_with_mnemonic("")
-            if row["kind"] in ("action", "copy", "command"):
-                widget.connect(
-                    "activate", lambda _item: self.activate(item_path)
-                )
-        widget.show()
-        return widget
+    def slot_at(self, slot_path: tuple) -> dict[str, Any] | None:
+        *parent, (group, index) = slot_path
+        pool = self.slots.get(tuple(parent), {}).get(group, [])
+        return pool[index] if index < len(pool) else None
 
-    def forget(self, item_path: tuple[str, ...]) -> None:
-        for stored in [key for key in self.widgets
-                       if key[:len(item_path)] == item_path]:
-            self.widgets.pop(stored, None)
-            self.rows.pop(stored, None)
-
-    def activate(self, item_path: tuple[str, ...]) -> None:
-        # Look up the row at click time so a reused item acts on current data.
-        row = self.rows.get(item_path)
+    def activate(self, slot_path: tuple) -> None:
+        # Read the slot's row at click time so a reused item acts on the
+        # entry it currently shows.
+        slot = self.slot_at(slot_path)
+        row = slot["row"] if slot else None
         if row is None:
             return
         if row["kind"] == "action":

@@ -195,12 +195,12 @@ def test_units_and_timeouts(tray):
 
 
 def row_keys(rows):
-    keys = [row["key"] for row in rows]
+    keys = [(row["group"], row["key"]) for row in rows]
     assert len(keys) == len(set(keys)), keys
     for row in rows:
         if row["kind"] == "entry":
             row_keys(row["rows"])
-    return keys
+    return [key for _group, key in keys]
 
 
 def changed_status():
@@ -233,9 +233,9 @@ def test_menu_rows_are_stably_keyed(tray):
     before = tray.menu_rows(build(tray, status_fixture()))
     after = tray.menu_rows(build(tray, changed_status()))
     before_keys, after_keys = row_keys(before), row_keys(after)
-    peer = "leases:tensor-parallel@" + str(NOW - 3600)
+    peer = "tensor-parallel@" + str(NOW - 3600)
     assert peer in before_keys and peer in after_keys
-    assert "lanes:lane-3" in after_keys and "lanes:lane-3" not in before_keys
+    assert "lane-3" in after_keys and "lane-3" not in before_keys
     assert not [key for key in after_keys if "revoked-owner" in key]
     peer_before = next(row for row in before if row["key"] == peer)
     peer_after = next(row for row in after if row["key"] == peer)
@@ -243,10 +243,32 @@ def test_menu_rows_are_stably_keyed(tray):
         row["key"] for row in peer_after["rows"]
     ]
     assert peer_before["rows"] != peer_after["rows"]
+    groups = []
+    for row in before:
+        if not groups or groups[-1] != row["group"]:
+            groups.append(row["group"])
+    assert len(groups) == len(set(groups)), "groups must be contiguous"
+    for row in before:
+        kinds = {other["kind"] for other in before
+                 if other["group"] == row["group"]}
+        assert len(kinds) == 1, (row["group"], kinds)
+
+
+def slot_for(app, key, path=()):
+    for group in app.slots.get(path, {}).values():
+        for slot in group:
+            if slot["row"] is not None and slot["row"]["key"] == key:
+                return slot
+    raise AssertionError(key)
+
+
+def widget_count(app):
+    return sum(len(pool) for pools in app.slots.values()
+               for pool in pools.values())
 
 
 def test_open_menu_survives_updates(tray):
-    """Reuse live GTK items across updates; skip without a display."""
+    """Updates must reuse GTK items; skip without a display."""
     try:
         tray.load_toolkit()
         if not tray.Gtk.init_check(sys.argv)[0]:
@@ -255,33 +277,45 @@ def test_open_menu_survives_updates(tray):
     except Exception as exc:  # noqa: BLE001 - any toolkit failure means skip
         print(f"tray GTK reconciliation: SKIP ({exc})")
         return
-    app.render(build(tray, status_fixture()))
-    peer = ("leases:tensor-parallel@" + str(NOW - 3600),)
-    heartbeat = next(path for path, row in app.rows.items()
-                     if path[:1] == peer and row.get("label", "").startswith("Heartbeat"))
-    revoke = peer + ("action:Revoke lease…",)
-    kept = {path: app.widgets[path] for path in (peer, heartbeat, revoke)}
-    submenu = app.widgets[peer].get_submenu()
-    gone = ("leases:revoked-owner@" + str(NOW - 30),)
-    gone_widget = app.widgets[gone]
-
-    app.render(build(tray, changed_status()))
-    for path, widget in kept.items():
-        assert app.widgets[path] is widget, path
-    assert app.widgets[peer].get_submenu() is submenu
-    assert kept[heartbeat].get_label() == "Heartbeat: 10 min ago (TTL 300s)"
-    assert gone not in app.widgets
-    assert gone_widget not in app.menu.get_children()
-    labels = [child.get_label() for child in app.menu.get_children()
-              if not isinstance(child, tray.Gtk.SeparatorMenuItem)]
-    assert "fixture-new:latest · GPU1 · ready" in labels
-    assert labels.index("fixture-new:latest · GPU1 · ready") > labels.index(
-        "fixture-busy:latest · GPU1 · ready"
+    first, second = build(tray, status_fixture()), build(tray, changed_status())
+    app.render(first)
+    peer = slot_for(app, "tensor-parallel@" + str(NOW - 3600))
+    heartbeat = next(
+        slot for pool in app.slots[peer["path"]].values() for slot in pool
+        if slot["row"] and slot["row"]["label"].startswith("Heartbeat")
     )
-    # A reused action item acts on the current lease data at click time.
-    assert app.rows[revoke]["spec"]["request"]["token"] == "lease_tensor-parallel"
-    print("tray GTK reconciliation: PASS (open items reused, relabelled, "
-          "rows added and removed in place)")
+    revoke = slot_for(app, "action:Revoke lease…", peer["path"])
+    kept = [(peer, peer["widget"]), (heartbeat, heartbeat["widget"]),
+            (revoke, revoke["widget"])]
+    gone = slot_for(app, "revoked-owner@" + str(NOW - 30))
+    gone_widget = gone["widget"]
+    submenu = peer["widget"].get_submenu()
+
+    app.render(second)
+    for slot, widget in kept:
+        assert slot["widget"] is widget and slot["row"] is not None
+    assert peer["widget"].get_submenu() is submenu
+    assert heartbeat["widget"].get_label() == "Heartbeat: 10 min ago (TTL 300s)"
+    # A vanished entry is hidden in place, never removed, and is not reused
+    # by an entry that appeared in the same update.
+    assert gone["row"] is None and not gone_widget.get_visible()
+    assert gone_widget in app.menu.get_children()
+    new_lane = slot_for(app, "lane-3")
+    assert new_lane is not gone
+    assert new_lane["widget"].get_label() == "fixture-new:latest · GPU1 · ready"
+    assert revoke["row"]["spec"]["request"]["token"] == "lease_tensor-parallel"
+
+    # Steady state: once every shape has been seen, alternating data must
+    # never create or remove items, i.e. never change the exported layout.
+    app.render(first)
+    settled = widget_count(app)
+    children = list(app.menu.get_children())
+    for model in (second, first, second, first):
+        app.render(model)
+        assert widget_count(app) == settled
+        assert list(app.menu.get_children()) == children
+    print("tray GTK reconciliation: PASS (items reused and relabelled, "
+          "vanished rows hidden in place, no layout change in steady state)")
 
 
 def test_offline_and_idle_models(tray):
