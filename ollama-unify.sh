@@ -6130,9 +6130,14 @@ def start_sessions(group: str) -> int:
         return 0
 
     def run(argv: list[str]) -> str:
-        return subprocess.run(
+        result = subprocess.run(
             argv, capture_output=True, text=True, timeout=15, check=False,
-        ).stdout
+        )
+        if result.returncode:
+            print(f"ollama-unify-tray: {' '.join(argv)} failed "
+                  f"({result.returncode}): {result.stderr.strip()}",
+                  file=sys.stderr)
+        return result.stdout
 
     users = set()
     for line in run(["loginctl", "list-sessions", "--no-legend"]).splitlines():
@@ -6156,10 +6161,22 @@ def start_sessions(group: str) -> int:
             continue
         if gid not in os.getgrouplist(user, account.pw_gid):
             continue
+        # Talk to the user's own bus directly. `systemctl --machine=user@.host`
+        # fails inside the broker unit's namespaced environment.
+        runtime_dir = f"/run/user/{account.pw_uid}"
+        if not os.path.exists(f"{runtime_dir}/bus"):
+            print(f"ollama-unify-tray: no user bus for {user}", file=sys.stderr)
+            continue
         run([
-            "systemctl", "--user", f"--machine={user}@.host",
-            "--no-block", "start", TRAY_UNIT,
+            "runuser", "-u", user, "--", "env",
+            f"XDG_RUNTIME_DIR={runtime_dir}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
+            "systemctl", "--user", "--no-block", "start", TRAY_UNIT,
         ])
+        print(f"ollama-unify-tray: requested {TRAY_UNIT} for {user}",
+              file=sys.stderr)
+    if not users:
+        print("ollama-unify-tray: no active graphical sessions", file=sys.stderr)
     return 0
 
 
