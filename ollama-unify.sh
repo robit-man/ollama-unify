@@ -5554,6 +5554,12 @@ INVENTORY_REFRESH_SECONDS = 60.0
 ICON_OK = "video-display-symbolic"
 ICON_ATTENTION = "dialog-warning-symbolic"
 ICON_OFFLINE = "network-offline-symbolic"
+# Hidden items kept ready per menu group. Created only alongside an
+# unavoidable layout change, they let entries swap (a lane replaced by
+# another within one poll) without changing the exported layout again.
+SPARE_SLOTS = 2
+# Groups whose size is fixed by construction never need spares.
+FIXED_GROUPS = ("copy", "commands")
 
 Gtk: Any = None
 Gdk: Any = None
@@ -6023,6 +6029,7 @@ class TrayApp:
         self.slots: dict[tuple, dict[str, list[dict[str, Any]]]] = {}
         self.group_order: dict[tuple, list[str]] = {}
         self.generation = 0
+        self.layout_changed = False
         self.inventory: dict[str, dict[str, str]] = {}
         self.inventory_at = 0.0
         self.selected_gpus = [
@@ -6070,7 +6077,10 @@ class TrayApp:
             self.label = model.get("label")
             self.indicator.set_label(self.label or "", "00L · 00O")
         self.generation += 1
+        self.layout_changed = False
         self.sync_menu(self.menu, menu_rows(model), ())
+        if self.layout_changed:
+            self.add_spares()
         return False
 
     def sync_menu(self, menu: Any, rows: list[dict[str, Any]],
@@ -6111,12 +6121,55 @@ class TrayApp:
                      and slot["freed"] < self.generation), None,
                 )
                 if slot is None:
-                    slot = self.create_slot(row["kind"], path + ((group, len(pool)),))
-                    menu.insert(slot["widget"], offset + len(pool))
-                    pool.append(slot)
+                    slot = self.append_slot(menu, path, group, row["kind"], offset)
                 slot["row"] = row
                 self.apply_row(slot)
             offset += len(pool)
+
+    def append_slot(self, menu: Any, path: tuple, group: str, kind: str,
+                    offset: int) -> dict[str, Any]:
+        pool = self.slots[path][group]
+        slot = self.create_slot(kind, path + ((group, len(pool)),))
+        menu.insert(slot["widget"], offset + len(pool))
+        pool.append(slot)
+        self.layout_changed = True
+        return slot
+
+    def add_spares(self) -> None:
+        """Top up hidden slots while the layout is changing anyway."""
+        for path in list(self.slots):
+            menu = self.menu_at(path)
+            offset = 0
+            for group in list(self.group_order[path]):
+                pool = self.slots[path][group]
+                kind = pool[0]["kind"] if pool else None
+                if kind and kind != "separator" and group not in FIXED_GROUPS:
+                    template = max(
+                        (slot["row"] for slot in pool
+                         if slot["row"] is not None and kind == "entry"),
+                        key=lambda row: len(row["rows"]), default=None,
+                    )
+                    free = sum(1 for slot in pool if slot["row"] is None)
+                    for _ in range(SPARE_SLOTS - free):
+                        spare = self.append_slot(menu, path, group, kind, offset)
+                        if template is not None:
+                            # Prebuild the submenu so reusing the spare
+                            # only relabels items.
+                            self.sync_menu(spare["widget"].get_submenu(),
+                                           template["rows"], spare["path"])
+                            self.release(spare["path"])
+                offset += len(pool)
+
+    def release(self, path: tuple) -> None:
+        for pool in self.slots.get(path, {}).values():
+            for slot in pool:
+                slot["row"] = None
+                slot["widget"].hide()
+
+    def menu_at(self, path: tuple) -> Any:
+        if not path:
+            return self.menu
+        return self.slot_at(path)["widget"].get_submenu()
 
     def create_slot(self, kind: str, slot_path: tuple) -> dict[str, Any]:
         if kind == "separator":
@@ -6129,7 +6182,8 @@ class TrayApp:
                 widget.connect(
                     "activate", lambda _item: self.activate(slot_path)
                 )
-        return {"widget": widget, "row": None, "freed": 0, "path": slot_path}
+        return {"widget": widget, "row": None, "freed": 0, "path": slot_path,
+                "kind": kind}
 
     def apply_row(self, slot: dict[str, Any]) -> None:
         widget, row = slot["widget"], slot["row"]

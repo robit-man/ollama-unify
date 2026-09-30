@@ -314,8 +314,26 @@ def test_open_menu_survives_updates(tray):
         app.render(model)
         assert widget_count(app) == settled
         assert list(app.menu.get_children()) == children
+
+    # The broker replaces lanes within one poll (reclaim one, start another)
+    # and CUDA processes come and go. Spares absorb both without new items.
+    swapped = changed_status()
+    lanes = swapped["parallel_pool"]["lanes"]
+    lanes[:] = [lane for lane in lanes if lane["id"] != "lane-1"] + [{
+        "id": "lane-9", "kind": "managed", "gpu_uuid": GPU2,
+        "state": "ready", "model": "fixture-swapped:latest", "parallel": 1,
+        "in_flight": 0, "reserved_mib": 2048,
+    }]
+    swapped["foreign_gpu_processes"][f"5151@{GPU2}"] = 1024
+    app.render(build(tray, swapped))
+    assert widget_count(app) == settled
+    assert list(app.menu.get_children()) == children
+    assert slot_for(app, "lane-9")["widget"].get_label() == (
+        "fixture-swapped:latest · GPU2 · ready"
+    )
     print("tray GTK reconciliation: PASS (items reused and relabelled, "
-          "vanished rows hidden in place, no layout change in steady state)")
+          "vanished rows hidden in place, entry swaps absorbed by spares, "
+          "no layout change in steady state)")
 
 
 def test_offline_and_idle_models(tray):
