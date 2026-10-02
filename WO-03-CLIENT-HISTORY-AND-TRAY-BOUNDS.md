@@ -41,19 +41,19 @@ the narrowest active monitor work area.
 - [x] Full broker and tray test suite passes.
 - [x] Classifier and transfer fixture suites pass.
 - [x] Shell/Python static checks and `git diff --check` pass.
-- [ ] Source worktree is clean after commit.
-- [ ] Commit is pushed to the tracked remote branch.
+- [x] Source worktree is clean after commit.
+- [x] Commit is pushed to the tracked remote branch.
 
 ## Deployment checklist
 
-- [ ] Re-run `docker gpu discover` immediately before service mutation.
-- [ ] Snapshot the active lease owners/scopes/states without exposing tokens.
-- [ ] Install generated broker/tray artifacts from this source checkout.
-- [ ] Restart the negotiator and user tray service.
-- [ ] Verify the negotiated API, control socket, and services are healthy.
-- [ ] Verify active leases retain their owner, scope, and state.
-- [ ] Verify installed retention metadata reflects the new defaults.
-- [ ] Verify installed tray labels are screen-bounded.
+- [x] Re-run `docker gpu discover` immediately before service mutation.
+- [x] Snapshot the active lease owners/scopes/states without exposing tokens.
+- [x] Install generated broker/tray artifacts from this source checkout.
+- [x] Restart the negotiator and user tray service.
+- [x] Verify the negotiated API, control socket, and services are healthy.
+- [x] Verify active leases retain their owner, scope, and state.
+- [x] Verify installed retention metadata reflects the new defaults.
+- [x] Verify installed tray labels are screen-bounded.
 
 ## Rollback
 
@@ -70,3 +70,17 @@ tray service in that order. Re-run discovery and compare the lease snapshot.
 - 2026-10-02: `bash tests/test-transfer.sh` passed.
 - 2026-10-02: `bash -n`, `shellcheck`, `ruff check`, and `git diff --check`
   passed.
+- 2026-10-02: repair commit `43b4b98` pushed to `origin/main`.
+- 2026-10-02: pre-deployment discovery reported the broker healthy and one
+  active Voryn lease scoped to GPU
+  `GPU-170a99ee-850f-2182-1050-4e8d3c87b6b0`. A token-free status snapshot
+  and recoverable installed-artifact copy were written under `/tmp`.
+- 2026-10-02: `./ollama-unify.sh --install-safety` installed the generated
+  negotiator and tray. Its immediate discovery refresh raced startup once;
+  subsequent API, socket, service, and discovery checks all passed.
+- 2026-10-02: installed negotiator and tray SHA-256 values exactly matched the
+  source render. The negotiator, Ollama backend, and reloaded/restarted user
+  tray were active with no warning-or-higher journal entries after deployment.
+- 2026-10-02: the Voryn lease retained its owner, active state, exact GPU scope,
+  and renewed heartbeat. Live discovery reports a 3600-second client-history
+  TTL, 256-client cap, 32 lanes per client, and 8 clients per lane.
