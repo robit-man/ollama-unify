@@ -284,6 +284,19 @@ def test_units_and_timeouts(tray):
             os.environ.pop(name, None)
 
 
+def test_labels_are_pixel_bounded(tray):
+    def measure(value):
+        return sum(18 if character in "MW" else 8 for character in value)
+
+    short = "short label"
+    assert tray.ellipsized_text(short, measure(short), measure) == short
+    long = "OMNIUS-" + "wide-WM-" * 40
+    fitted = tray.ellipsized_text(long, 180, measure)
+    assert fitted.endswith("…")
+    assert measure(fitted) <= 180
+    assert tray.ellipsized_text(long, 4, measure) == ""
+
+
 def row_keys(rows):
     keys = [(row["group"], row["key"]) for row in rows]
     assert len(keys) == len(set(keys)), keys
@@ -439,6 +452,21 @@ def test_open_menu_survives_updates(tray):
     assert [spec["request"]["gpu_uuids"] for spec in fired] == [[GPU0, GPU1]]
     assert gpu1["widget"].get_active() is False
 
+    # The real GTK label, not only the pure helper, stays inside the monitor
+    # budget and retains the unabridged value as a tooltip.
+    oversized = build(tray, status_fixture())
+    full_label = "OMNIUS-" + "wide-WM-" * 400
+    oversized["clients"][0]["title"] = full_label
+    app.render(oversized)
+    client_slot = slot_for(app, "app:eval")
+    shown = client_slot["widget"].get_label()
+    assert shown.endswith("…") and shown != full_label
+    assert client_slot["widget"].get_tooltip_text() == full_label
+    width = client_slot["widget"].get_child().create_pango_layout(
+        shown
+    ).get_pixel_size()[0]
+    assert width <= app.label_width_pixels
+
     print("tray GTK reconciliation: PASS (items reused and relabelled, "
           "vanished rows hidden in place, entry swaps absorbed by spares, "
           "guarded GPU toggles, "
@@ -465,6 +493,7 @@ def main():
     test_model_gpu_policy_menu(tray)
     test_single_device_host(tray)
     test_units_and_timeouts(tray)
+    test_labels_are_pixel_bounded(tray)
     test_offline_and_idle_models(tray)
     test_menu_rows_are_stably_keyed(tray)
     test_open_menu_survives_updates(tray)

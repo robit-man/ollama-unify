@@ -1556,6 +1556,12 @@ def discovery_document() -> dict[str, Any]:
         "warnings": [lease_visibility_warning([])],
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
+        "client_history_policy": {
+            "ttl_seconds": CLIENT_HISTORY_TTL,
+            "max_clients": CLIENT_HISTORY_LIMIT,
+            "max_lanes_per_client": CLIENT_LANE_HISTORY_LIMIT,
+            "max_clients_per_lane": LANE_CLIENT_LIMIT,
+        },
         "context_policy": {
             "default_max_context": MAX_CONTEXT,
             "model_profiles": MODEL_CONTEXT_PROFILES,
@@ -1750,7 +1756,13 @@ def wait_for_foreign_settle(
 
 
 CLIENT_HEADER = "X-Ollama-Unify-Client"
-CLIENT_HISTORY_LIMIT = 256
+CLIENT_HISTORY_LIMIT = max(1, env_int("OLLAMA_UNIFY_CLIENT_HISTORY_LIMIT", 256))
+CLIENT_HISTORY_TTL = max(
+    0.1, env_float("OLLAMA_UNIFY_CLIENT_HISTORY_TTL", 3600.0)
+)
+CLIENT_LANE_HISTORY_LIMIT = max(
+    1, env_int("OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT", 32)
+)
 LANE_CLIENT_LIMIT = 8
 DOCKER_SOCKET = "/var/run/docker.sock"
 DOCKER_CACHE_SECONDS = 30.0
@@ -2132,6 +2144,7 @@ class Lane:
     # Which client's request started this lane, and who has used it since.
     triggered_by: dict[str, str] | None = None
     clients: dict[str, dict[str, Any]] = field(default_factory=dict)
+    active_clients: dict[str, int] = field(default_factory=dict)
 
     def public_summary(self) -> dict[str, Any]:
         alive = self.kind == "system" or (
@@ -2152,7 +2165,11 @@ class Lane:
             "resolved_context_length": self.resolved_context_length,
             "triggered_by": self.triggered_by,
             "clients": sorted(
-                ({"key": key, **usage} for key, usage in self.clients.items()),
+                ({
+                    "key": key, **usage,
+                    "expires_at": float(usage.get("last_seen") or 0)
+                    + CLIENT_HISTORY_TTL,
+                } for key, usage in self.clients.items()),
                 key=lambda usage: -usage["last_seen"],
             ),
         }
@@ -4105,10 +4122,17 @@ class Broker:
         model: str,
         succeeded: bool,
         logical_request_id: str = "",
+        client_key: str = "",
     ) -> None:
         retired = None
         with self.cv:
             lane.in_flight = max(0, lane.in_flight - 1)
+            if client_key:
+                remaining = lane.active_clients.get(client_key, 0) - 1
+                if remaining > 0:
+                    lane.active_clients[client_key] = remaining
+                else:
+                    lane.active_clients.pop(client_key, None)
             lane.last_used = time.time()
             if succeeded and model:
                 lane.model = model
@@ -4691,7 +4715,7 @@ class Broker:
         return {"ok": True, "stopped_lanes": [lane_id], "gpus": gpu_snapshot()}
 
     def record_client_use(self, client: dict[str, Any], lane: Lane,
-                          model: str) -> None:
+                          model: str) -> str:
         """Account an admitted request to its client, model, and lane."""
         now = time.time()
         key = str(client.get("key") or "unknown")
@@ -4717,27 +4741,93 @@ class Broker:
             })
             lane_usage["requests"] += 1
             lane_usage["last_seen"] = now
+            lane.active_clients[key] = lane.active_clients.get(key, 0) + 1
             if len(lane.clients) > LANE_CLIENT_LIMIT:
-                oldest = min(lane.clients,
-                             key=lambda item: lane.clients[item]["last_seen"])
-                lane.clients.pop(oldest)
-            if len(self.clients) > CLIENT_HISTORY_LIMIT:
-                oldest = min(self.clients,
-                             key=lambda item: self.clients[item]["last_seen"])
-                self.clients.pop(oldest)
+                removable = [
+                    item for item in lane.clients
+                    if item not in lane.active_clients
+                ]
+                if removable:
+                    oldest = min(
+                        removable,
+                        key=lambda item: lane.clients[item]["last_seen"],
+                    )
+                    lane.clients.pop(oldest)
+
+            self._prune_client_history_locked(now)
+            return key
+
+    def _prune_client_history_locked(self, now: float | None = None) -> None:
+        """Expire and bound every client-attribution history surface.
+
+        An inference that outlives the history TTL must keep its attribution
+        until it exits. All other history is an observability cache, not
+        durable state, and is therefore bounded by both time and cardinality.
+        """
+        current = time.time() if now is None else now
+        cutoff = current - CLIENT_HISTORY_TTL
+        active_pairs = set()
+        for lane in self.lanes.values():
+            active_keys = set(lane.active_clients)
+            active_pairs.update((lane.lane_id, key) for key in active_keys)
+            for key, usage in list(lane.clients.items()):
+                if (key not in active_keys
+                        and float(usage.get("last_seen") or 0) < cutoff):
+                    lane.clients.pop(key, None)
+        active_clients = {key for _lane_id, key in active_pairs}
+        for key, record in list(self.clients.items()):
+            lanes = record.get("lanes") or {}
+            for lane_id, usage in list(lanes.items()):
+                if (lane_id, key) not in active_pairs and float(
+                    usage.get("last_seen") or 0
+                ) < cutoff:
+                    lanes.pop(lane_id, None)
+            if len(lanes) > CLIENT_LANE_HISTORY_LIMIT:
+                protected = {
+                    lane_id for lane_id in lanes
+                    if (lane_id, key) in active_pairs
+                }
+                removable = sorted(
+                    (lane_id for lane_id in lanes if lane_id not in protected),
+                    key=lambda lane_id: float(
+                        lanes[lane_id].get("last_seen") or 0
+                    ),
+                )
+                excess = len(lanes) - CLIENT_LANE_HISTORY_LIMIT
+                for lane_id in removable[:excess]:
+                    lanes.pop(lane_id, None)
+            if (key not in active_clients
+                    and float(record.get("last_seen") or 0) < cutoff):
+                self.clients.pop(key, None)
+
+        excess = len(self.clients) - CLIENT_HISTORY_LIMIT
+        if excess > 0:
+            removable_clients = sorted(
+                (key for key in self.clients if key not in active_clients),
+                key=lambda key: float(
+                    self.clients[key].get("last_seen") or 0
+                ),
+            )
+            for key in removable_clients[:excess]:
+                self.clients.pop(key, None)
 
     def _client_summaries_locked(self) -> list[dict[str, Any]]:
         live = set(self.lanes)
         summaries = []
         for key, record in self.clients.items():
             lanes = [
-                {"id": lane_id, "live": lane_id in live, **usage}
+                {
+                    "id": lane_id, "live": lane_id in live, **usage,
+                    "expires_at": float(usage.get("last_seen") or 0)
+                    + CLIENT_HISTORY_TTL,
+                }
                 for lane_id, usage in record["lanes"].items()
             ]
             summaries.append({
                 "key": key, "identity": record["identity"],
                 "first_seen": record["first_seen"],
                 "last_seen": record["last_seen"],
+                "expires_at": record["last_seen"] + CLIENT_HISTORY_TTL,
                 "requests": record["requests"], "models": dict(record["models"]),
                 "lanes": sorted(lanes, key=lambda usage: -usage["last_seen"]),
             })
@@ -4786,6 +4876,7 @@ class Broker:
 
     def status(self) -> dict[str, Any]:
         with self.cv:
+            self._prune_client_history_locked()
             leases = [asdict(lease) for lease in self.leases.values()]
             lease_summaries = self._public_lease_summaries_locked()
             draining = self.draining
@@ -4821,6 +4912,12 @@ class Broker:
                     "completed_responses": completed_responses,
                 },
                 "clients": clients,
+                "client_history_policy": {
+                    "ttl_seconds": CLIENT_HISTORY_TTL,
+                    "max_clients": CLIENT_HISTORY_LIMIT,
+                    "max_lanes_per_client": CLIENT_LANE_HISTORY_LIMIT,
+                    "max_clients_per_lane": LANE_CLIENT_LIMIT,
+                },
                 "model_gpu_policy": model_gpu_policy,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
@@ -5260,6 +5357,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         retained_request = None
         gpu_uuids = None
         is_resume = False
+        client_key = ""
         try:
             (
                 logical_request_id,
@@ -5404,10 +5502,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         lane = admission.lane
-        self.broker.record_client_use(self._client_identity(), lane, model)
+        client_key = self.broker.record_client_use(
+            self._client_identity(), lane, model
+        )
         if not self._client_connected():
             self.broker.proxy_exit(
-                lane, model, False, admission.logical_request_id
+                lane, model, False, admission.logical_request_id, client_key
             )
             admission = None
             return
@@ -5542,7 +5642,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 backend.close()
             if admission is not None:
                 self.broker.proxy_exit(
-                    lane, model, succeeded, admission.logical_request_id
+                    lane, model, succeeded, admission.logical_request_id,
+                    client_key,
                 )
 
     do_GET = _handle
@@ -6094,6 +6195,11 @@ SPARE_SLOTS = 2
 FIXED_GROUPS = ("copy", "commands")
 # Most recently active clients shown; the broker keeps a longer history.
 CLIENT_MENU_LIMIT = 20
+# Leave room for menu padding, check marks, and submenu arrows. The remaining
+# label budget is derived from the narrowest monitor, so moving the indicator
+# between unequal screens cannot create an off-screen menu.
+TRAY_SCREEN_MARGIN_PX = 192
+TRAY_FALLBACK_SCREEN_WIDTH_PX = 1024
 
 Gtk: Any = None
 Gdk: Any = None
@@ -6240,6 +6346,41 @@ def gpu_list(gpu_uuids: list[str], inventory: dict[str, dict[str, str]]) -> str:
 def wrapped(prefix: str, text: str, width: int = 64) -> list[str]:
     lines = textwrap.wrap(text, width) or [""]
     return [prefix + lines[0]] + ["    " + line for line in lines[1:]]
+
+
+def ellipsized_text(text: str, max_pixels: int, measure: Any) -> str:
+    """Return the longest measured prefix that fits, with a visible ellipsis."""
+    if max_pixels <= 0 or measure(text) <= max_pixels:
+        return text
+    ellipsis = "…"
+    if measure(ellipsis) > max_pixels:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if measure(text[:middle] + ellipsis) <= max_pixels:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + ellipsis
+
+
+def tray_label_width_pixels() -> int:
+    """Fit labels on every monitor, including smaller secondary displays."""
+    widths = []
+    try:
+        display = Gdk.Display.get_default()
+        if display is not None:
+            for index in range(display.get_n_monitors()):
+                monitor = display.get_monitor(index)
+                if monitor is not None:
+                    workarea = monitor.get_workarea()
+                    if workarea.width > 0:
+                        widths.append(int(workarea.width))
+    except (AttributeError, TypeError):
+        pass
+    screen_width = min(widths) if widths else TRAY_FALLBACK_SCREEN_WIDTH_PX
+    return max(32, screen_width - TRAY_SCREEN_MARGIN_PX)
 
 
 def action(label: str, request: dict[str, Any], confirm: str | None = None,
@@ -6755,6 +6896,7 @@ class TrayApp:
         # Set while the tray itself changes a check item, whose GTK
         # set_active emits the same activate signal as a user click.
         self.applying = False
+        self.label_width_pixels = tray_label_width_pixels()
         self.inventory: dict[str, dict[str, str]] = {}
         self.inventory_at = 0.0
         self.selected_gpus = [
@@ -6803,6 +6945,7 @@ class TrayApp:
             self.indicator.set_label(self.label or "", "00L · 00O")
         self.generation += 1
         self.layout_changed = False
+        self.label_width_pixels = tray_label_width_pixels()
         self.sync_menu(self.menu, menu_rows(model), ())
         if self.layout_changed:
             self.add_spares()
@@ -6916,9 +7059,24 @@ class TrayApp:
     def apply_row(self, slot: dict[str, Any]) -> None:
         widget, row = slot["widget"], slot["row"]
         if row["kind"] != "separator":
-            text = row["label"].replace("_", "__")
+            full_text = row["label"]
+            label = widget.get_child()
+
+            def measure(value: str) -> int:
+                if label is None or not hasattr(label, "create_pango_layout"):
+                    return len(value) * 8
+                return label.create_pango_layout(value).get_pixel_size()[0]
+
+            visible_text = ellipsized_text(
+                full_text, self.label_width_pixels, measure,
+            )
+            text = visible_text.replace("_", "__")
             if widget.get_label() != text:
                 widget.set_label(text)
+            tooltip = full_text if visible_text != full_text else None
+            widget.set_tooltip_text(tooltip)
+            if label is not None:
+                label.set_tooltip_text(tooltip)
             sensitive = row.get("enabled", row["kind"] != "info")
             if widget.get_sensitive() != sensitive:
                 widget.set_sensitive(sensitive)
@@ -7191,6 +7349,7 @@ install_gpu_negotiator() {
   local plugin_dir selected_ids model_store ollama_binary configured_environment backend_port
   local drain_timeout pending_timeout unload_timeout lease_ttl heartbeat_reconnect_grace
   local anon_poll anon_settle anon_max_drain
+  local client_history_ttl client_history_limit client_lane_history_limit
   local pool_enabled pool_max_servers pool_port_start pool_instance_parallel
   local pool_idle_timeout pool_ready_timeout pool_load_timeout
   local pool_vram_reserve pool_host_reserve pool_model_overhead
@@ -7217,6 +7376,9 @@ install_gpu_negotiator() {
   anon_poll="${OLLAMA_SAFE_NEGOTIATOR_ANON_POLL:-0.5}"
   anon_settle="${OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE:-2}"
   anon_max_drain="${OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN:-15}"
+  client_history_ttl="${OLLAMA_SAFE_CLIENT_HISTORY_TTL:-3600}"
+  client_history_limit="${OLLAMA_SAFE_CLIENT_HISTORY_LIMIT:-256}"
+  client_lane_history_limit="${OLLAMA_SAFE_CLIENT_LANE_HISTORY_LIMIT:-32}"
   configured_environment=$(systemctl show ollama.service -p Environment --value 2>/dev/null || true)
   model_store="${OLLAMA_SAFE_MODEL_STORE:-}"
   if [ -z "$model_store" ]; then
@@ -7254,6 +7416,14 @@ install_gpu_negotiator() {
     || { err "OLLAMA_SAFE_NEGOTIATOR_ANON_SETTLE must be numeric"; exit 2; }
   [[ "$anon_max_drain" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_NEGOTIATOR_ANON_MAX_DRAIN must be numeric"; exit 2; }
+  [[ "$client_history_ttl" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_CLIENT_HISTORY_TTL must be numeric"; exit 2; }
+  for value_name in client_history_limit client_lane_history_limit; do
+    [[ "${!value_name}" =~ ^[0-9]+$ ]] \
+      || { err "${value_name} must be an unsigned integer"; exit 2; }
+    [ "${!value_name}" -ge 1 ] \
+      || { err "${value_name} must be at least 1"; exit 2; }
+  done
   [[ "$pool_enabled" =~ ^[01]$ ]] \
     || { err "OLLAMA_SAFE_POOL_ENABLED must be 0 or 1"; exit 2; }
   for value_name in pool_max_servers pool_port_start pool_instance_parallel pool_vram_reserve pool_host_reserve pool_model_overhead; do
@@ -7322,6 +7492,9 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_ANON_SETTLE="%s"\n' "$anon_settle"
     printf 'OLLAMA_UNIFY_ANON_MAX_DRAIN="%s"\n' "$anon_max_drain"
     printf 'OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB="256"\n'
+    printf 'OLLAMA_UNIFY_CLIENT_HISTORY_TTL="%s"\n' "$client_history_ttl"
+    printf 'OLLAMA_UNIFY_CLIENT_HISTORY_LIMIT="%s"\n' "$client_history_limit"
+    printf 'OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT="%s"\n' "$client_lane_history_limit"
     printf 'OLLAMA_UNIFY_POOL_ENABLED="%s"\n' "$pool_enabled"
     printf 'OLLAMA_UNIFY_POOL_MAX_SERVERS="%s"\n' "$pool_max_servers"
     printf 'OLLAMA_UNIFY_POOL_MAX_QUEUE="64"\n'

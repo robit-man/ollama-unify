@@ -344,6 +344,7 @@ class PoolHarness:
                  completed_max_body_bytes=1024 * 1024,
                  completed_max_total_bytes=4 * 1024 * 1024,
                  pending_timeout=300.0, revoke_timeout=300.0,
+                 client_history_ttl=3600.0, client_lane_history_limit=32,
                  model_gpu_preferences=None, model_context_profiles=None,
                  profile="cuda_triple", selected_gpus=None):
         self.profile = profile
@@ -364,6 +365,8 @@ class PoolHarness:
         self.completed_max_total_bytes = completed_max_total_bytes
         self.pending_timeout = pending_timeout
         self.revoke_timeout = revoke_timeout
+        self.client_history_ttl = client_history_ttl
+        self.client_lane_history_limit = client_lane_history_limit
         self.model_gpu_preferences = model_gpu_preferences
         self.model_context_profiles = model_context_profiles
 
@@ -432,6 +435,10 @@ class PoolHarness:
             "OLLAMA_UNIFY_ANON_MAX_DRAIN": "0.3",
             "OLLAMA_UNIFY_FOREIGN_RELEASE_TOLERANCE_MIB": str(
                 self.release_tolerance_mib
+            ),
+            "OLLAMA_UNIFY_CLIENT_HISTORY_TTL": str(self.client_history_ttl),
+            "OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT": str(
+                self.client_lane_history_limit
             ),
         })
         self.daemon = subprocess.Popen(
@@ -1381,6 +1388,73 @@ def test_client_attribution(helper, fixture_bin):
         assert lanes[first_lane]["clients"][0]["key"] == "app:fixture-app"
         assert lanes[first_lane]["clients"][0]["requests"] == 2
         assert lanes[other_lane]["triggered_by"]["key"] == undeclared["key"]
+
+
+def test_client_history_ttl_and_lane_bound(helper, fixture_bin):
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1,
+        client_history_ttl=60, client_lane_history_limit=2,
+    ) as harness:
+        lane_ids = []
+        for index in range(3):
+            status, payload, headers = chat(
+                harness.proxy_port, MODEL, f"history-{index}",
+                client="history-client",
+            )
+            assert status == 200, payload
+            lane_id = headers["X-Ollama-Unify-Lane"]
+            lane_ids.append(lane_id)
+            control(harness.socket_path, {
+                "action": "stop_lane", "lane_id": lane_id,
+            })
+
+        current = harness.status()
+        policy = current["client_history_policy"]
+        assert policy == {
+            "ttl_seconds": 60.0,
+            "max_clients": 256,
+            "max_lanes_per_client": 2,
+            "max_clients_per_lane": 8,
+        }
+        history = next(
+            client for client in current["clients"]
+            if client["key"] == "app:history-client"
+        )
+        assert history["expires_at"] == history["last_seen"] + 60
+        assert [usage["id"] for usage in history["lanes"]] == lane_ids[-2:][::-1]
+        assert all(
+            usage["expires_at"] == usage["last_seen"] + 60
+            for usage in history["lanes"]
+        )
+
+    with PoolHarness(
+        helper, fixture_bin, max_servers=1, client_history_ttl=0.4,
+    ) as harness:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            active = executor.submit(
+                chat, harness.proxy_port, MODEL, "active-past-history-ttl",
+                1.2, 5, client="active-client",
+            )
+            wait_until(
+                lambda: any(
+                    client["key"] == "app:active-client"
+                    for client in harness.status()["clients"]
+                ),
+                "active client attribution",
+            )
+            time.sleep(0.5)
+            assert any(
+                client["key"] == "app:active-client"
+                for client in harness.status()["clients"]
+            ), "an in-flight request must survive history TTL pruning"
+            assert active.result(timeout=5)[0] == 200
+
+        time.sleep(0.5)
+        expired = harness.status()
+        assert not expired["clients"]
+        assert all(
+            not lane["clients"] for lane in managed_lanes(expired)
+        ), "per-lane Used by history must expire with the same TTL"
 
 
 def model_lane_gpus(harness, model):
@@ -2575,6 +2649,7 @@ def main():
     test_multi_gpu_lease_is_exclusive_for_its_lifetime(helper, fixture_bin)
     test_operator_revoke_and_lane_stop(helper, fixture_bin)
     test_client_attribution(helper, fixture_bin)
+    test_client_history_ttl_and_lane_bound(helper, fixture_bin)
     test_operator_model_gpu_policy(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)

@@ -261,6 +261,11 @@ On desktop hosts the installer adds a system tray indicator (`/usr/local/libexec
 
 Destructive actions ask for confirmation, and failures open a dialog that shows the broker's error. Release and prepare wait as long as the broker's configured drain, unload, and settle deadlines allow. The icon switches to a warning when a lease is pending, revoking, or overdue, when the broker is draining, or when the Ollama backend is down.
 
+Every menu label is pixel-measured against the narrowest active monitor work
+area. Oversized labels are shortened with an ellipsis before GTK lays out the
+menu, with the complete value retained as a tooltip, so a long client, model,
+unit, or lease name cannot push the tray menu across a screen boundary.
+
 The indicator talks to the control socket, so only members of the broker's access group can use it. That group already has full lease control through the socket. The socket also accepts `revoke` (by token) and `stop_lane` (by lane id, `force` to interrupt in-flight requests). The user unit `ollama-unify-tray.service` is enabled globally for `graphical-session.target`, and the broker unit's `ExecStartPost` starts it in every active desktop session of an access-group member, so the indicator comes up with the broker. Choosing *Quit indicator* stops it until the next login or broker start.
 
 ### Client attribution
@@ -272,7 +277,7 @@ The broker records which application sends each request and which Ollama lane se
 - **Bridge-network containers** — the peer IP is mapped to a container name through the Docker API when the broker's user can read the Docker socket.
 - **Anything else** — the remote address and `User-Agent`.
 
-Only process names are recorded, never command lines, which can contain secrets. Broker status (`clients`) lists up to 256 recent clients with request counts per model and per lane. Each lane reports `triggered_by`, the client whose request started it, and its most recent clients. The tray shows *Started for* and *Used by* in each lane's submenu, and a *Clients* section lists the 20 most recent applications with their identity and the lanes they used.
+Only process names are recorded, never command lines, which can contain secrets. Client attribution is an expiring observability cache: `OLLAMA_UNIFY_CLIENT_HISTORY_TTL` defaults to 3600 seconds and is renewed automatically whenever that client sends a request. When activity stops, the top-level client record, its per-lane history, and each lane's *Used by* entry expire naturally. An in-flight request remains attributed even when it runs beyond the TTL, then becomes eligible for expiry after it exits. Broker status publishes `expires_at` on retained attribution rows and `client_history_policy` with the effective TTL and bounds. The cache keeps at most 256 clients (`OLLAMA_UNIFY_CLIENT_HISTORY_LIMIT`), 32 lanes per client (`OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT`), and eight clients per lane. Broker status (`clients`) includes request counts per model and retained lane; each lane reports `triggered_by`, the client whose request started it, and its recent clients. The tray shows *Started for* and *Used by* in each lane's submenu, and a *Clients* section lists the 20 most recent applications with their identity and lanes.
 
 ### Surviving Ollama upgrades
 
