@@ -206,6 +206,8 @@ def chat(
     workload_class="foreground",
     queue_policy="wait",
     mock_body_size=None,
+    mock_backend_reset=False,
+    mock_partial_stall=False,
     gpu_uuids=None,
     client=None,
 ):
@@ -231,6 +233,10 @@ def chat(
     }
     if mock_body_size is not None:
         payload["mock_body_size"] = mock_body_size
+    if mock_backend_reset:
+        payload["mock_backend_reset"] = True
+    if mock_partial_stall:
+        payload["mock_partial_stall"] = True
     return http_json(
         port, "POST", "/api/chat", payload,
         timeout=timeout, extra_headers=headers,
@@ -284,17 +290,31 @@ def embed(port, model, request_id, timeout=10):
     }, timeout=timeout)
 
 
-def streaming_chat(port, model, request_id, logical_request_id, timeout=10):
+def streaming_chat(
+    port,
+    model,
+    request_id,
+    logical_request_id,
+    timeout=10,
+    *,
+    chunk_count=None,
+    chunk_interval=None,
+):
+    payload = {
+        "model": model,
+        "stream": True,
+        "mock_stream": True,
+        "mock_request_id": request_id,
+    }
+    if chunk_count is not None:
+        payload["mock_stream_count"] = chunk_count
+    if chunk_interval is not None:
+        payload["mock_stream_interval"] = chunk_interval
     return http_raw(
         port,
         "POST",
         "/api/chat",
-        {
-            "model": model,
-            "stream": True,
-            "mock_stream": True,
-            "mock_request_id": request_id,
-        },
+        payload,
         timeout=timeout,
         extra_headers={
             "X-Ollama-Unify-Logical-Request-Id": logical_request_id,
@@ -336,6 +356,36 @@ def reset_connection(connection):
     connection.close()
 
 
+def incomplete_fixed_length_chat(port, model, request_id, timeout=3):
+    payload = json.dumps({
+        "model": model,
+        "stream": False,
+        "mock_request_id": request_id,
+        "mock_partial_stall": True,
+    }).encode()
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", port, timeout=timeout
+    )
+    started = time.monotonic()
+    connection.request(
+        "POST",
+        "/api/chat",
+        body=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    partial = b""
+    try:
+        response.read()
+    except http.client.IncompleteRead as exc:
+        partial = exc.partial
+    else:
+        raise AssertionError("incomplete fixed-length response read as complete")
+    elapsed = time.monotonic() - started
+    connection.close()
+    return response.status, partial, elapsed
+
+
 class PoolHarness:
     def __init__(self, helper, fixture_bin, *, max_servers=1, tags=None,
                  runner_vram_mib=2048, max_queue=64,
@@ -345,6 +395,9 @@ class PoolHarness:
                  completed_max_total_bytes=4 * 1024 * 1024,
                  pending_timeout=300.0, revoke_timeout=300.0,
                  client_history_ttl=3600.0, client_lane_history_limit=32,
+                 request_activity_ttl=3.0, request_detached_ttl=1.0,
+                 request_cancel_grace=0.25,
+                 instance_parallel=1,
                  model_gpu_preferences=None, model_context_profiles=None,
                  profile="cuda_triple", selected_gpus=None):
         self.profile = profile
@@ -367,6 +420,10 @@ class PoolHarness:
         self.revoke_timeout = revoke_timeout
         self.client_history_ttl = client_history_ttl
         self.client_lane_history_limit = client_lane_history_limit
+        self.request_activity_ttl = request_activity_ttl
+        self.request_detached_ttl = request_detached_ttl
+        self.request_cancel_grace = request_cancel_grace
+        self.instance_parallel = instance_parallel
         self.model_gpu_preferences = model_gpu_preferences
         self.model_context_profiles = model_context_profiles
 
@@ -419,7 +476,9 @@ class PoolHarness:
                 self.completed_max_total_bytes
             ),
             "OLLAMA_UNIFY_POOL_PORT_START": str(pool_port),
-            "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": "1",
+            "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": str(
+                self.instance_parallel
+            ),
             "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
             "OLLAMA_UNIFY_POOL_READY_TIMEOUT": "3",
             "OLLAMA_UNIFY_POOL_LOAD_TIMEOUT": "3",
@@ -427,6 +486,15 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_MODEL_OVERHEAD_PERCENT": "100",
             "OLLAMA_UNIFY_OLLAMA_BINARY": os.path.join(self.fixture_bin, "ollama"),
             "OLLAMA_UNIFY_DRAIN_TIMEOUT": "3",
+            "OLLAMA_UNIFY_REQUEST_ACTIVITY_TTL": str(
+                self.request_activity_ttl
+            ),
+            "OLLAMA_UNIFY_REQUEST_DETACHED_TTL": str(
+                self.request_detached_ttl
+            ),
+            "OLLAMA_UNIFY_REQUEST_CANCEL_GRACE": str(
+                self.request_cancel_grace
+            ),
             "OLLAMA_UNIFY_PENDING_TIMEOUT": str(self.pending_timeout),
             "OLLAMA_UNIFY_REVOKE_TIMEOUT": str(self.revoke_timeout),
             "OLLAMA_UNIFY_UNLOAD_TIMEOUT": "3",
@@ -524,6 +592,11 @@ def test_existing_pool_contract(helper, fixture_bin):
             assert discovery_status == 200, discovery
             assert discovery["parallel_pool"]["private_port_start"] == pool_port
             assert discovery["parallel_pool"]["private_port_end"] == pool_port + 31
+            lifecycle = discovery["parallel_pool"]["request_lifecycle"]
+            assert lifecycle["activity_ttl_seconds"] == 3
+            assert lifecycle["detached_ttl_seconds"] == 30
+            assert lifecycle["cancel_grace_seconds"] == 5
+            assert lifecycle["tracked"] == 0
             admission_protocol = discovery["parallel_pool"]["admission_protocol"]
             assert admission_protocol["logical_request_header"] == (
                 "X-Ollama-Unify-Logical-Request-Id"
@@ -1404,6 +1477,14 @@ def test_client_history_ttl_and_lane_bound(helper, fixture_bin):
             assert status == 200, payload
             lane_id = headers["X-Ollama-Unify-Lane"]
             lane_ids.append(lane_id)
+            wait_until(
+                lambda: all(
+                    lane["in_flight"] == 0
+                    for lane in managed_lanes(harness.status())
+                    if lane["id"] == lane_id
+                ),
+                "client-history request finalization",
+            )
             control(harness.socket_path, {
                 "action": "stop_lane", "lane_id": lane_id,
             })
@@ -2010,6 +2091,409 @@ def test_completed_response_survives_delivery_disconnect(helper, fixture_bin):
             if event["request_id"] == "completed-after-disconnect"
         ]
         assert generated == ["completed-after-disconnect"]
+        lifecycle = harness.status()["parallel_pool"]["request_lifecycle"]
+        assert lifecycle["expired_total"] == 0
+
+
+def test_backend_activity_renews_active_request_ttl(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        request_activity_ttl=0.2,
+        request_detached_ttl=0.2,
+    ) as harness:
+        status, body, _ = streaming_chat(
+            harness.proxy_port,
+            MODEL,
+            "renewable-stream",
+            "turn:renewable-stream",
+            timeout=5,
+            chunk_count=8,
+            chunk_interval=0.08,
+        )
+        assert status == 200
+        assert body.count(b"\n") == 8
+        broker_status = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "renewed streaming request to release",
+        )
+        lifecycle = broker_status["parallel_pool"]["request_lifecycle"]
+        assert lifecycle["expired_total"] == 0
+        assert lifecycle["activity_renewed_total"] >= 10
+        assert broker_status["active_requests"] == 0
+        assert all(
+            lane["in_flight"] == 0 for lane in managed_lanes(broker_status)
+        )
+
+
+def test_silent_backend_request_expires_exact_admission(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        request_activity_ttl=0.15,
+        request_detached_ttl=0.15,
+        request_cancel_grace=0.1,
+    ) as harness:
+        status, payload, _ = chat(
+            harness.proxy_port,
+            MODEL,
+            "silent-backend",
+            delay=1.0,
+            timeout=5,
+        )
+        assert status == 504, (status, payload)
+        assert payload["reason_code"] == "backend_activity_timeout"
+        recovered = wait_until(
+            lambda: (
+                current
+                if (
+                    (current := harness.status())["active_requests"] == 0
+                    and all(
+                        lane["in_flight"] == 0
+                        for lane in managed_lanes(current)
+                    )
+                )
+                else None
+            ),
+            "expired request ownership to be released",
+            timeout=8,
+        )
+        lifecycle = recovered["parallel_pool"]["request_lifecycle"]
+        assert lifecycle["expired_total"] == 1
+        assert lifecycle["forced_lane_stop_total"] == 1
+        assert lifecycle["forced_release_total"] == 1
+
+        follower_status, follower, _ = chat(
+            harness.proxy_port, MODEL, "after-silent-expiry", timeout=8
+        )
+        assert follower_status == 200, follower
+        final = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "follower request to release",
+        )
+        assert final["active_requests"] == 0
+        assert sum(lane["in_flight"] for lane in managed_lanes(final)) == 0
+
+
+def test_repeated_abandoned_requests_do_not_compound_lanes(
+    helper, fixture_bin,
+):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=3,
+        request_activity_ttl=1.0,
+        request_detached_ttl=0.15,
+        request_cancel_grace=0.1,
+    ) as harness:
+        for attempt in range(1, 4):
+            request_id = f"abandoned-active-{attempt}"
+            abandoned = open_abandonable_chat(
+                harness.proxy_port,
+                MODEL,
+                request_id,
+                logical_request_id=f"turn:{request_id}",
+                delay=2.0,
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == request_id
+                    for event in request_events(harness.event_log)
+                ),
+                f"attempt {attempt} to reach its managed backend",
+            )
+            reset_connection(abandoned)
+            recovered = wait_until(
+                lambda: (
+                    current
+                    if (
+                        (current := harness.status())["active_requests"] == 0
+                        and all(
+                            lane["in_flight"] == 0
+                            for lane in managed_lanes(current)
+                        )
+                    )
+                    else None
+                ),
+                f"attempt {attempt} lifecycle expiry",
+                timeout=8,
+            )
+            assert len(managed_lanes(recovered)) <= 1
+
+        follower_status, follower, _ = chat(
+            harness.proxy_port, MODEL, "after-abandoned-active", timeout=8
+        )
+        assert follower_status == 200, follower
+        final = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "post-abandonment follower to release",
+        )
+        lanes = managed_lanes(final)
+        lifecycle = final["parallel_pool"]["request_lifecycle"]
+        assert len(lanes) == 1
+        assert sum(lane["in_flight"] for lane in lanes) == 0
+        assert lifecycle["disconnected_total"] >= 3
+        assert lifecycle["expired_total"] >= 3
+        assert lifecycle["forced_lane_stop_total"] >= 3
+        starts = sum(event["kind"] == "start" for event in events(harness.event_log))
+        stops = sum(event["kind"] == "stop" for event in events(harness.event_log))
+        assert starts - stops == 1
+
+
+def test_cancelled_shared_lane_blocks_fresh_admission(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=2,
+        instance_parallel=2,
+        request_activity_ttl=2.0,
+        request_detached_ttl=0.12,
+        request_cancel_grace=0.1,
+    ) as harness:
+        capacity_status, capacity, _ = harness.capacity(MODEL, parallel=2)
+        assert capacity_status == 200, capacity
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            legitimate = executor.submit(
+                chat,
+                harness.proxy_port,
+                MODEL,
+                "shared-legitimate",
+                0.8,
+                8,
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "shared-legitimate"
+                    for event in request_events(harness.event_log)
+                ),
+                "legitimate request on shared lane",
+            )
+            abandoned = open_abandonable_chat(
+                harness.proxy_port,
+                MODEL,
+                "shared-abandoned",
+                logical_request_id="turn:shared-abandoned",
+                delay=2.0,
+            )
+            wait_until(
+                lambda: any(
+                    event.get("request_id") == "shared-abandoned"
+                    for event in request_events(harness.event_log)
+                ),
+                "abandoned request on shared lane",
+            )
+            reset_connection(abandoned)
+            wait_until(
+                lambda: (
+                    current
+                    if (
+                        (current := harness.status())["parallel_pool"]
+                        ["request_lifecycle"]["cancelling"] >= 1
+                        and any(
+                            lane["state"] == "retiring"
+                            for lane in managed_lanes(current)
+                        )
+                    )
+                    else None
+                ),
+                "shared lane to retire on its first cancellation",
+            )
+            follower = executor.submit(
+                chat,
+                harness.proxy_port,
+                MODEL,
+                "shared-follower",
+                0,
+                8,
+            )
+            queued = wait_until(
+                lambda: (
+                    queue
+                    if (
+                        (queue := harness.status()["parallel_pool"]["queue"])
+                        ["phase_counts"].get(
+                            "waiting-request-cancellation", 0
+                        ) == 1
+                    )
+                    else None
+                ),
+                "follower to wait for cancelled shared lane teardown",
+            )
+            assert queued["depth"] == 1
+            assert not any(
+                event.get("request_id") == "shared-follower"
+                for event in request_events(harness.event_log)
+            )
+            starts = sum(
+                event["kind"] == "start"
+                for event in events(harness.event_log)
+            )
+            stops = sum(
+                event["kind"] == "stop"
+                for event in events(harness.event_log)
+            )
+            assert starts - stops == 1
+            legitimate_result = legitimate.result(timeout=8)
+            assert legitimate_result[0] == 200, legitimate_result
+            follower_result = follower.result(timeout=8)
+            assert follower_result[0] == 200, follower_result
+            assert (
+                follower_result[2]["X-Ollama-Unify-Lane"]
+                != legitimate_result[2]["X-Ollama-Unify-Lane"]
+            )
+
+        final = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "shared-lane follower release",
+            timeout=8,
+        )
+        assert len(managed_lanes(final)) == 1
+        assert all(
+            lane["state"] == "ready" and lane["in_flight"] == 0
+            for lane in managed_lanes(final)
+        )
+        starts = sum(
+            event["kind"] == "start" for event in events(harness.event_log)
+        )
+        stops = sum(
+            event["kind"] == "stop" for event in events(harness.event_log)
+        )
+        assert starts - stops == 1
+
+
+def test_cancellation_induced_eof_is_not_replayable(helper, fixture_bin):
+    logical_id = "turn:cancelled-stream"
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        request_activity_ttl=0.15,
+        request_detached_ttl=0.15,
+        request_cancel_grace=0.1,
+    ) as harness:
+        status, body, _ = streaming_chat(
+            harness.proxy_port,
+            MODEL,
+            "cancelled-stream",
+            logical_id,
+            timeout=5,
+            chunk_count=2,
+            chunk_interval=1.0,
+        )
+        assert status == 200
+        assert b"chunk-1" in body
+        assert b"chunk-2" not in body
+        wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "cancelled stream admission release",
+            timeout=8,
+        )
+        replay = resume_chat(harness.proxy_port, logical_id, timeout=5)
+        assert replay[0] == 409, replay
+        assert replay[1]["reason_code"] == "backend_activity_timeout"
+        completed = harness.status()["parallel_pool"]["completed_responses"]
+        assert completed["entries"] == 0
+        generated = [
+            event for event in request_events(harness.event_log)
+            if event.get("request_id") == "cancelled-stream"
+        ]
+        assert len(generated) == 1
+
+
+def test_partial_fixed_length_response_closes_client(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        request_activity_ttl=0.5,
+        request_cancel_grace=0.1,
+    ) as harness:
+        status, partial, elapsed = incomplete_fixed_length_chat(
+            harness.proxy_port,
+            MODEL,
+            "partial-fixed-length",
+        )
+        assert status == 200
+        assert partial
+        assert elapsed < 2.0
+        final = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "partial-response admission release",
+            timeout=8,
+        )
+        lifecycle = final["parallel_pool"]["request_lifecycle"]
+        assert lifecycle["cancelled_total"] == 1
+        assert lifecycle["forced_lane_stop_total"] == 1
+        assert not managed_lanes(final)
+
+
+def test_backend_reset_retires_managed_lane(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        request_activity_ttl=0.5,
+        request_cancel_grace=0.1,
+    ) as harness:
+        capacity_status, capacity, _ = harness.capacity(MODEL)
+        assert capacity_status == 200, capacity
+        old_lane_id = managed_lanes(harness.status())[0]["id"]
+        status, payload, _ = chat(
+            harness.proxy_port,
+            MODEL,
+            "backend-reset",
+            timeout=5,
+            mock_backend_reset=True,
+        )
+        assert status == 503, (status, payload)
+        assert payload["reason_code"] == "backend_transport_failed"
+        final = wait_until(
+            lambda: (
+                current
+                if (current := harness.status())["active_requests"] == 0
+                else None
+            ),
+            "reset backend admission release",
+            timeout=8,
+        )
+        lifecycle = final["parallel_pool"]["request_lifecycle"]
+        assert lifecycle["cancelled_total"] == 1
+        assert lifecycle["forced_lane_stop_total"] == 1
+        assert not managed_lanes(final)
+        follower = chat(
+            harness.proxy_port,
+            MODEL,
+            "after-backend-reset",
+            timeout=8,
+        )
+        assert follower[0] == 200, follower
+        assert follower[2]["X-Ollama-Unify-Lane"] != old_lane_id
 
 
 def test_completed_oversize_response_fails_closed_without_regeneration(
@@ -2661,6 +3145,13 @@ def main():
     test_completed_native_response_replays_without_generation(helper, fixture_bin)
     test_completed_streaming_response_replays_exact_body(helper, fixture_bin)
     test_completed_response_survives_delivery_disconnect(helper, fixture_bin)
+    test_backend_activity_renews_active_request_ttl(helper, fixture_bin)
+    test_silent_backend_request_expires_exact_admission(helper, fixture_bin)
+    test_repeated_abandoned_requests_do_not_compound_lanes(helper, fixture_bin)
+    test_cancelled_shared_lane_blocks_fresh_admission(helper, fixture_bin)
+    test_cancellation_induced_eof_is_not_replayable(helper, fixture_bin)
+    test_partial_fixed_length_response_closes_client(helper, fixture_bin)
+    test_backend_reset_retires_managed_lane(helper, fixture_bin)
     test_completed_oversize_response_fails_closed_without_regeneration(
         helper, fixture_bin,
     )

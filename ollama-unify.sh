@@ -1147,6 +1147,23 @@ POOL_INSTANCE_PARALLEL = max(1, env_int("OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL", 1
 POOL_IDLE_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_IDLE_TIMEOUT", 300.0)
 POOL_READY_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_READY_TIMEOUT", 30.0)
 POOL_LOAD_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_LOAD_TIMEOUT", DRAIN_TIMEOUT)
+# An admitted request is a renewable lease, not an unbounded counter. Backend
+# headers and response chunks renew the activity deadline. If the caller goes
+# away, non-replayable work is cancelled immediately; logical work gets a
+# short renewable window in which to finish and enter the replay cache.
+REQUEST_ACTIVITY_TTL = max(
+    0.1, env_float("OLLAMA_UNIFY_REQUEST_ACTIVITY_TTL", DRAIN_TIMEOUT)
+)
+REQUEST_DETACHED_TTL = max(
+    0.1, env_float("OLLAMA_UNIFY_REQUEST_DETACHED_TTL", 30.0)
+)
+REQUEST_CANCEL_GRACE = max(
+    0.1, env_float("OLLAMA_UNIFY_REQUEST_CANCEL_GRACE", 5.0)
+)
+# _terminate_process has a 15s graceful wait, a 5s leader reap wait, and a
+# final 5s process-group verification window. Give that worker one extra
+# second, then renew/retry the stop without ever dropping its reservation.
+LANE_STOP_ATTEMPT_TTL = max(REQUEST_CANCEL_GRACE, 26.0)
 POOL_VRAM_RESERVE_MIB = env_int("OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB", 8192)
 POOL_HOST_RESERVE_MIB = env_int("OLLAMA_UNIFY_POOL_HOST_RESERVE_MIB", 2048)
 POOL_MODEL_OVERHEAD_PERCENT = max(
@@ -1578,6 +1595,15 @@ def discovery_document() -> dict[str, Any]:
             "instance_parallel": POOL_INSTANCE_PARALLEL,
             "idle_timeout_seconds": POOL_IDLE_TIMEOUT,
             "load_timeout_seconds": POOL_LOAD_TIMEOUT,
+            "request_lifecycle": {
+                "activity_ttl_seconds": REQUEST_ACTIVITY_TTL,
+                "detached_ttl_seconds": REQUEST_DETACHED_TTL,
+                "cancel_grace_seconds": REQUEST_CANCEL_GRACE,
+                "lane_stop_attempt_ttl_seconds": LANE_STOP_ATTEMPT_TTL,
+                "renewal_events": ["backend_connected", "response_headers", "response_chunk"],
+                "non_logical_disconnect": "cancel_immediately",
+                "logical_disconnect": "renewable_completion_window",
+            },
             "model_overhead_percent": POOL_MODEL_OVERHEAD_PERCENT,
             "vram_reserve_mib": POOL_VRAM_RESERVE_MIB,
             "host_reserve_mib_per_lane": POOL_HOST_RESERVE_MIB,
@@ -2125,6 +2151,18 @@ def lease_visibility_warning(summaries: list[dict[str, Any]]) -> str:
     )
 
 
+def process_group_alive(process: Any) -> bool:
+    if process is None:
+        return False
+    try:
+        os.killpg(process.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 @dataclass
 class Lane:
     lane_id: str
@@ -2147,9 +2185,7 @@ class Lane:
     active_clients: dict[str, int] = field(default_factory=dict)
 
     def public_summary(self) -> dict[str, Any]:
-        alive = self.kind == "system" or (
-            self.process is not None and self.process.poll() is None
-        )
+        alive = self.kind == "system" or process_group_alive(self.process)
         return {
             "id": self.lane_id,
             "kind": self.kind,
@@ -2343,6 +2379,37 @@ class QueuedRequest:
         }
 
 
+@dataclass
+class ActiveRequest:
+    """Exact ownership record for one admitted proxy request.
+
+    Aggregate counters are presentation data. This record is the authority
+    used for release, cancellation, and late-cleanup protection.
+    """
+
+    request_id: str
+    lane: Lane
+    logical_request_id: str
+    admitted_at: float
+    last_activity_at: float
+    expires_at: float
+    phase: str = "admitted"
+    client_key: str = ""
+    detached_at: float | None = None
+    cancel_requested_at: float | None = None
+    cancel_reason: str = ""
+    backend: Any = None
+    backend_started: bool = False
+    backend_completed: bool = False
+    lane_stop_started: bool = False
+    lane_stopped: bool = False
+    # Serialize the last client write against EOF/reset observation. Without
+    # this per-request guard, a client that closes immediately after reading a
+    # complete fixed-length body can race the handler's completion commit and
+    # incorrectly retire a healthy lane.
+    terminal_lock: Any = field(default_factory=threading.RLock, repr=False)
+
+
 @dataclass(frozen=True)
 class Admission:
     lane: Lane
@@ -2396,6 +2463,7 @@ class Broker:
         self.stopping = threading.Event()
         self.anonymous_running = False
         self.waiters: list[QueuedRequest] = []
+        self.active_request_records: dict[str, ActiveRequest] = {}
         self.logical_in_flight: dict[str, tuple[str, str, int]] = {}
         self.logical_tombstones: dict[str, LogicalRequestTombstone] = {}
         self.retained_request_bytes = 0
@@ -2423,6 +2491,13 @@ class Broker:
         self.queue_wait_ms_total = 0
         self.queue_wait_ms_max = 0
         self.queue_peak = 0
+        self.request_activity_renewed_total = 0
+        self.request_disconnected_total = 0
+        self.request_expired_total = 0
+        self.request_cancelled_total = 0
+        self.request_forced_lane_stop_total = 0
+        self.request_forced_release_total = 0
+        self.request_terminal_release_total = 0
         now = time.time()
         self.lanes: dict[str, Lane] = {
             "base": Lane(
@@ -2543,9 +2618,8 @@ class Broker:
 
     def _prune_dead_lanes_locked(self) -> None:
         dead = [lane_id for lane_id, lane in self.lanes.items()
-                if lane.kind == "managed" and (
-                    lane.process is None or lane.process.poll() is not None
-                )]
+                if lane.kind == "managed"
+                and not process_group_alive(lane.process)]
         for lane_id in dead:
             lane = self.lanes.pop(lane_id)
             LOG.warning("managed Ollama lane stopped unexpectedly: %s", lane.lane_id)
@@ -2865,6 +2939,9 @@ class Broker:
             unavailable = "response_body_exceeds_total_cache_limit"
         now = time.monotonic()
         with self.cv:
+            tombstone = self.logical_tombstones.get(logical_request_id)
+            if tombstone is not None and tombstone.request_id == request_id:
+                self.logical_tombstones.pop(logical_request_id, None)
             self._prune_completed_responses_locked(now)
             self._remove_completed_response_locked(logical_request_id)
             while (
@@ -3101,7 +3178,7 @@ class Broker:
             self._prune_dead_lanes_locked()
             reserved_by_gpu: dict[str, int] = {}
             for lane in self.lanes.values():
-                if lane.kind != "managed" or not lane.gpu_uuid or lane.retiring:
+                if lane.kind != "managed" or not lane.gpu_uuid:
                     continue
                 reserved_by_gpu[lane.gpu_uuid] = (
                     reserved_by_gpu.get(lane.gpu_uuid, 0)
@@ -3177,24 +3254,41 @@ class Broker:
         )
 
     @staticmethod
-    def _terminate_process(process: Any) -> None:
+    def _terminate_process(process: Any) -> bool:
         if process is None:
-            return
+            return True
+        process_group = process.pid
+
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process_group, signal.SIGTERM)
         except OSError:
             pass
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process_group, signal.SIGKILL)
             except OSError:
                 pass
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        # The lane leader can exit before runner grandchildren in the same
+        # process group. Reservation release requires the complete group to be
+        # gone, not merely a reaped parent Popen.
+        if process_group_alive(process):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 5.0
+            while (
+                process_group_alive(process)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+        return process.poll() is not None and not process_group_alive(process)
 
     def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int,
                     capabilities: set[str], request_path: str,
@@ -3313,15 +3407,34 @@ class Broker:
         )
         return lane
 
-    def _stop_lanes(self, lanes: list[Lane], reason: str) -> None:
+    def _stop_lanes(self, lanes: list[Lane], reason: str) -> list[Lane]:
+        failed: list[Lane] = []
         for lane in lanes:
             try:
                 unload_models_at(lane.host, lane.port, min(UNLOAD_TIMEOUT, 15.0),
                                  require_available=False)
             except Exception as exc:
                 LOG.warning("managed lane unload failed id=%s: %s", lane.lane_id, exc)
-            self._terminate_process(lane.process)
-            LOG.info("managed Ollama lane stopped id=%s reason=%s", lane.lane_id, reason)
+            if self._terminate_process(lane.process):
+                LOG.info(
+                    "managed Ollama lane stopped id=%s reason=%s",
+                    lane.lane_id,
+                    reason,
+                )
+                continue
+            lane.retiring = True
+            lane.last_used = 0
+            with self.cv:
+                self.lanes[lane.lane_id] = lane
+                self.cv.notify_all()
+            failed.append(lane)
+            LOG.error(
+                "managed Ollama lane process group survived stop; retaining "
+                "its reservation id=%s reason=%s",
+                lane.lane_id,
+                reason,
+            )
+        return failed
 
     def stop_pool_lanes(
         self, reason: str, gpu_uuids: set[str] | None = None,
@@ -3335,7 +3448,12 @@ class Broker:
             for lane in lanes:
                 self.lanes.pop(lane.lane_id, None)
             self.cv.notify_all()
-        self._stop_lanes(lanes, reason)
+        failed = self._stop_lanes(lanes, reason)
+        if failed:
+            raise RuntimeError(
+                "managed lane process group did not stop: "
+                + ", ".join(lane.lane_id for lane in failed)
+            )
         return [lane.lane_id for lane in lanes]
 
     def ensure_capacity(
@@ -3354,6 +3472,9 @@ class Broker:
         with self.cv:
             requested_gpu_uuids = gpu_uuids
             gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
+            cancelling_request = self._model_cancellation_in_progress_locked(
+                model
+            )
         if gpu_uuids == ():
             raise PermanentCapacityError(
                 f"model {model!r} is restricted to GPUs "
@@ -3365,6 +3486,15 @@ class Broker:
         if parallel < 1:
             raise PermanentCapacityError(
                 "parallel must be at least 1", 400, "invalid_capacity_request"
+            )
+        if cancelling_request:
+            raise CapacityError(
+                f"model {model!r} is cancelling an expired request; retry "
+                "after its managed lane stops",
+                503,
+                "request_cancellation_in_progress",
+                True,
+                1,
             )
         maximum = POOL_MAX_SERVERS * POOL_INSTANCE_PARALLEL
         if parallel > maximum:
@@ -3445,7 +3575,14 @@ class Broker:
                     if retired:
                         self.cv.notify_all()
                 if retired:
-                    self._stop_lanes(retired, f"idle lane replacement for {model}")
+                    failed = self._stop_lanes(
+                        retired, f"idle lane replacement for {model}"
+                    )
+                    if failed:
+                        raise CapacityError(
+                            "retired managed lane process group did not stop",
+                            reason_code="lane_stop_failed",
+                        )
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     blocked = self._ollama_blocked_gpus_locked()
@@ -3562,9 +3699,14 @@ class Broker:
                                 else "lane_capacity_wait"
                             ),
                         )
-                    self._stop_lanes(
+                    failed = self._stop_lanes(
                         [victim], f"live VRAM reclamation for {model}",
                     )
+                    if failed:
+                        raise CapacityError(
+                            "reclaimed managed lane process group did not stop",
+                            reason_code="lane_stop_failed",
+                        )
                 created: list[Lane] = []
                 try:
                     for chosen_uuid in placements:
@@ -3636,6 +3778,474 @@ class Broker:
             )
             self._remove_waiter_locked(waiter)
             self.queue_stale_total += 1
+
+    def _register_active_request_locked(
+        self,
+        lane: Lane,
+        request_id: str,
+        logical_request_id: str,
+    ) -> None:
+        if request_id in self.active_request_records:
+            raise RuntimeError(f"request {request_id} is already admitted")
+        now = time.monotonic()
+        self.active_request_records[request_id] = ActiveRequest(
+            request_id=request_id,
+            lane=lane,
+            logical_request_id=logical_request_id,
+            admitted_at=now,
+            last_activity_at=now,
+            expires_at=now + REQUEST_ACTIVITY_TTL,
+        )
+        lane.in_flight += 1
+        lane.last_used = time.time()
+        self.active_requests = len(self.active_request_records)
+
+    def bind_active_request_client(
+        self, admission: Admission, client_key: str,
+    ) -> None:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            if active is not None:
+                active.client_key = client_key
+
+    def request_backend_started(
+        self, admission: Admission, backend: Any,
+    ) -> bool:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            if active is None or active.cancel_requested_at is not None:
+                return False
+            active.backend = backend
+            active.backend_started = True
+            active.phase = "backend_connecting"
+            now = time.monotonic()
+            active.last_activity_at = now
+            active.expires_at = now + (
+                REQUEST_DETACHED_TTL
+                if active.detached_at is not None
+                else REQUEST_ACTIVITY_TTL
+            )
+            if (
+                active.detached_at is not None
+                and not active.logical_request_id
+            ):
+                active.expires_at = now
+            self.cv.notify_all()
+            return True
+
+    def renew_request_activity(
+        self, admission: Admission, phase: str,
+    ) -> bool:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            if active is None or active.cancel_requested_at is not None:
+                return False
+            now = time.monotonic()
+            active.phase = phase
+            active.last_activity_at = now
+            active.expires_at = now + (
+                REQUEST_DETACHED_TTL
+                if active.detached_at is not None
+                else REQUEST_ACTIVITY_TTL
+            )
+            self.request_activity_renewed_total += 1
+            self.cv.notify_all()
+            return True
+
+    def _mark_active_cancelling_locked(
+        self,
+        active: ActiveRequest,
+        reason: str,
+        *,
+        expired: bool,
+    ) -> bool:
+        if active.cancel_requested_at is not None:
+            return False
+        now = time.monotonic()
+        active.cancel_requested_at = now
+        active.cancel_reason = reason
+        active.phase = "cancelling"
+        active.expires_at = now + REQUEST_CANCEL_GRACE
+        if active.lane.kind == "managed":
+            # Stop admitting fresh work to a lane whose backend termination is
+            # not yet proven, even when that lane allows parallel requests.
+            active.lane.retiring = True
+        self.request_cancelled_total += 1
+        if expired:
+            self.request_expired_total += 1
+        if active.logical_request_id:
+            self._record_logical_tombstone_locked(
+                active.logical_request_id,
+                active.request_id,
+                reason,
+            )
+        self.cv.notify_all()
+        return True
+
+    def request_client_detached(self, admission: Admission) -> None:
+        cancel = None
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+        if active is None:
+            return
+        with active.terminal_lock:
+            with self.cv:
+                current = self.active_request_records.get(
+                    admission.request_id
+                )
+                if (
+                    current is not active
+                    or active.detached_at is not None
+                    or active.backend_completed
+                ):
+                    return
+                now = time.monotonic()
+                active.detached_at = now
+                active.phase = "detached"
+                self.request_disconnected_total += 1
+                if active.logical_request_id:
+                    active.expires_at = now + REQUEST_DETACHED_TTL
+                else:
+                    if self._mark_active_cancelling_locked(
+                        active, "client_disconnected", expired=False
+                    ):
+                        cancel = active
+                self.cv.notify_all()
+        if cancel is not None:
+            self._cancel_backend_transport(cancel)
+
+    def active_request_terminal_lock(
+        self, admission: Admission,
+    ) -> Any | None:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            return active.terminal_lock if active is not None else None
+
+    def request_backend_complete(self, admission: Admission) -> bool:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            if active is None:
+                return False
+            if active.cancel_requested_at is not None:
+                # Cancellation and completion are competing terminal events.
+                # Once cancellation commits, EOF caused by our own socket
+                # shutdown must never become a successful/replayable response.
+                return False
+            if active.backend_completed:
+                return True
+            active.backend_completed = True
+            active.phase = "backend_complete"
+            now = time.monotonic()
+            active.last_activity_at = now
+            active.expires_at = now + REQUEST_CANCEL_GRACE
+            tombstone = self.logical_tombstones.get(
+                active.logical_request_id
+            )
+            if (
+                tombstone is not None
+                and tombstone.request_id == active.request_id
+            ):
+                self.logical_tombstones.pop(active.logical_request_id, None)
+            self.cv.notify_all()
+            return True
+
+    def active_request_cancel_reason(self, admission: Admission) -> str:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            return active.cancel_reason if active is not None else ""
+
+    def note_backend_failure(
+        self, admission: Admission, reason: str,
+    ) -> None:
+        with self.cv:
+            active = self.active_request_records.get(admission.request_id)
+            if active is None or active.backend_completed:
+                return
+            self._mark_active_cancelling_locked(
+                active,
+                reason,
+                expired=reason in {
+                    "backend_activity_timeout", "detached_request_expired",
+                },
+            )
+
+    @staticmethod
+    def _cancel_backend_transport(active: ActiveRequest) -> None:
+        backend = active.backend
+        if backend is None:
+            return
+        sock = getattr(backend, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            backend.close()
+        except OSError:
+            pass
+
+    def _active_request_summary_locked(self) -> dict[str, Any]:
+        now = time.monotonic()
+        records = list(self.active_request_records.values())
+        phases: dict[str, int] = {}
+        for active in records:
+            phases[active.phase] = phases.get(active.phase, 0) + 1
+        finite_expiries = [
+            active.expires_at for active in records
+            if math.isfinite(active.expires_at)
+        ]
+        return {
+            "tracked": len(records),
+            "phase_counts": phases,
+            "detached": sum(
+                active.detached_at is not None for active in records
+            ),
+            "cancelling": sum(
+                active.cancel_requested_at is not None for active in records
+            ),
+            "oldest_age_ms": max(
+                (int((now - active.admitted_at) * 1000) for active in records),
+                default=0,
+            ),
+            "nearest_expiry_ms": max(
+                0,
+                int((min(finite_expiries) - now) * 1000)
+                if finite_expiries else 0,
+            ),
+            "activity_ttl_seconds": REQUEST_ACTIVITY_TTL,
+            "detached_ttl_seconds": REQUEST_DETACHED_TTL,
+            "cancel_grace_seconds": REQUEST_CANCEL_GRACE,
+            "lane_stop_attempt_ttl_seconds": LANE_STOP_ATTEMPT_TTL,
+            "activity_renewed_total": self.request_activity_renewed_total,
+            "disconnected_total": self.request_disconnected_total,
+            "expired_total": self.request_expired_total,
+            "cancelled_total": self.request_cancelled_total,
+            "forced_lane_stop_total": self.request_forced_lane_stop_total,
+            "forced_release_total": self.request_forced_release_total,
+            "terminal_release_total": self.request_terminal_release_total,
+        }
+
+    def _model_cancellation_in_progress_locked(self, model: str) -> bool:
+        return any(
+            active.lane.kind == "managed"
+            and active.lane.model == model
+            and active.cancel_requested_at is not None
+            and not active.lane_stopped
+            for active in self.active_request_records.values()
+        )
+
+    def _release_active_request_locked(
+        self,
+        request_id: str,
+        model: str,
+        succeeded: bool,
+        client_key: str = "",
+    ) -> Lane | None:
+        active = self.active_request_records.pop(request_id, None)
+        if active is None:
+            return None
+        lane = active.lane
+        lane.in_flight = max(0, lane.in_flight - 1)
+        key = client_key or active.client_key
+        if key:
+            remaining = lane.active_clients.get(key, 0) - 1
+            if remaining > 0:
+                lane.active_clients[key] = remaining
+            else:
+                lane.active_clients.pop(key, None)
+        lane.last_used = time.time()
+        if succeeded and model:
+            lane.model = model
+        self.active_requests = len(self.active_request_records)
+        if active.logical_request_id:
+            logical = self.logical_in_flight.get(active.logical_request_id)
+            if logical is not None and logical[1] == active.request_id:
+                self.logical_in_flight.pop(active.logical_request_id, None)
+        retired = None
+        if (
+            lane.kind == "managed"
+            and lane.retiring
+            and not lane.in_flight
+            and self.lanes.get(lane.lane_id) is lane
+        ):
+            self.lanes.pop(lane.lane_id)
+            retired = lane
+        self.cv.notify_all()
+        return retired
+
+    def _schedule_cancelled_lane_stop_locked(self, lane: Lane) -> bool:
+        lane_requests = [
+            active for active in self.active_request_records.values()
+            if active.lane is lane
+        ]
+        if (
+            not lane_requests
+            or lane.kind != "managed"
+            or lane.process is None
+            or any(active.cancel_requested_at is None for active in lane_requests)
+            or any(active.lane_stop_started for active in lane_requests)
+        ):
+            return False
+        for active in lane_requests:
+            active.lane_stop_started = True
+            active.phase = "stopping_lane"
+            active.expires_at = time.monotonic() + LANE_STOP_ATTEMPT_TTL
+        lane.retiring = True
+        self.request_forced_lane_stop_total += 1
+        self.cv.notify_all()
+        return True
+
+    def _stop_expired_lane(self, lane: Lane) -> None:
+        group_stopped = self._terminate_process(lane.process)
+        if not group_stopped:
+            LOG.error(
+                "managed Ollama lane did not stop after request cancellation "
+                "id=%s gpu=%s; retaining its admission accounting",
+                lane.lane_id,
+                lane.gpu_uuid,
+            )
+            with self.cv:
+                now = time.monotonic()
+                for active in self.active_request_records.values():
+                    if active.lane is lane:
+                        active.lane_stop_started = False
+                        active.phase = "lane_stop_failed"
+                        active.expires_at = now + REQUEST_CANCEL_GRACE
+                self.cv.notify_all()
+            return
+        LOG.warning(
+            "managed Ollama lane force-stopped after request cancellation "
+            "id=%s gpu=%s",
+            lane.lane_id,
+            lane.gpu_uuid,
+        )
+        with self.cv:
+            self.lanes.pop(lane.lane_id, None)
+            stopped = [
+                active for active in self.active_request_records.values()
+                if active.lane is lane and active.cancel_requested_at is not None
+            ]
+            for active in stopped:
+                active.lane_stopped = True
+                self._release_active_request_locked(
+                    active.request_id, "", False
+                )
+                self.request_forced_release_total += 1
+            self.cv.notify_all()
+
+    def active_request_watchdog(self) -> None:
+        """Wait on exact request deadlines and cancel only their ownership.
+
+        This is deadline/event driven: admissions, backend activity, client
+        detach, and terminal release all notify the condition. There is no
+        fixed polling cadence.
+        """
+        while True:
+            cancel: list[ActiveRequest] = []
+            stop_lanes: list[Lane] = []
+            with self.cv:
+                while not self.stopping.is_set():
+                    now = time.monotonic()
+                    due = [
+                        active for active in self.active_request_records.values()
+                        if active.expires_at <= now
+                    ]
+                    if due:
+                        break
+                    deadline = min(
+                        (active.expires_at
+                         for active in self.active_request_records.values()),
+                        default=None,
+                    )
+                    self.cv.wait(
+                        None if deadline is None else max(0.01, deadline - now)
+                    )
+                if self.stopping.is_set():
+                    return
+                now = time.monotonic()
+                force_release: list[ActiveRequest] = []
+                terminal_release: list[ActiveRequest] = []
+                for active in due:
+                    current = self.active_request_records.get(active.request_id)
+                    if current is not active:
+                        continue
+                    if (
+                        active.backend_completed
+                        and active.cancel_requested_at is None
+                    ):
+                        # The normal handler finalizer releases this admission
+                        # immediately after caching any logical response. Keep
+                        # that terminal phase leased too, so an interrupted
+                        # finalizer cannot pin lane accounting forever. A
+                        # tombstone closes the narrow replay/regeneration race;
+                        # record_completed_response clears it for this exact
+                        # request if finalization subsequently completes.
+                        if active.logical_request_id:
+                            self._record_logical_tombstone_locked(
+                                active.logical_request_id,
+                                active.request_id,
+                                "completion_finalization_timeout",
+                            )
+                        terminal_release.append(active)
+                        continue
+                    if active.cancel_requested_at is None:
+                        if active.detached_at is not None:
+                            reason = (
+                                "detached_request_expired"
+                                if active.logical_request_id
+                                else "client_disconnected"
+                            )
+                        else:
+                            reason = "backend_activity_timeout"
+                        if self._mark_active_cancelling_locked(
+                            active,
+                            reason,
+                            expired=reason != "client_disconnected",
+                        ):
+                            cancel.append(active)
+                        continue
+                    if active.lane_stopped:
+                        force_release.append(active)
+                        continue
+                    lane = active.lane
+                    if active.lane_stop_started:
+                        # The bounded stop worker failed to report a terminal
+                        # result. Renew ownership and retry; never release the
+                        # lane's reservation merely because its worker died.
+                        active.lane_stop_started = False
+                        active.phase = "lane_stop_attempt_expired"
+                    if self._schedule_cancelled_lane_stop_locked(lane):
+                        stop_lanes.append(lane)
+                    else:
+                        active.expires_at = now + REQUEST_CANCEL_GRACE
+                        cancel.append(active)
+                for active in force_release:
+                    retired = self._release_active_request_locked(
+                        active.request_id, "", False
+                    )
+                    if retired is not None:
+                        stop_lanes.append(retired)
+                    self.request_forced_release_total += 1
+                for active in terminal_release:
+                    retired = self._release_active_request_locked(
+                        active.request_id, "", False
+                    )
+                    if retired is not None:
+                        stop_lanes.append(retired)
+                    self.request_terminal_release_total += 1
+            for active in cancel:
+                self._cancel_backend_transport(active)
+            seen_lane_ids: set[str] = set()
+            for lane in stop_lanes:
+                if lane.lane_id in seen_lane_ids:
+                    continue
+                seen_lane_ids.add(lane.lane_id)
+                threading.Thread(
+                    target=self._stop_expired_lane,
+                    args=(lane,),
+                    daemon=True,
+                ).start()
 
     @staticmethod
     def _waiter_terminal_failure(waiter: QueuedRequest) -> CapacityError:
@@ -3728,9 +4338,9 @@ class Broker:
                         self.cv.wait(min(remaining, 0.25))
                     lane = self._select_lane_locked(model, routable, gpu_uuids)
                     if lane is not None:
-                        lane.in_flight += 1
-                        lane.last_used = time.time()
-                        self.active_requests += 1
+                        self._register_active_request_locked(
+                            lane, request_id, logical_request_id
+                        )
                         return Admission(
                             lane, request_id, logical_request_id,
                             request_fingerprint,
@@ -3983,9 +4593,11 @@ class Broker:
                         self.queue_wait_ms_max = max(
                             self.queue_wait_ms_max, queue_ms
                         )
-                        lane.in_flight += 1
-                        lane.last_used = time.time()
-                        self.active_requests += 1
+                        self._register_active_request_locked(
+                            lane,
+                            waiter.request_id,
+                            waiter.logical_request_id,
+                        )
                         if waiter.logical_request_id:
                             self.logical_in_flight[waiter.logical_request_id] = (
                                 waiter.request_fingerprint,
@@ -4033,6 +4645,19 @@ class Broker:
                     self.cv.wait(5.0)
                     continue
                 model = waiter.model
+                if self._model_cancellation_in_progress_locked(model):
+                    waiter.phase = "waiting-request-cancellation"
+                    waiter.last_error = (
+                        "an expired request is stopping its managed lane"
+                    )
+                    waiter.last_reason_code = (
+                        "request_cancellation_in_progress"
+                    )
+                    self.reconcile_retry_at = 0.0
+                    self.reconcile_last_error = waiter.last_error
+                    self.reconciling_model = None
+                    self.cv.wait()
+                    continue
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
                             and (waiter.gpu_uuids is None
@@ -4118,34 +4743,42 @@ class Broker:
 
     def proxy_exit(
         self,
-        lane: Lane,
+        admission: Admission,
         model: str,
         succeeded: bool,
-        logical_request_id: str = "",
         client_key: str = "",
     ) -> None:
         retired = None
+        expired_lane = None
         with self.cv:
-            lane.in_flight = max(0, lane.in_flight - 1)
-            if client_key:
-                remaining = lane.active_clients.get(client_key, 0) - 1
-                if remaining > 0:
-                    lane.active_clients[client_key] = remaining
+            active = self.active_request_records.get(admission.request_id)
+            lane = active.lane if active is not None else admission.lane
+            if (
+                active is not None
+                and active.cancel_requested_at is not None
+                and active.backend_started
+                and not active.backend_completed
+                and active.lane.kind == "managed"
+                and not active.lane_stopped
+            ):
+                active.phase = "backend_terminal"
+                active.expires_at = time.monotonic() + REQUEST_CANCEL_GRACE
+                if self._schedule_cancelled_lane_stop_locked(active.lane):
+                    expired_lane = active.lane
                 else:
-                    lane.active_clients.pop(client_key, None)
-            lane.last_used = time.time()
-            if succeeded and model:
-                lane.model = model
-            self.active_requests = max(0, self.active_requests - 1)
-            if logical_request_id:
-                self.logical_in_flight.pop(logical_request_id, None)
-            if (lane.kind == "managed" and lane.retiring and not lane.in_flight
-                    and self.lanes.get(lane.lane_id) is lane):
-                # A lane moved off a disallowed GPU finishes its requests
-                # first, then stops.
-                self.lanes.pop(lane.lane_id)
-                retired = lane
-            self.cv.notify_all()
+                    self.cv.notify_all()
+            else:
+                retired = self._release_active_request_locked(
+                    admission.request_id, model, succeeded, client_key
+                )
+                if self._schedule_cancelled_lane_stop_locked(lane):
+                    expired_lane = lane
+        if expired_lane is not None:
+            threading.Thread(
+                target=self._stop_expired_lane,
+                args=(expired_lane,),
+                daemon=True,
+            ).start()
         if retired is not None:
             threading.Thread(
                 target=self._stop_lanes, args=([retired], "operator GPU policy"),
@@ -4678,7 +5311,14 @@ class Broker:
                     model, allowed or "all", [lane.lane_id for lane in moved] + retiring)
 
         def migrate() -> None:
-            self._stop_lanes(moved, "operator GPU policy")
+            failed = self._stop_lanes(moved, "operator GPU policy")
+            if failed:
+                LOG.error(
+                    "model %s cannot move until lane process groups stop: %s",
+                    model,
+                    [lane.lane_id for lane in failed],
+                )
+                return
             if not moved and not retiring:
                 return
             try:
@@ -4711,7 +5351,11 @@ class Broker:
             lane.retiring = True
             self.lanes.pop(lane_id, None)
             self.cv.notify_all()
-        self._stop_lanes([lane], "operator stop")
+        failed = self._stop_lanes([lane], "operator stop")
+        if failed:
+            raise RuntimeError(
+                f"lane {lane_id} process group survived stop and remains tracked"
+            )
         return {"ok": True, "stopped_lanes": [lane_id], "gpus": gpu_snapshot()}
 
     def record_client_use(self, client: dict[str, Any], lane: Lane,
@@ -4885,6 +5529,7 @@ class Broker:
             reason = self.last_reason
             lanes = self._lane_summaries_locked()
             queue = self._queue_summary_locked(include_requests=True)
+            request_lifecycle = self._active_request_summary_locked()
             completed_responses = self._completed_response_summary_locked()
             clients = self._client_summaries_locked()
             model_gpu_policy = {
@@ -4909,6 +5554,7 @@ class Broker:
                     "instance_parallel": POOL_INSTANCE_PARALLEL,
                     "lanes": lanes,
                     "queue": queue,
+                    "request_lifecycle": request_lifecycle,
                     "completed_responses": completed_responses,
                 },
                 "clients": clients,
@@ -4945,7 +5591,12 @@ class Broker:
                     self.lanes.pop(lane.lane_id, None)
                 base_idle = self.lanes["base"].in_flight == 0
                 self.cv.notify_all()
-            self._stop_lanes(affected, reason)
+            failed = self._stop_lanes(affected, reason)
+            if failed:
+                raise RuntimeError(
+                    "managed lane process groups survived reactive stop: "
+                    + ", ".join(lane.lane_id for lane in failed)
+                )
             if not affected and base_idle:
                 unload_all_models()
             wait_for_foreign_settle()
@@ -5040,8 +5691,13 @@ class Broker:
                 self.transition.release()
 
     def shutdown(self) -> None:
-        self.stopping.set()
-        self.stop_pool_lanes("broker shutdown")
+        with self.cv:
+            self.stopping.set()
+            self.cv.notify_all()
+        try:
+            self.stop_pool_lanes("broker shutdown")
+        except RuntimeError as exc:
+            LOG.error("broker shutdown retained live lane reservations: %s", exc)
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -5107,6 +5763,55 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return True
         except OSError:
             return False
+
+    def _watch_active_client(
+        self, admission: Admission, stop_socket: socket.socket,
+    ) -> None:
+        """Wait for client EOF/reset without polling the inference cadence."""
+        try:
+            readable, _, exceptional = select.select(
+                [self.connection, stop_socket], [], [self.connection], None
+            )
+            if stop_socket in readable:
+                return
+            if exceptional:
+                self.broker.request_client_detached(admission)
+                return
+            if self.connection in readable:
+                try:
+                    data = self.connection.recv(
+                        1, socket.MSG_PEEK | socket.MSG_DONTWAIT
+                    )
+                except BlockingIOError:
+                    return
+                except OSError:
+                    data = b""
+                if not data:
+                    self.broker.request_client_detached(admission)
+                # Non-empty bytes belong to an uncommon pipelined next
+                # request. Leave them untouched for BaseHTTPRequestHandler.
+        except (OSError, ValueError):
+            self.broker.request_client_detached(admission)
+
+    @staticmethod
+    def _stop_client_watcher(
+        stop_writer: socket.socket | None,
+        stop_reader: socket.socket | None,
+        watcher: threading.Thread | None,
+    ) -> None:
+        if stop_writer is not None:
+            try:
+                stop_writer.send(b"x")
+            except OSError:
+                pass
+        if watcher is not None:
+            watcher.join(timeout=0.25)
+        for endpoint in (stop_writer, stop_reader):
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError:
+                    pass
 
     def _requested_admission_wait(self) -> float | None:
         """Return a bounded broker-admission wait requested by the client.
@@ -5283,6 +5988,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 ]
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
                 document["parallel_pool"]["queue"] = self.broker._queue_summary_locked()
+                document["parallel_pool"]["request_lifecycle"] = (
+                    self.broker._active_request_summary_locked()
+                )
                 document["parallel_pool"]["completed_responses"] = (
                     self.broker._completed_response_summary_locked()
                 )
@@ -5345,7 +6053,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(503, {"error": str(exc)})
             finally:
                 if admission is not None:
-                    self.broker.proxy_exit(admission.lane, "", True)
+                    self.broker.proxy_exit(admission, "", True)
             return
         model = ""
         admission = None
@@ -5505,16 +6213,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         client_key = self.broker.record_client_use(
             self._client_identity(), lane, model
         )
+        self.broker.bind_active_request_client(admission, client_key)
         if not self._client_connected():
+            self.broker.request_client_detached(admission)
             self.broker.proxy_exit(
-                lane, model, False, admission.logical_request_id, client_key
+                admission, model, False, client_key
             )
             admission = None
             return
         response_started = False
         succeeded = False
         backend = None
+        watcher_stop_reader = None
+        watcher_stop_writer = None
+        client_watcher = None
+        client_socket_timeout = self.connection.gettimeout()
         try:
+            watcher_stop_reader, watcher_stop_writer = socket.socketpair()
+            client_watcher = threading.Thread(
+                target=self._watch_active_client,
+                args=(admission, watcher_stop_reader),
+                daemon=True,
+            )
+            client_watcher.start()
+            self.connection.settimeout(REQUEST_ACTIVITY_TTL)
             broker_control_headers = {
                 "x-ollama-unify-admission-wait-ms",
                 "x-ollama-unify-logical-request-id",
@@ -5531,9 +6253,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 key.lower() == "content-type" for key in headers
             ):
                 headers["Content-Type"] = content_type
-            backend = http.client.HTTPConnection(lane.host, lane.port, timeout=None)
+            backend = http.client.HTTPConnection(
+                lane.host, lane.port, timeout=REQUEST_ACTIVITY_TTL
+            )
+            if not self.broker.request_backend_started(admission, backend):
+                raise ConnectionAbortedError(
+                    "request was cancelled before backend connection"
+                )
             backend.request(self.command, self.path, body=body if body else None, headers=headers)
+            if not self.broker.renew_request_activity(
+                admission, "request_sent"
+            ):
+                backend.close()
+                raise ConnectionAbortedError(
+                    "request was cancelled while contacting backend"
+                )
             response = backend.getresponse()
+            if not self.broker.renew_request_activity(
+                admission, "response_headers"
+            ):
+                raise ConnectionAbortedError(
+                    "request was cancelled before response headers"
+                )
             forwarded_headers = [
                 (key, value) for key, value in response.getheaders()
                 if key.lower() not in HOP_HEADERS
@@ -5573,11 +6314,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 response_started = True
             except OSError:
                 client_writable = False
+                self.broker.request_client_detached(admission)
+                if not admission.logical_request_id:
+                    raise ClientDisconnected(
+                        "client disconnected before response headers"
+                    )
 
             retain_body = bool(
                 admission.logical_request_id and path in INFERENCE_PATHS
             )
             unavailable_reason = None
+            declared_length = -1
             if content_length is not None:
                 try:
                     declared_length = int(content_length)
@@ -5589,13 +6336,44 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             retained_chunks: list[bytes] = []
             response_body_bytes = 0
             response_digest = hashlib.sha256()
+            body_expected = (
+                self.command != "HEAD"
+                and response.status not in (204, 304)
+                and not 100 <= response.status < 200
+            )
             reader = getattr(response, "read1", response.read)
             while True:
                 chunk = reader(65536)
                 if not chunk:
+                    if (
+                        body_expected
+                        and declared_length >= 0
+                        and response_body_bytes != declared_length
+                    ):
+                        self.broker.note_backend_failure(
+                            admission, "backend_incomplete_response"
+                        )
+                        raise http.client.IncompleteRead(
+                            b"", declared_length - response_body_bytes
+                        )
+                    if not self.broker.request_backend_complete(admission):
+                        raise ConnectionAbortedError(
+                            "backend response ended after request cancellation"
+                        )
                     break
+                if not self.broker.renew_request_activity(
+                    admission, "response_body"
+                ):
+                    raise ConnectionAbortedError(
+                        "request was cancelled during response"
+                    )
                 response_body_bytes += len(chunk)
                 response_digest.update(chunk)
+                if declared_length >= 0 and response_body_bytes > declared_length:
+                    self.broker.note_backend_failure(
+                        admission, "backend_incomplete_response"
+                    )
+                    raise http.client.IncompleteRead(b"", 0)
                 if retain_body:
                     if (
                         response_body_bytes
@@ -5608,15 +6386,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         unavailable_reason = (
                             "observed_body_exceeds_per_entry_limit"
                         )
-                if client_writable:
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except OSError:
-                        # Continue draining the completed backend response. A
-                        # retry with the logical ID can then replay it instead
-                        # of launching a duplicate generation.
-                        client_writable = False
+                terminal_chunk = (
+                    declared_length >= 0
+                    and response_body_bytes == declared_length
+                )
+                terminal_lock = (
+                    self.broker.active_request_terminal_lock(admission)
+                    if terminal_chunk else None
+                )
+                if terminal_lock is not None:
+                    terminal_lock.acquire()
+                try:
+                    if client_writable:
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except OSError:
+                            # Continue draining the completed backend response.
+                            # A retry with the logical ID can then replay it
+                            # instead of launching duplicate generation.
+                            client_writable = False
+                            self.broker.request_client_detached(admission)
+                            if not admission.logical_request_id:
+                                raise ClientDisconnected(
+                                    "client disconnected during response"
+                                )
+                    if terminal_chunk:
+                        if not self.broker.request_backend_complete(admission):
+                            raise ConnectionAbortedError(
+                                "backend completed after request cancellation"
+                            )
+                finally:
+                    if terminal_lock is not None:
+                        terminal_lock.release()
             succeeded = response.status < 500
             if admission.logical_request_id and path in INFERENCE_PATHS:
                 self.broker.record_completed_response(
@@ -5633,18 +6435,63 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body_sha256=response_digest.hexdigest(),
                     unavailable_reason=unavailable_reason,
                 )
+        except ClientDisconnected:
+            pass
         except Exception as exc:
-            LOG.error("proxy error %s %s: %s", self.command, self.path, exc)
-            if not response_started:
-                self._send_json(503, {"error": f"Ollama backend unavailable: {exc}"})
+            failure_reason = (
+                "backend_activity_timeout"
+                if isinstance(exc, (TimeoutError, socket.timeout))
+                else "backend_transport_failed"
+            )
+            self.broker.note_backend_failure(admission, failure_reason)
+            cancel_reason = self.broker.active_request_cancel_reason(admission)
+            if cancel_reason == "client_disconnected":
+                LOG.info(
+                    "proxy client disconnected %s %s request=%s",
+                    self.command, self.path, admission.request_id,
+                )
+            else:
+                LOG.error(
+                    "proxy error %s %s request=%s reason=%s: %s",
+                    self.command,
+                    self.path,
+                    admission.request_id,
+                    cancel_reason or "backend_unavailable",
+                    exc,
+                )
+            if not response_started and cancel_reason != "client_disconnected":
+                status = 504 if cancel_reason == "backend_activity_timeout" else 503
+                self._send_json(status, {
+                    "error": f"Ollama backend unavailable: {exc}",
+                    "reason_code": cancel_reason or "backend_unavailable",
+                    "retryable": True,
+                    "request_id": admission.request_id,
+                })
+            elif response_started:
+                # A fixed-length response that ends early otherwise leaves
+                # the client waiting forever for bytes the backend will never
+                # produce. EOF is the only valid terminal signal at this point.
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
         finally:
+            try:
+                self.connection.settimeout(client_socket_timeout)
+            except OSError:
+                pass
             if backend is not None:
                 backend.close()
             if admission is not None:
                 self.broker.proxy_exit(
-                    lane, model, succeeded, admission.logical_request_id,
-                    client_key,
+                    admission, model, succeeded, client_key,
                 )
+            self._stop_client_watcher(
+                watcher_stop_writer,
+                watcher_stop_reader,
+                client_watcher,
+            )
 
     do_GET = _handle
     do_POST = _handle
@@ -5872,7 +6719,9 @@ def serve() -> int:
     proxy = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
 
     def shutdown(_signum: int, _frame: Any) -> None:
-        broker.stopping.set()
+        with broker.cv:
+            broker.stopping.set()
+            broker.cv.notify_all()
         threading.Thread(target=control.shutdown, daemon=True).start()
         threading.Thread(target=proxy.shutdown, daemon=True).start()
 
@@ -5883,6 +6732,7 @@ def serve() -> int:
     threading.Thread(target=broker.anonymous_watcher, daemon=True).start()
     threading.Thread(target=broker.lease_reaper, daemon=True).start()
     threading.Thread(target=broker.pool_reaper, daemon=True).start()
+    threading.Thread(target=broker.active_request_watchdog, daemon=True).start()
     LOG.info(
         "proxy listening on %s:%s; backend %s:%s; control %s; pool enabled=%s max=%s",
         LISTEN_HOST, LISTEN_PORT, BACKEND_HOST, BACKEND_PORT, CONTROL_SOCKET,
@@ -7397,6 +8247,9 @@ install_gpu_negotiator() {
   pool_idle_timeout="${OLLAMA_SAFE_POOL_IDLE_TIMEOUT:-300}"
   pool_ready_timeout="${OLLAMA_SAFE_POOL_READY_TIMEOUT:-30}"
   pool_load_timeout="${OLLAMA_SAFE_POOL_LOAD_TIMEOUT:-$drain_timeout}"
+  request_activity_ttl="${OLLAMA_SAFE_REQUEST_ACTIVITY_TTL:-$drain_timeout}"
+  request_detached_ttl="${OLLAMA_SAFE_REQUEST_DETACHED_TTL:-30}"
+  request_cancel_grace="${OLLAMA_SAFE_REQUEST_CANCEL_GRACE:-5}"
   pool_vram_reserve="${OLLAMA_SAFE_POOL_VRAM_RESERVE_MIB:-8192}"
   pool_host_reserve="${OLLAMA_SAFE_POOL_HOST_RESERVE_MIB:-2048}"
   pool_model_overhead="${OLLAMA_SAFE_POOL_MODEL_OVERHEAD_PERCENT:-110}"
@@ -7440,6 +8293,12 @@ install_gpu_negotiator() {
     || { err "OLLAMA_SAFE_POOL_READY_TIMEOUT must be numeric"; exit 2; }
   [[ "$pool_load_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_POOL_LOAD_TIMEOUT must be numeric"; exit 2; }
+  [[ "$request_activity_ttl" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_REQUEST_ACTIVITY_TTL must be numeric"; exit 2; }
+  [[ "$request_detached_ttl" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_REQUEST_DETACHED_TTL must be numeric"; exit 2; }
+  [[ "$request_cancel_grace" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { err "OLLAMA_SAFE_REQUEST_CANCEL_GRACE must be numeric"; exit 2; }
   [[ "$pool_resume_ttl" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { err "OLLAMA_SAFE_POOL_RESUME_TTL must be numeric"; exit 2; }
   [ -x "$ollama_binary" ] \
@@ -7510,6 +8369,9 @@ install_gpu_negotiator() {
     printf 'OLLAMA_UNIFY_POOL_IDLE_TIMEOUT="%s"\n' "$pool_idle_timeout"
     printf 'OLLAMA_UNIFY_POOL_READY_TIMEOUT="%s"\n' "$pool_ready_timeout"
     printf 'OLLAMA_UNIFY_POOL_LOAD_TIMEOUT="%s"\n' "$pool_load_timeout"
+    printf 'OLLAMA_UNIFY_REQUEST_ACTIVITY_TTL="%s"\n' "$request_activity_ttl"
+    printf 'OLLAMA_UNIFY_REQUEST_DETACHED_TTL="%s"\n' "$request_detached_ttl"
+    printf 'OLLAMA_UNIFY_REQUEST_CANCEL_GRACE="%s"\n' "$request_cancel_grace"
     printf 'OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB="%s"\n' "$pool_vram_reserve"
     printf 'OLLAMA_UNIFY_POOL_HOST_RESERVE_MIB="%s"\n' "$pool_host_reserve"
     printf 'OLLAMA_UNIFY_POOL_MODEL_OVERHEAD_PERCENT="%s"\n' "$pool_model_overhead"
