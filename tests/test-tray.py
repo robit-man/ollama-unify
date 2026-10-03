@@ -122,6 +122,9 @@ def test_menu_model(tray):
     assert model["icon"] == tray.ICON_ATTENTION
     assert model["label"] == "3L · 2O"
     assert model["summary"][0] == "Broker running · 3 lease(s) · 2 Ollama lane(s)"
+    assert model["summary"][1] == (
+        "Lease expected-release overdue: single-gpu"
+    )
 
     peer, pending, revoking = model["leases"]
     unlisted = GPU4[:12]

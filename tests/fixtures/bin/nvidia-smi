@@ -75,7 +75,10 @@ case "$*" in
     fi
     ;;
   *--query-gpu=uuid,memory.total,compute_cap*)
-    if [ "$MOCK_PROFILE" = "cuda_triple" ]; then
+    if [ "$MOCK_PROFILE" = "cuda_partial_failure" ]; then
+      printf '%s\n' 'GPU-healthy, 81920, 8.0'
+      exit 255
+    elif [ "$MOCK_PROFILE" = "cuda_triple" ]; then
       printf '%s\n' 'GPU-large, 81920, 8.0'
     elif [ "$MOCK_PROFILE" = "cuda_mixed" ]; then
       printf '%s\n' 'GPU-large, 49152, 8.0'

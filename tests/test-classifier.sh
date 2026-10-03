@@ -173,7 +173,8 @@ if env -u OLLAMA_SAFE_LARGEST_MODEL_MIB PATH="$test_path" MOCK_PROFILE=cpu \
 fi
 
 preflight_script=$(mktemp)
-trap 'rm -f "$preflight_script"; rm -rf "$model_fixture" "$empty_fixture"' EXIT
+gpu_preflight_script=$(mktemp)
+trap 'rm -f "$preflight_script" "$gpu_preflight_script"; rm -rf "$model_fixture" "$empty_fixture"' EXIT
 bash -c 'source "$1"; render_safety_preflight_script' _ "$script" > "$preflight_script"
 chmod +x "$preflight_script"
 if "$preflight_script" 999999999 20 >/dev/null 2>&1; then
@@ -189,6 +190,28 @@ fi
 if ! "$preflight_script" 1 100 >/dev/null 2>&1; then
   printf 'FAIL: memory preflight rejected bounded empty-daemon headroom\n' >&2
   exit 1
+fi
+
+bash -c 'source "$1"; render_gpu_preflight_script' _ "$script" \
+  > "$gpu_preflight_script"
+chmod +x "$gpu_preflight_script"
+if ! PATH="$test_path" MOCK_PROFILE=cuda_partial_failure \
+  "$gpu_preflight_script" "$fixture_bin/nvidia-smi" GPU-healthy; then
+  printf 'FAIL: CUDA preflight rejected a healthy selected GPU because an unrelated GPU failed\n' >&2
+  exit 1
+fi
+if PATH="$test_path" MOCK_PROFILE=cuda_partial_failure \
+  "$gpu_preflight_script" "$fixture_bin/nvidia-smi" GPU-missing \
+  >/dev/null 2>&1; then
+  printf 'FAIL: CUDA preflight accepted a missing selected GPU\n' >&2
+  exit 1
+else
+  gpu_preflight_status=$?
+  if [ "$gpu_preflight_status" -ne 75 ]; then
+    printf 'FAIL: CUDA preflight returned %s instead of 75\n' \
+      "$gpu_preflight_status" >&2
+    exit 1
+  fi
 fi
 
 printf 'classifier fixtures: PASS (CUDA dedicated/display, ROCm, Vulkan, Metal, CPU)\n'
