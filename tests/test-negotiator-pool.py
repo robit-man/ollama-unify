@@ -605,7 +605,8 @@ def test_existing_pool_contract(helper, fixture_bin):
                 "X-Ollama-Unify-GPU-UUIDs"
             )
             assert admission_protocol["gpu_constraint_semantics"] == (
-                "ordered hard allowlist"
+                "ordered hard allowlist intersected with broker-selected GPUs; "
+                "rejected only when the intersection is empty"
             )
             assert admission_protocol["queue_policies"] == ["wait", "yield"]
             assert admission_protocol["retry_after_json_field"] == "retry_after_ms"
@@ -853,8 +854,30 @@ def test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin):
             "GPU-large-1"
         ]
 
+        stale_status, stale, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-retired", "GPU-large-1", "GPU-missing"]
+        )
+        assert stale_status == 200, stale
+        assert stale["requested_gpu_uuids"] == ["GPU-large-1"]
+        assert [lane["gpu_uuid"] for lane in stale["lanes"]] == [
+            "GPU-large-1"
+        ]
+
+        routed_status, routed, _ = chat(
+            harness.proxy_port,
+            MODEL,
+            "stale-constraint-request",
+            gpu_uuids=["GPU-retired", "GPU-large-1"],
+        )
+        assert routed_status == 200, routed
+        routed_event = next(
+            event for event in request_events(harness.event_log)
+            if event["request_id"] == "stale-constraint-request"
+        )
+        assert routed_event["gpu"] == "GPU-large-1"
+
         invalid_status, invalid, _ = harness.capacity(
-            MODEL, gpu_uuids=["GPU-display"]
+            MODEL, gpu_uuids=["GPU-display", "GPU-retired"]
         )
         assert invalid_status == 422, invalid
         assert invalid["reason_code"] == "gpu_constraint_unavailable"

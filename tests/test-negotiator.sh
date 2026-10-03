@@ -48,6 +48,12 @@ agent_instructions=$(
   source "$repo_dir/ollama-unify.sh"
   render_gpu_tray_indicator
 ) > "$test_tmp/ollama-unify-tray"
+grep -q 'user_systemctl + \["daemon-reload"\]' \
+  "$test_tmp/ollama-unify-tray" \
+  || { printf 'tray session launcher does not reload user units\n' >&2; exit 1; }
+grep -q 'user_systemctl + \["--no-block", "restart", TRAY_UNIT\]' \
+  "$test_tmp/ollama-unify-tray" \
+  || { printf 'tray session launcher does not restart existing indicators\n' >&2; exit 1; }
 tray_unit=$(
   # shellcheck disable=SC1091
   source "$repo_dir/ollama-unify.sh"

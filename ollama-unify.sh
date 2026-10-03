@@ -1245,7 +1245,14 @@ def canonical_model_tag(model: str) -> str:
 
 
 def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None:
-    """Parse a presence-sensitive, ordered hard GPU allowlist."""
+    """Parse a presence-sensitive, ordered hard GPU allowlist.
+
+    An allowlist constrains placement to matching members; it is not a demand
+    that every listed device still exist. Hardware selection can legitimately
+    shrink while a long-lived client still has the previous superset cached.
+    Keep the live intersection in caller order, and fail closed only when no
+    allowed GPU remains.
+    """
     if value is None:
         return None
     if isinstance(value, str):
@@ -1292,15 +1299,23 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
             for device in gpu_snapshot()
             if device.get("uuid")
         }
+    available = [gpu_uuid for gpu_uuid in normalized if gpu_uuid in selected]
     unavailable = [gpu_uuid for gpu_uuid in normalized if gpu_uuid not in selected]
-    if unavailable:
+    if not available:
         raise PermanentCapacityError(
-            "GPU constraint includes UUIDs outside the broker-selected set: "
-            + ", ".join(unavailable),
+            "GPU constraint has no UUIDs in the broker-selected set; requested: "
+            + ", ".join(normalized),
             422,
             "gpu_constraint_unavailable",
         )
-    return tuple(normalized)
+    if unavailable:
+        LOG.warning(
+            "%s pruned unavailable GPU UUIDs %s; effective allowlist is %s",
+            source,
+            unavailable,
+            available,
+        )
+    return tuple(available)
 
 
 class BackendHTTPError(RuntimeError):
@@ -1668,7 +1683,10 @@ def discovery_document() -> dict[str, Any]:
                 "queue_policy_header": "X-Ollama-Unify-Queue-Policy",
                 "queue_policies": ["wait", "yield"],
                 "gpu_uuids_header": GPU_UUIDS_HEADER,
-                "gpu_constraint_semantics": "ordered hard allowlist",
+                "gpu_constraint_semantics": (
+                    "ordered hard allowlist intersected with broker-selected GPUs; "
+                    "rejected only when the intersection is empty"
+                ),
                 "retry_after_json_field": "retry_after_ms",
                 "reason_codes": [
                     "queue_admission_timeout",
@@ -1755,7 +1773,7 @@ def discovery_document() -> dict[str, Any]:
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner, meaningful justification, and expected release horizon. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Never acquire without first reviewing current lessees and their expected end times.\n5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker rejects unavailable UUIDs and never falls back outside the allowlist.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner, meaningful justification, and expected release horizon. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Never acquire without first reviewing current lessees and their expected end times.\n5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_by_gpu(
@@ -8138,13 +8156,15 @@ def start_sessions(group: str) -> int:
         if not os.path.exists(f"{runtime_dir}/bus"):
             print(f"ollama-unify-tray: no user bus for {user}", file=sys.stderr)
             continue
-        run([
+        user_systemctl = [
             "runuser", "-u", user, "--", "env",
             f"XDG_RUNTIME_DIR={runtime_dir}",
             f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
-            "systemctl", "--user", "--no-block", "start", TRAY_UNIT,
-        ])
-        print(f"ollama-unify-tray: requested {TRAY_UNIT} for {user}",
+            "systemctl", "--user",
+        ]
+        run(user_systemctl + ["daemon-reload"])
+        run(user_systemctl + ["--no-block", "restart", TRAY_UNIT])
+        print(f"ollama-unify-tray: requested restart of {TRAY_UNIT} for {user}",
               file=sys.stderr)
     if not users:
         print("ollama-unify-tray: no active graphical sessions", file=sys.stderr)
@@ -8202,7 +8222,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
 6. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
 7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
-8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker rejects unavailable UUIDs and never falls back outside the allowlist.
+8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.
 
 Machine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.
 AGENT_INSTRUCTIONS
