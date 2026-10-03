@@ -32,25 +32,25 @@ retry amplification in clients.
 
 ## Omnius implementation checklist
 
-- [ ] Preserve typed broker failure metadata across Telegram router layers.
-- [ ] Skip JSON-to-plain fallback for `retryable:false` broker failures.
-- [ ] Do not schedule durable Telegram recovery for a permanent failure.
-- [ ] Prove one wire attempt and zero scheduled recoveries for broker 422
+- [x] Preserve typed broker failure metadata across Telegram router layers.
+- [x] Skip JSON-to-plain fallback for `retryable:false` broker failures.
+- [x] Do not schedule durable Telegram recovery for a permanent failure.
+- [x] Prove one wire attempt and zero scheduled recoveries for broker 422
   `gpu_constraint_unavailable`.
 
 ## Delivery and live validation checklist
 
-- [ ] Full broker integration/static suite passes.
-- [ ] Broker repair is committed and pushed to the tracked branch.
-- [ ] Run `docker gpu discover` immediately before service mutation.
-- [ ] Install generated broker/tray artifacts from the committed checkout.
-- [ ] Restart broker and tray while preserving active external leases.
-- [ ] Verify installed discovery advertises intersection semantics.
+- [x] Full broker integration/static suite passes.
+- [x] Broker repair is committed and pushed to the tracked branch.
+- [x] Run `docker gpu discover` immediately before service mutation.
+- [x] Install generated broker/tray artifacts from the committed checkout.
+- [x] Restart broker and tray while preserving active external leases.
+- [x] Verify installed discovery advertises intersection semantics.
 - [ ] Verify a mixed selected/stale capacity constraint resolves to selected
   members without issuing model inference.
 - [ ] Observe the user's next Omnius request route past broker admission with
   no repeated 422s.
-- [ ] Omnius permanent-failure repair passes focused tests, is committed, and
+- [x] Omnius permanent-failure repair passes focused tests, is committed, and
   is pushed to its tracked branch.
 
 ## Rollback

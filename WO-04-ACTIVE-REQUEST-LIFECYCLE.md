@@ -65,17 +65,17 @@ managed lanes and false VRAM exhaustion.
 - [x] Generated negotiator script compiles.
 - [x] Full broker, classifier, transfer, tray, and shell/static suites pass.
 - [x] `git diff --check` passes.
-- [ ] Repair is committed and pushed to the tracked remote branch.
+- [x] Repair is committed and pushed to the tracked remote branch.
 
 ## Deployment checklist
 
-- [ ] Run `docker gpu discover` immediately before service mutation.
-- [ ] Snapshot active lease owners, scopes, and states without lease tokens.
-- [ ] Install generated artifacts from this exact source checkout.
-- [ ] Restart the broker without restarting or reallocating external workloads.
-- [ ] Verify API health, control socket health, and active-lease preservation.
-- [ ] Verify stale active admissions and duplicate managed lanes are gone.
-- [ ] Verify installed lifecycle policy matches source defaults.
+- [x] Run `docker gpu discover` immediately before service mutation.
+- [x] Snapshot active lease owners, scopes, and states without lease tokens.
+- [x] Install generated artifacts from this exact source checkout.
+- [x] Restart the broker without restarting or reallocating external workloads.
+- [x] Verify API health, control socket health, and active-lease preservation.
+- [x] Verify stale active admissions and duplicate managed lanes are gone.
+- [x] Verify installed lifecycle policy matches source defaults.
 - [ ] Observe fresh Omnius traffic without request or lane accumulation.
 
 ## Rollback
@@ -101,4 +101,10 @@ token-free lease snapshot before allowing new inference traffic.
   `bash tests/test-transfer.sh` passed.
 - 2026-10-03: generated negotiator/tray compilation, `ruff check`, `bash -n`,
   `shellcheck`, and `git diff --check` passed.
-- Commit, push, and live deployment verification remain pending.
+- 2026-10-03: commits `63a6ae3`, `8aee399`, and follow-up `2cdc8cf`
+  were pushed to `origin/main`; generated source and installed artifact hashes
+  match.
+- 2026-10-03: required discovery preflight showed two selected healthy A100s
+  and preserved the active scoped Voryn lease during broker/Ollama restart.
+  API and control health passed; request lifecycle reported zero tracked,
+  detached, or cancelling requests after restart.
