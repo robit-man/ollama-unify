@@ -46,8 +46,8 @@ retry amplification in clients.
 - [x] Install generated broker/tray artifacts from the committed checkout.
 - [x] Restart broker and tray while preserving active external leases.
 - [x] Verify installed discovery advertises intersection semantics.
-- [ ] Verify a mixed selected/stale capacity constraint resolves to selected
-  members without issuing model inference.
+- [x] Verify a mixed selected/stale request constraint resolves to selected
+  members on a metadata request without issuing model inference.
 - [ ] Observe the user's next Omnius request route past broker admission with
   no repeated 422s.
 - [x] Omnius permanent-failure repair passes focused tests, is committed, and
