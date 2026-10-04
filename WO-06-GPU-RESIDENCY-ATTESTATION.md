@@ -33,17 +33,33 @@ CPU first token, disconnect, destroy the lane, and repeat the cold load.
 
 ## Verification and delivery checklist
 
-- [ ] Focused CPU-fallback regression passes.
-- [ ] Full broker integration/static suite passes.
-- [ ] Repair is committed and pushed to `origin/main`.
-- [ ] Run `docker gpu discover` immediately before service mutation.
-- [ ] Install and restart the broker from the verified commit.
-- [ ] Confirm a zero-token load probe either has positive VRAM residency on
+- [x] Focused CPU-fallback regression passes.
+- [x] Full broker integration/static suite passes.
+- [x] Repair is committed and pushed to `origin/main`.
+- [x] Run `docker gpu discover` immediately before service mutation.
+- [x] Install and restart the broker from the verified commit.
+- [x] Confirm a zero-token load probe either has positive VRAM residency on
   its scoped healthy GPU or fails immediately with `gpu_runtime_unavailable`.
-- [ ] Confirm no Telegram router request can enter a CPU-only managed lane.
+- [x] Confirm no Telegram router request can enter a CPU-only managed lane.
 
 ## Hardware recovery blocker
 
 GPU2 cannot be restored by broker code. The NVIDIA kernel driver reports that
 it fell off the PCIe bus and requires a node reboot. Rebooting interrupts the
 active Voryn lease and therefore requires an explicit coordinated reboot.
+
+## Verification evidence
+
+- 2026-10-04: full broker, pool, queue, lease, lifecycle, tray, ShellCheck,
+  classifier, and transfer suites passed after both repairs.
+- 2026-10-04: commits `4860dc8` and `5e40005` were pushed to `origin/main`.
+- 2026-10-04: installed negotiator hash matched rendered source; Ollama,
+  broker, and tray services were active and the Voryn lease was preserved.
+- 2026-10-04: the first GPU0 zero-token probe rejected `size_vram=0` with
+  non-retryable `gpu_runtime_unavailable` instead of publishing a lane.
+- 2026-10-04: the second probe launched the runner with `-c 8192` rather than
+  the erroneous `-c 262144`, then rejected the still-CPU-only load in about
+  15 seconds. Queue depth, tracked requests, and managed lanes returned to 0.
+- 2026-10-04: `nvidia-smi -q -i 0` reported `GPU Recovery Action: Reboot`;
+  kernel history records GPU2 `Xid 79` (fallen off bus) and `Xid 154` (node
+  reboot required).
