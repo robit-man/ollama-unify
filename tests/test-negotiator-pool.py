@@ -399,7 +399,8 @@ class PoolHarness:
                  request_cancel_grace=0.25,
                  instance_parallel=1,
                  model_gpu_preferences=None, model_context_profiles=None,
-                 profile="cuda_triple", selected_gpus=None):
+                 profile="cuda_triple", selected_gpus=None,
+                 cpu_only=False):
         self.profile = profile
         self.selected_gpus = selected_gpus or [
             "GPU-large-0", "GPU-large-1", "GPU-large-2",
@@ -426,6 +427,7 @@ class PoolHarness:
         self.instance_parallel = instance_parallel
         self.model_gpu_preferences = model_gpu_preferences
         self.model_context_profiles = model_context_profiles
+        self.cpu_only = cpu_only
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -448,6 +450,7 @@ class PoolHarness:
             "MOCK_NVIDIA_COMPUTE_APPS_FILE": self.compute_apps,
             "MOCK_OLLAMA_GPU_USAGE_DIR": self.gpu_usage_dir,
             "MOCK_OLLAMA_VRAM_MIB": str(self.runner_vram_mib),
+            "MOCK_OLLAMA_CPU_ONLY": "1" if self.cpu_only else "0",
             "OLLAMA_UNIFY_CONFIG": os.path.join(self.temp_dir, "missing.conf"),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{self.backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{self.proxy_port}",
@@ -744,6 +747,23 @@ def test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
         assert discovery["parallel_pool"]["model_gpu_preferences"] == {
             MODEL: ["GPU-large-1"],
         }
+
+
+def test_managed_lane_rejects_cpu_fallback(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        cpu_only=True,
+    ) as harness:
+        status, rejected, _ = harness.capacity(
+            MODEL, gpu_uuids=["GPU-large-0"]
+        )
+        assert status == 503, rejected
+        assert rejected["retryable"] is False
+        assert rejected["reason_code"] == "gpu_runtime_unavailable"
+        assert "size_vram=0" in rejected["error"]
+        assert managed_lanes(harness.status()) == []
 
 
 def test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin):
@@ -3132,6 +3152,7 @@ def main():
     fixture_bin = os.path.abspath(sys.argv[2])
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
+    test_managed_lane_rejects_cpu_fallback(helper, fixture_bin)
     test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin)
     test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
     test_lease_registration_requires_visible_coordination_metadata(

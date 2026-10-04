@@ -1697,6 +1697,7 @@ def discovery_document() -> dict[str, Any]:
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
                     "model_not_installed",
+                    "gpu_runtime_unavailable",
                     "backend_start_failed",
                     "logical_request_conflict",
                     "logical_request_in_progress",
@@ -3429,14 +3430,30 @@ class Broker:
             resident = backend_json_at(
                 "127.0.0.1", port, "GET", "/api/ps", timeout=3.0
             ).get("models", [])
-            if not any(
-                isinstance(item, dict) and canonical_model_tag(str(
+            resident_model = next((
+                item
+                for item in resident if isinstance(resident, list)
+                and isinstance(item, dict)
+                and canonical_model_tag(str(
                     item.get("name") or item.get("model") or ""
                 )) == model
-                for item in resident if isinstance(resident, list)
-            ):
+            ), None)
+            if resident_model is None:
                 raise CapacityError(
                     f"managed Ollama lane did not make model {model!r} resident"
+                )
+            size_vram = resident_model.get("size_vram")
+            if (
+                isinstance(size_vram, bool)
+                or not isinstance(size_vram, (int, float))
+                or size_vram <= 0
+            ):
+                raise PermanentCapacityError(
+                    f"managed Ollama lane for model {model!r} loaded with "
+                    f"size_vram={size_vram!r} under GPU {gpu_uuid}; CUDA did "
+                    "not make the model GPU-resident",
+                    503,
+                    "gpu_runtime_unavailable",
                 )
             actual_context = verified_model_context(model, resident)
         except Exception as exc:

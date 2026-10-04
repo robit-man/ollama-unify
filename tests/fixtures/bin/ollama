@@ -25,6 +25,7 @@ host, port = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434").rsplit(":", 1)
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 gpu_usage_dir = os.environ.get("MOCK_OLLAMA_GPU_USAGE_DIR", "")
 gpu_usage_mib = int(os.environ.get("MOCK_OLLAMA_VRAM_MIB", "2048"))
+cpu_only = os.environ.get("MOCK_OLLAMA_CPU_ONLY", "0") == "1"
 context_length = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "0") or "0")
 gpu_usage_path = (
     os.path.join(gpu_usage_dir, f"{os.getpid()}.csv") if gpu_usage_dir else ""
@@ -173,10 +174,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif model:
                 self.server.models = [{
                     "name": model,
-                    "size_vram": 1024,
+                    "size_vram": 0 if cpu_only else 1024,
                     "context_length": context_length,
                 }]
-                set_gpu_usage(True)
+                set_gpu_usage(not cpu_only)
         response_payload = {
             "done": True, "model": model, "gpu": gpu, "pid": os.getpid(),
         }
