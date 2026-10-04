@@ -1377,7 +1377,10 @@ def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
             options["num_ctx"] = profile["context_length"]
         elif MAX_CONTEXT > 0:
             requested = options.get("num_ctx")
-            if isinstance(requested, (int, float)) and requested > MAX_CONTEXT:
+            if requested is None or (
+                isinstance(requested, (int, float))
+                and requested > MAX_CONTEXT
+            ):
                 options["num_ctx"] = MAX_CONTEXT
     payload.pop("num_gpu", None)
     payload.pop("main_gpu", None)
@@ -3284,8 +3287,11 @@ class Broker:
                 "keep_alive": keep_alive,
             }
         options = {"num_predict": 0}
-        if model in MODEL_CONTEXT_PROFILES:
-            options["num_ctx"] = MODEL_CONTEXT_PROFILES[model]["context_length"]
+        warm_context = MODEL_CONTEXT_PROFILES.get(
+            model, {}
+        ).get("context_length", MAX_CONTEXT)
+        if warm_context > 0:
+            options["num_ctx"] = warm_context
         return "/api/generate", {
             "model": model,
             "prompt": "",

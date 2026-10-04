@@ -12,6 +12,8 @@ CPU first token, disconnect, destroy the lane, and repeat the cold load.
 - The broker repeatedly reported 27B lanes as warm, then killed each lane
   after the client deadline and detached completion TTL.
 - The lane's `/api/ps` record reported `size_vram: 0`.
+- The zero-token probe showed Ollama launching the 27B model at its 262144-token
+  model default even though the broker configured an 8192-token ceiling.
 - `nvidia-smi` showed no managed Ollama runner on either selected A100.
 - Kernel history reports GPU2 at PCI `84:00.0` fell off the bus (`Xid 79`)
   and the NVIDIA recovery action is `Node Reboot Required` (`Xid 154`).
@@ -25,6 +27,9 @@ CPU first token, disconnect, destroy the lane, and repeat the cold load.
 - [x] Publish the new reason code in broker discovery.
 - [x] Add a fixture mode that simulates Ollama CPU fallback.
 - [x] Add a regression proving zero-VRAM lanes are rejected and unregistered.
+- [x] Pin the configured default context during warm-up and when inference
+  omits `num_ctx`, so Ollama cannot silently load at the model's larger default.
+- [x] Add a regression covering both context-pinning paths.
 
 ## Verification and delivery checklist
 

@@ -400,7 +400,7 @@ class PoolHarness:
                  instance_parallel=1,
                  model_gpu_preferences=None, model_context_profiles=None,
                  profile="cuda_triple", selected_gpus=None,
-                 cpu_only=False):
+                 cpu_only=False, max_context=0):
         self.profile = profile
         self.selected_gpus = selected_gpus or [
             "GPU-large-0", "GPU-large-1", "GPU-large-2",
@@ -428,6 +428,7 @@ class PoolHarness:
         self.model_gpu_preferences = model_gpu_preferences
         self.model_context_profiles = model_context_profiles
         self.cpu_only = cpu_only
+        self.max_context = max_context
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -464,6 +465,7 @@ class PoolHarness:
             "OLLAMA_UNIFY_MODEL_CONTEXT_PROFILES": json.dumps(
                 self.model_context_profiles or {}
             ),
+            "OLLAMA_UNIFY_MAX_CONTEXT": str(self.max_context),
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
             "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
@@ -764,6 +766,36 @@ def test_managed_lane_rejects_cpu_fallback(helper, fixture_bin):
         assert rejected["reason_code"] == "gpu_runtime_unavailable"
         assert "size_vram=0" in rejected["error"]
         assert managed_lanes(harness.status()) == []
+
+
+def test_default_context_is_pinned_on_warmup_and_inference(helper, fixture_bin):
+    with PoolHarness(
+        helper,
+        fixture_bin,
+        max_servers=1,
+        max_context=8192,
+    ) as harness:
+        status, capacity, _ = harness.capacity(MODEL)
+        assert status == 200, capacity
+        warm = next(
+            event for event in events(harness.event_log)
+            if event["kind"] == "request"
+            and event["model"] == MODEL
+            and event["request_id"] is None
+        )
+        assert warm["options"]["num_ctx"] == 8192
+
+        status, response, _ = chat(
+            harness.proxy_port,
+            MODEL,
+            "default-context-request",
+        )
+        assert status == 200, response
+        request = next(
+            event for event in request_events(harness.event_log)
+            if event["request_id"] == "default-context-request"
+        )
+        assert request["options"]["num_ctx"] == 8192
 
 
 def test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin):
@@ -3153,6 +3185,7 @@ def main():
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
     test_managed_lane_rejects_cpu_fallback(helper, fixture_bin)
+    test_default_context_is_pinned_on_warmup_and_inference(helper, fixture_bin)
     test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin)
     test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
     test_lease_registration_requires_visible_coordination_metadata(
