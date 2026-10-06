@@ -1191,7 +1191,7 @@ POOL_LOAD_TIMEOUT = env_float("OLLAMA_UNIFY_POOL_LOAD_TIMEOUT", DRAIN_TIMEOUT)
 # An admitted request is a renewable lease, not an unbounded counter. Backend
 # headers and response chunks renew the activity deadline. If the caller goes
 # away, non-replayable work is cancelled immediately; logical work gets a
-# short renewable window in which to finish and enter the replay cache.
+# short absolute window in which to finish and enter the replay cache.
 REQUEST_ACTIVITY_TTL = max(
     0.1, env_float("OLLAMA_UNIFY_REQUEST_ACTIVITY_TTL", DRAIN_TIMEOUT)
 )
@@ -3902,10 +3902,10 @@ class Broker:
             active.phase = "backend_connecting"
             now = time.monotonic()
             active.last_activity_at = now
-            active.expires_at = now + (
-                REQUEST_DETACHED_TTL
+            active.expires_at = (
+                active.detached_at + REQUEST_DETACHED_TTL
                 if active.detached_at is not None
-                else REQUEST_ACTIVITY_TTL
+                else now + REQUEST_ACTIVITY_TTL
             )
             if (
                 active.detached_at is not None
@@ -3925,10 +3925,10 @@ class Broker:
             now = time.monotonic()
             active.phase = phase
             active.last_activity_at = now
-            active.expires_at = now + (
-                REQUEST_DETACHED_TTL
+            active.expires_at = (
+                active.detached_at + REQUEST_DETACHED_TTL
                 if active.detached_at is not None
-                else REQUEST_ACTIVITY_TTL
+                else now + REQUEST_ACTIVITY_TTL
             )
             self.request_activity_renewed_total += 1
             self.cv.notify_all()
