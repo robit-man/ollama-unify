@@ -177,6 +177,28 @@ class GpuHealthTests(unittest.TestCase):
                 self.assertEqual(len(document['warnings']), 2)
                 self.assertIn('New GPU work is blocked', document['warnings'][1])
 
+    def test_cli_discovery_uses_daemon_quarantine_instead_of_file_defaults(self):
+        healthy = {'supported': True, 'admission_blocked': False,
+                   'recovery_actions': {}, 'missing_selected_gpu_ids': [], 'error': None}
+        document = {'selected_gpu_ids': ['GPU-selected', 'GPU-quarantined'],
+                    'selected_gpu_count': 2, 'gpu_health': {'admission_blocked': True},
+                    'parallel_pool': {'enabled': True}, 'gpus': [],
+                    'warnings': ['lease warning', 'stale fault warning']}
+        live = {'leases': [], 'selected_gpu_ids': ['GPU-selected'], 'selected_gpu_count': 1,
+                'gpu_health': healthy, 'gpus': [{'uuid': 'GPU-selected'}, {'uuid': 'GPU-display'}],
+                'parallel_pool': {'enabled': False}}
+        with mock.patch.object(sys, 'argv', ['broker', 'discover']), mock.patch.object(
+            n, 'discovery_document', return_value=document
+        ), mock.patch.object(n, 'send_control', return_value=live), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(n.main(), 0)
+        actual = json.loads(output.getvalue())
+        self.assertEqual(actual['selected_gpu_ids'], ['GPU-selected'])
+        self.assertEqual(actual['selected_gpu_count'], 1)
+        self.assertFalse(actual['parallel_pool']['enabled'])
+        self.assertFalse(actual['gpu_health']['admission_blocked'])
+        self.assertEqual(len(actual['warnings']), 1)
+        self.assertEqual([gpu['selected_for_ollama'] for gpu in actual['gpus']], [True, False])
+
 
 if __name__ == '__main__':
     unittest.main()
