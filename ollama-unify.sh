@@ -1639,24 +1639,34 @@ def managed_cgroup_pids() -> set[int]:
     return descendants
 
 
-def foreign_gpu_usage() -> dict[str, int]:
+def foreign_gpu_usage(*, strict: bool = False) -> dict[str, int]:
     try:
         result = subprocess.run([
             "nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
             "--format=csv,noheader,nounits",
         ], check=True, capture_output=True, text=True, timeout=5)
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        if strict:
+            raise RuntimeError("cannot verify foreign CUDA processes") from exc
+        return {}
+    if not result.stdout.strip():
+        # There is nothing to classify. Avoid walking /proc on each scheduler
+        # check before the first CUDA process exists.
         return {}
     ollama_pids = managed_cgroup_pids()
     usage: dict[str, int] = {}
     for raw in result.stdout.splitlines():
         fields = [field.strip() for field in raw.split(",")]
         if len(fields) != 3:
+            if strict and raw.strip():
+                raise RuntimeError("invalid CUDA process telemetry")
             continue
         try:
             pid = int(fields[0])
-            used = int(fields[2])
+            used = int(fields[2]) if fields[2].isdigit() else 0
         except ValueError:
+            if strict:
+                raise RuntimeError("invalid CUDA process telemetry")
             continue
         if SELECTED_GPUS and fields[1] not in SELECTED_GPUS:
             continue
@@ -1801,6 +1811,7 @@ def discovery_document() -> dict[str, Any]:
                     "gpu_runtime_unavailable",
                     "gpu_recovery_required",
                     "gpu_health_unavailable",
+                "gpu_unregistered_workload",
                     "backend_start_failed",
                     "logical_request_conflict",
                     "logical_request_in_progress",
@@ -1871,13 +1882,13 @@ def discovery_document() -> dict[str, Any]:
             "num_gpu_semantics": (
                 "Ollama num_gpu is the number of GPU-offloaded layers, not the physical GPU count; -1 is automatic."
             ),
-            "anonymous_cuda": "Reactive best-effort only; cooperative leases are required for OOM prevention.",
+            "anonymous_cuda": "Unregistered activity quarantines affected GPUs and defers model load/unload; acquire before CUDA initialization. Initial anonymous allocation cannot be prevented.",
         },
     }
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner, meaningful justification, and expected release horizon. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Never acquire without first reviewing current lessees and their expected end times.\n5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner, meaningful justification, and expected release horizon. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Never acquire without first reviewing current lessees and their expected end times.\n5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Unregistered CUDA activity quarantines affected GPUs: broker model load/unload is deferred until it exits. This cannot prevent its initial allocation or replace cooperative leases.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_by_gpu(
@@ -2625,6 +2636,8 @@ class Broker:
         self.last_reason = "restored lease transition" if self.draining else "startup"
         self.stopping = threading.Event()
         self.anonymous_running = False
+        self._foreign_usage_checked_at = 0.0
+        self._foreign_usage_cache: dict[str, int] | None = None
         self.waiters: list[QueuedRequest] = []
         self.active_request_records: dict[str, ActiveRequest] = {}
         self.logical_in_flight: dict[str, tuple[str, str, int]] = {}
@@ -2805,6 +2818,50 @@ class Broker:
             )
         ]
 
+    def _unregistered_gpus_locked(self, *, refresh: bool = False) -> set[str]:
+        if BACKEND_TYPE != "cuda":
+            return set()
+        # Coalesce read-only scheduler/status polls. Destructive transitions
+        # always force a fresh process query immediately before acting.
+        if refresh or time.monotonic() - self._foreign_usage_checked_at >= min(ANON_POLL, 0.25):
+            try:
+                self._foreign_usage_cache = foreign_gpu_usage(strict=True)
+            except RuntimeError:
+                self._foreign_usage_cache = None
+            self._foreign_usage_checked_at = time.monotonic()
+        usage = self._foreign_usage_cache
+        if usage is None:
+            return set(SELECTED_GPUS)
+        if any(not lease.gpu_uuids and lease.state in ("pending", "active", "revoking")
+               for lease in self.leases.values()):
+            return set()
+        return {key.rsplit("@", 1)[-1] for key in usage} - self._reserved_gpus_locked()
+
+    def _require_safe_gpu_transition(self, gpu_uuid: str) -> None:
+        with self.cv:
+            blocked = self._unregistered_gpus_locked(refresh=True)
+        if gpu_uuid in blocked:
+            raise CapacityError(
+                "Unregistered CUDA activity or unavailable process telemetry on "
+                f"{gpu_uuid}; model load/unload is deferred until it clears",
+                503, "gpu_unregistered_workload", True, 1,
+            )
+
+    def _unload_base_models(self) -> list[str]:
+        # The base backend has no provable GPU scope. An empty metadata/CPU
+        # backend needs no unload. Never evict a resident base model around
+        # an unknown CUDA owner on any selected GPU.
+        models = running_models(require_available=True)
+        if not models:
+            return []
+        with self.cv:
+            if self._unregistered_gpus_locked(refresh=True):
+                raise CapacityError(
+                    "Base model unload deferred around unregistered CUDA activity",
+                    503, "gpu_unregistered_workload", True, 1,
+                )
+        return unload_all_models()
+
     def _ollama_blocked_gpus_locked(self) -> set[str]:
         """Return scoped GPUs whose external allocation is not stable.
 
@@ -2819,7 +2876,7 @@ class Broker:
         `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
         set. Two external owners never share a scoped GPU.
         """
-        return {
+        return self._unregistered_gpus_locked() | {
             gpu_uuid
             for lease in self.leases.values()
             for gpu_uuid in lease.gpu_uuids
@@ -3320,10 +3377,9 @@ class Broker:
     def _placement_devices(self, blocked: set[str]) -> list[dict[str, Any]]:
         """Return capacity after honoring every live lane's promised VRAM.
 
-        Ollama may unload an idle lane's model while the lane process remains
-        ready.  Physical free VRAM then rises, but the lane can reload on its
-        next request.  Treat its reservation as still committed so another
-        lane cannot consume the same future capacity.
+        Physical free VRAM can rise while a live lane retains its reservation.
+        Treat that promise as committed until the complete process group exits
+        so another lane cannot consume the same capacity.
         """
         devices = [
             device for device in gpu_snapshot()
@@ -3368,7 +3424,8 @@ class Broker:
     @staticmethod
     def _warm_request(model: str, capabilities: set[str], request_path: str
                       ) -> tuple[str, dict[str, Any]]:
-        keep_alive = f"{max(1, int(POOL_IDLE_TIMEOUT))}s"
+        # The broker owns eviction timing; native idle expiry bypasses guards.
+        keep_alive = -1
         if request_path in EMBEDDING_PATHS or (
             not request_path and "embedding" in capabilities
             and "completion" not in capabilities
@@ -3460,6 +3517,7 @@ class Broker:
                     capabilities: set[str], request_path: str,
                     triggered_by: dict[str, str] | None = None) -> Lane:
         require_gpu_health(refresh=True)
+        self._require_safe_gpu_transition(gpu_uuid)
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise PermanentCapacityError(
@@ -3485,7 +3543,7 @@ class Broker:
             "OLLAMA_MAX_LOADED_MODELS": "1",
             "OLLAMA_NUM_PARALLEL": str(POOL_INSTANCE_PARALLEL),
             "OLLAMA_SCHED_SPREAD": "0",
-            "OLLAMA_KEEP_ALIVE": f"{max(1, int(POOL_IDLE_TIMEOUT))}s",
+            "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_MAX_QUEUE": "64",
             "OLLAMA_GPU_OVERHEAD": str(POOL_VRAM_RESERVE_MIB * 1024 * 1024),
             "OLLAMA_FLASH_ATTENTION": "1",
@@ -3500,11 +3558,16 @@ class Broker:
             env["OLLAMA_CONTEXT_LENGTH"] = str(lane_context)
         if OLLAMA_MODELS:
             env["OLLAMA_MODELS"] = OLLAMA_MODELS
+        LOG.info("managed lane starting id=%s gpu=%s model=%s port=%s",
+                 lane_id, gpu_uuid, model, port)
         process = subprocess.Popen(
             [OLLAMA_BINARY, "serve"], env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Inherit systemd's bounded journal instead of discarding CUDA/GSP
+            # load failures. Lifecycle records map child PID to exact UUID.
             start_new_session=True,
         )
+        LOG.info("managed lane spawned id=%s gpu=%s model=%s pid=%s",
+                 lane_id, gpu_uuid, model, process.pid)
         deadline = time.monotonic() + POOL_READY_TIMEOUT
         try:
             while time.monotonic() < deadline:
@@ -3531,6 +3594,9 @@ class Broker:
                 model, capabilities, request_path
             )
             require_gpu_health(refresh=True)
+            self._require_safe_gpu_transition(gpu_uuid)
+            LOG.info("managed lane loading id=%s gpu=%s model=%s pid=%s",
+                     lane_id, gpu_uuid, model, process.pid)
             backend_json_at(
                 "127.0.0.1", port, "POST", warm_path, warm_payload,
                 timeout=POOL_LOAD_TIMEOUT,
@@ -3565,7 +3631,13 @@ class Broker:
                 )
             actual_context = verified_model_context(model, resident)
         except Exception as exc:
-            self._terminate_process(process)
+            LOG.error("managed lane load failed id=%s gpu=%s model=%s pid=%s: %s",
+                      lane_id, gpu_uuid, model, process.pid, exc)
+            now = time.time()
+            failed_lane = Lane(lane_id, "managed", "127.0.0.1", port,
+                               gpu_uuid, model, POOL_INSTANCE_PARALLEL,
+                               required_mib, now, now, process)
+            self._stop_lanes([failed_lane], "warm-up failed")
             if (isinstance(exc, BackendHTTPError)
                     and 400 <= exc.status < 500
                     and exc.status not in (408, 409, 425, 429)):
@@ -3595,15 +3667,31 @@ class Broker:
         failed: list[Lane] = []
         for lane in lanes:
             try:
+                self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
+            except CapacityError:
+                # Keep both process and reservation: CUDA teardown itself is
+                # unsafe while an unknown owner could be doing peer traffic.
+                lane.retiring = True
+                with self.cv:
+                    self.lanes[lane.lane_id] = lane
+                    self.cv.notify_all()
+                failed.append(lane)
+                LOG.warning("managed lane stop deferred id=%s gpu=%s model=%s reason=%s",
+                            lane.lane_id, lane.gpu_uuid, lane.model, reason)
+                continue
+            LOG.info("managed lane unloading id=%s gpu=%s model=%s pid=%s reason=%s",
+                     lane.lane_id, lane.gpu_uuid, lane.model,
+                     getattr(lane.process, "pid", None), reason)
+            try:
                 unload_models_at(lane.host, lane.port, min(UNLOAD_TIMEOUT, 15.0),
                                  require_available=False)
             except Exception as exc:
                 LOG.warning("managed lane unload failed id=%s: %s", lane.lane_id, exc)
             if self._terminate_process(lane.process):
                 LOG.info(
-                    "managed Ollama lane stopped id=%s reason=%s",
-                    lane.lane_id,
-                    reason,
+                    "managed Ollama lane stopped id=%s gpu=%s model=%s exit=%s reason=%s",
+                    lane.lane_id, lane.gpu_uuid, lane.model,
+                    getattr(lane.process, "returncode", None), reason,
                 )
                 continue
             lane.retiring = True
@@ -3702,8 +3790,10 @@ class Broker:
                         reason_code="lease_transition",
                     )
                 self._prune_dead_lanes_locked()
+                blocked = self._ollama_blocked_gpus_locked()
                 existing = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
+                            and lane.gpu_uuid not in blocked and not lane.retiring
                             and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
@@ -3745,6 +3835,7 @@ class Broker:
                              or (gpu_uuids is not None
                                  and lane.gpu_uuid not in gpu_uuids))
                          and lane.in_flight == 0
+                         and lane.gpu_uuid not in blocked
                          and lane.model not in queued_models),
                         key=lambda lane: (lane.last_used, lane.created_at),
                     )
@@ -4282,7 +4373,11 @@ class Broker:
         return True
 
     def _stop_expired_lane(self, lane: Lane) -> None:
-        group_stopped = self._terminate_process(lane.process)
+        try:
+            self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
+            group_stopped = self._terminate_process(lane.process)
+        except CapacityError:
+            group_stopped = False
         if not group_stopped:
             LOG.error(
                 "managed Ollama lane did not stop after request cancellation "
@@ -5063,14 +5158,15 @@ class Broker:
         A reservation is a scheduling hint layered on live GPU telemetry. It
         cannot protect memory that a dead owner has already freed, and while
         it survives it blocks every Ollama admission on its scope forever.
-        Dropping it restores admission; measured free VRAM still governs
-        placement, so a still-resident allocation keeps its memory either way.
+        Dropping it restores admission only when the owner has exited.
+        Remaining foreign CUDA becomes unregistered and quarantines the GPU,
+        so an abandoned lease cannot authorize churn around a live owner.
         """
         self.leases.pop(lease.token, None)
         self.last_reason = reason
         message = (
             f"GPU lease abandoned for {lease.owner}: {reason}; "
-            "the reserved scope returns to live free-VRAM placement"
+            "scope released; remaining unregistered CUDA still blocks model transitions"
         )
         if not lease.gpu_uuids and self._global_transition_lease_locked() is None:
             # This lease held the host-wide drain. No other global transition
@@ -5158,7 +5254,7 @@ class Broker:
                 # holds before measuring a scoped reservation. Managed lanes
                 # have exact GPU UUIDs and may remain resident when the new
                 # external allocation already fits around them.
-                unloaded = unload_all_models()
+                unloaded = self._unload_base_models()
                 if requested_scope:
                     gpu_uuids, devices = self._plan_lease_gpus(
                         0, requested_scope,
@@ -5353,8 +5449,10 @@ class Broker:
                     raise RuntimeError("only an active lease can prepare a resize")
             self.begin_drain(f"lease resize by {lease.owner}")
             try:
-                stopped = self.stop_pool_lanes("lease prepare")
-                unloaded = unload_all_models()
+                stopped = self.stop_pool_lanes(
+                    "lease prepare", set(lease.gpu_uuids) if lease.gpu_uuids else None,
+                )
+                unloaded = self._unload_base_models()
                 with self.cv:
                     now = time.time()
                     lease.state = "pending"
@@ -5395,7 +5493,7 @@ class Broker:
                     unloaded = []
                 else:
                     stopped = self.stop_pool_lanes(reason)
-                    unloaded = unload_all_models()
+                    unloaded = self._unload_base_models()
                 if force:
                     # Operator override for a lease whose owner is gone. The
                     # settle check can never pass once the owner's allocation
@@ -5739,6 +5837,7 @@ class Broker:
             model_gpu_policy = {
                 model: list(gpus) for model, gpus in self.model_gpu_policy.items()
             }
+            unregistered_gpus = sorted(self._unregistered_gpus_locked())
         backend = probe_backend()
         health = gpu_health_snapshot()
         return {"ok": True, "backend_available": backend.available,
@@ -5750,7 +5849,11 @@ class Broker:
                 "lease_policy": lease_policy_document(),
                 "lease_summaries": lease_summaries,
                 "warnings": [lease_visibility_warning(lease_summaries)]
-                + gpu_health_warnings(health),
+                + gpu_health_warnings(health)
+                + (["Unregistered CUDA activity or unavailable process telemetry: "
+                    "model load/unload deferred on " + ", ".join(unregistered_gpus)]
+                   if unregistered_gpus else []),
+                "unregistered_gpu_quarantine": unregistered_gpus,
                 "pending_transition_timeout_seconds": PENDING_TIMEOUT,
                 "gpus": gpu_snapshot(),
                 "gpu_health": health,
@@ -5777,87 +5880,18 @@ class Broker:
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
-    def anonymous_rebalance(self, reason: str, affected_gpus: set[str]) -> None:
-        if not self.transition.acquire(blocking=False):
-            with self.cv:
-                self.anonymous_running = False
-            return
-        try:
-            deadline = time.monotonic() + ANON_MAX_DRAIN
-            with self.cv:
-                affected = [lane for lane in self.lanes.values()
-                            if lane.kind == "managed"
-                            and lane.gpu_uuid in affected_gpus]
-                for lane in affected:
-                    lane.retiring = True
-                self.cv.notify_all()
-                while any(lane.in_flight for lane in affected):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self.cv.wait(min(remaining, 0.25))
-                for lane in affected:
-                    self.lanes.pop(lane.lane_id, None)
-                base_idle = self.lanes["base"].in_flight == 0
-                self.cv.notify_all()
-            failed = self._stop_lanes(affected, reason)
-            if failed:
-                raise RuntimeError(
-                    "managed lane process groups survived reactive stop: "
-                    + ", ".join(lane.lane_id for lane in failed)
-                )
-            if not affected and base_idle:
-                unload_all_models()
-            wait_for_foreign_settle()
-            LOG.warning(
-                "reactive anonymous GPU rebalance completed: %s; retired=%s",
-                reason, [lane.lane_id for lane in affected],
-            )
-        except Exception as exc:
-            LOG.error("anonymous GPU rebalance failed: %s", exc)
-        finally:
-            self.transition.release()
-            with self.cv:
-                self.anonymous_running = False
-                self.cv.notify_all()
-
     def anonymous_watcher(self) -> None:
-        previous = foreign_gpu_usage()
-        candidate: dict[str, int] = {}
-        stable_since = 0.0
+        previous: set[str] = set()
         while not self.stopping.wait(ANON_POLL):
-            current = foreign_gpu_usage()
-            increased = increased_foreign_gpu_usage(previous, current)
-            if increased:
-                candidate.update(increased)
-                stable_since = time.monotonic()
-            elif candidate and any(
-                current.get(key, 0) < used for key, used in candidate.items()
-            ):
-                candidate = {}
-                stable_since = 0.0
-            stable = bool(candidate) and time.monotonic() - stable_since >= ANON_SETTLE
             with self.cv:
-                reserved = self._reserved_gpus_locked()
-                affected = {
-                    key.split("@", 1)[1] for key in candidate if "@" in key
-                } - reserved
-                can_start = (
-                    stable and bool(affected) and not self.draining
-                    and self._global_transition_lease_locked() is None
-                    and not self.anonymous_running
-                )
-                if can_start:
-                    self.anonymous_running = True
-            previous = current
-            if can_start:
-                reason = "stable foreign CUDA allocation increased on selected GPU"
-                candidate = {}
-                stable_since = 0.0
-                threading.Thread(
-                    target=self.anonymous_rebalance,
-                    args=(reason, affected), daemon=True,
-                ).start()
+                blocked = self._unregistered_gpus_locked(refresh=True)
+                if blocked != previous:
+                    self.cv.notify_all()
+            if blocked != previous:
+                LOG.warning("unregistered CUDA quarantine changed previous=%s current=%s; "
+                            "load/unload deferred, resident lanes preserved",
+                            sorted(previous), sorted(blocked))
+                previous = blocked
 
     def lease_reaper(self) -> None:
         while not self.stopping.wait(5.0):
@@ -5887,9 +5921,11 @@ class Broker:
             cutoff = time.time() - POOL_IDLE_TIMEOUT
             try:
                 with self.cv:
+                    blocked = self._unregistered_gpus_locked()
                     lanes = [lane for lane in self.lanes.values()
                              if lane.kind == "managed" and lane.in_flight == 0
-                             and lane.last_used < cutoff]
+                             and lane.gpu_uuid not in blocked
+                             and (lane.retiring or lane.last_used < cutoff)]
                     for lane in lanes:
                         lane.retiring = True
                         self.lanes.pop(lane.lane_id, None)
@@ -6191,6 +6227,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             document = discovery_document()
             with self.broker.cv:
                 lease_summaries = self.broker._public_lease_summaries_locked()
+                unregistered_gpus = sorted(self.broker._unregistered_gpus_locked())
+                document["unregistered_gpu_quarantine"] = unregistered_gpus
+                if unregistered_gpus:
+                    document["warnings"].append(
+                        "Unregistered CUDA activity or unavailable process telemetry: "
+                        "model load/unload deferred on " + ", ".join(unregistered_gpus)
+                    )
                 document["active_leases"] = lease_summaries
                 document["warnings"][0] = lease_visibility_warning(lease_summaries)
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
@@ -6417,6 +6460,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         lane = admission.lane
+        if lane.kind == "managed" and path in NATIVE_MODEL_PATHS and body:
+            try:
+                managed_payload = json.loads(body)
+                if isinstance(managed_payload, dict) and managed_payload.get("keep_alive") != 0:
+                    managed_payload["keep_alive"] = -1
+                    body = json.dumps(managed_payload, separators=(",", ":")).encode()
+            except (TypeError, ValueError):
+                pass
         client_key = self.broker.record_client_use(
             self._client_identity(), lane, model
         )
@@ -7128,7 +7179,8 @@ def main() -> int:
             document["active_leases"] = summaries
             # The daemon can have systemd EnvironmentFile overrides that the
             # CLI does not inherit. Publish its effective scope and health.
-            for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health"):
+            for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health",
+                        "unregistered_gpu_quarantine"):
                 if key in live_status:
                     document[key] = live_status[key]
             selected = set(document.get("selected_gpu_ids", []))
@@ -7137,6 +7189,12 @@ def main() -> int:
             if "enabled" in live_status.get("parallel_pool", {}):
                 document["parallel_pool"]["enabled"] = live_status["parallel_pool"]["enabled"]
             document["warnings"] = [lease_visibility_warning(summaries)] + gpu_health_warnings(document["gpu_health"])
+            if document.get("unregistered_gpu_quarantine"):
+                document["warnings"].append(
+                    "Unregistered CUDA activity or unavailable process telemetry: "
+                    "model load/unload deferred on "
+                    + ", ".join(document["unregistered_gpu_quarantine"])
+                )
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
             document["warnings"][0] = (
                 LEASE_COORDINATION_WARNING
@@ -8378,7 +8436,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
 4. Lease registration requires a specific owner, meaningful justification, and expected release horizon. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Never acquire without first reviewing current lessees and their expected end times.
 5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
-6. Never bypass the broker by assuming free VRAM from a static scan. Anonymous allocation is reactive and cannot prevent the first CUDA OOM.
+6. Never bypass the broker by assuming free VRAM from a static scan. Unregistered CUDA activity quarantines affected GPUs: broker model load/unload is deferred until it exits. This cannot prevent its initial allocation or replace cooperative leases.
 7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
 8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.
 
