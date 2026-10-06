@@ -1504,6 +1504,102 @@ def gpu_snapshot() -> list[dict[str, Any]]:
     return devices
 
 
+def _query_gpu_health() -> dict[str, Any]:
+    """Read driver recovery state, independently of apparently free VRAM."""
+    health: dict[str, Any] = {
+        "supported": BACKEND_TYPE == "cuda", "admission_blocked": False,
+        "recovery_actions": {}, "missing_selected_gpu_ids": [], "error": None,
+    }
+    if BACKEND_TYPE != "cuda":
+        return health
+    try:
+        result = subprocess.run([
+            "nvidia-smi", "--query-gpu=uuid,gpu_recovery_action",
+            "--format=csv,noheader,nounits",
+        ], check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        health.update(admission_blocked=True, error=str(exc))
+        return health
+    actions = {}
+    for raw in result.stdout.splitlines():
+        fields = [field.strip() for field in raw.split(",")]
+        if len(fields) == 2 and fields[0].startswith("GPU-"):
+            actions[fields[0]] = fields[1]
+    diagnostic = (result.stdout + "\n" + result.stderr).strip()
+    # Older drivers lack this query field. Preserve their existing admission
+    # behavior, but explicitly expose the unavailable protection in discovery.
+    if (not actions and result.returncode != 0
+            and "gpu_recovery_action" in diagnostic
+            and "not a valid field" in diagnostic.lower()):
+        health.update(supported=False, error=diagnostic[:512])
+        return health
+    selected = set(SELECTED_GPUS)
+    required = {
+        gpu_uuid: action for gpu_uuid, action in actions.items()
+        if action.strip("[]").lower() not in ("none", "n/a", "not supported")
+        and (not selected or gpu_uuid in selected
+             or "reboot" in action.lower())
+    }
+    missing = sorted(selected - actions.keys())
+    health.update(recovery_actions=required, missing_selected_gpu_ids=missing)
+    if result.returncode != 0 or not actions:
+        health["error"] = diagnostic[:512] or "GPU recovery telemetry is unavailable"
+    health["admission_blocked"] = bool(required or missing or health["error"])
+    return health
+
+
+_GPU_HEALTH_LOCK = threading.Lock()
+_GPU_HEALTH_CACHE: tuple[float, tuple[Any, ...], dict[str, Any]] | None = None
+
+
+def gpu_health_snapshot(*, refresh: bool = False) -> dict[str, Any]:
+    """Coalesce queue polling; allocation transitions force fresh telemetry."""
+    global _GPU_HEALTH_CACHE
+    key = (BACKEND_TYPE, tuple(SELECTED_GPUS))
+    with _GPU_HEALTH_LOCK:
+        cached = _GPU_HEALTH_CACHE
+        if (not refresh and cached is not None and cached[1] == key
+                and time.monotonic() - cached[0] < 0.5):
+            return dict(cached[2])
+        health = _query_gpu_health()
+        _GPU_HEALTH_CACHE = (time.monotonic(), key, health)
+        return dict(health)
+
+
+def require_gpu_health(*, request_id: str = "",
+                       logical_request_id: str = "",
+                       refresh: bool = False) -> None:
+    health = gpu_health_snapshot(refresh=refresh)
+    if not health["admission_blocked"]:
+        return
+    if health["recovery_actions"]:
+        actions = ", ".join(
+            f"{gpu_uuid}: {action}"
+            for gpu_uuid, action in health["recovery_actions"].items()
+        )
+        raise PermanentCapacityError(
+            "NVIDIA driver recovery is required before new GPU work: " + actions,
+            503, "gpu_recovery_required", request_id=request_id,
+            logical_request_id=logical_request_id,
+        )
+    raise CapacityError(
+        "GPU health cannot be verified; refusing new GPU work: "
+        + str(health["error"] or health["missing_selected_gpu_ids"]),
+        503, "gpu_health_unavailable", request_id=request_id,
+        logical_request_id=logical_request_id,
+    )
+
+
+def gpu_health_warnings(health: dict[str, Any]) -> list[str]:
+    if health["admission_blocked"]:
+        return ["New GPU work is blocked: NVIDIA recovery is required or "
+                "GPU health cannot be verified. Inspect gpu_health before retrying."]
+    if BACKEND_TYPE == "cuda" and not health["supported"]:
+        return ["This NVIDIA driver does not support GPU recovery telemetry; "
+                "recovery-state admission protection is unavailable."]
+    return []
+
+
 def managed_cgroup_pids() -> set[int]:
     pids: set[int] = set()
     for unit in ("ollama.service", "ollama-unify-negotiator.service"):
@@ -1605,6 +1701,7 @@ def host_memory_snapshot() -> dict[str, int | str]:
 
 def discovery_document() -> dict[str, Any]:
     devices = gpu_snapshot()
+    health = gpu_health_snapshot()
     backend = probe_backend()
     selected = set(SELECTED_GPUS)
     for device in devices:
@@ -1620,6 +1717,7 @@ def discovery_document() -> dict[str, Any]:
         "selected_gpu_ids": SELECTED_GPUS,
         "selected_gpu_count": len(SELECTED_GPUS),
         "gpus": devices,
+        "gpu_health": health,
         "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
         "ollama_backend": f"http://{BACKEND_HOST}:{BACKEND_PORT}",
         "control_socket": CONTROL_SOCKET,
@@ -1629,7 +1727,7 @@ def discovery_document() -> dict[str, Any]:
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
         "lease_policy": lease_policy_document(),
         "active_leases": [],
-        "warnings": [lease_visibility_warning([])],
+        "warnings": [lease_visibility_warning([])] + gpu_health_warnings(health),
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
         "client_history_policy": {
@@ -1701,6 +1799,8 @@ def discovery_document() -> dict[str, Any]:
                     "model_exceeds_gpu_capacity",
                     "model_not_installed",
                     "gpu_runtime_unavailable",
+                    "gpu_recovery_required",
+                    "gpu_health_unavailable",
                     "backend_start_failed",
                     "logical_request_conflict",
                     "logical_request_in_progress",
@@ -3359,6 +3459,7 @@ class Broker:
     def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int,
                     capabilities: set[str], request_path: str,
                     triggered_by: dict[str, str] | None = None) -> Lane:
+        require_gpu_health(refresh=True)
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise PermanentCapacityError(
@@ -3429,6 +3530,7 @@ class Broker:
             warm_path, warm_payload = self._warm_request(
                 model, capabilities, request_path
             )
+            require_gpu_health(refresh=True)
             backend_json_at(
                 "127.0.0.1", port, "POST", warm_path, warm_payload,
                 timeout=POOL_LOAD_TIMEOUT,
@@ -3551,6 +3653,7 @@ class Broker:
             raise PermanentCapacityError(
                 "capacity request requires a model tag", 400, "invalid_capacity_request"
             )
+        require_gpu_health(refresh=True)
         with self.cv:
             requested_gpu_uuids = gpu_uuids
             gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
@@ -4365,6 +4468,9 @@ class Broker:
                     client: dict[str, str] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
+        if routable and model and not allow_during_drain:
+            require_gpu_health(request_id=request_id,
+                               logical_request_id=logical_request_id)
         if routable and model and gpu_uuids is not None and not POOL_ENABLED:
             raise PermanentCapacityError(
                 "hard GPU constraints require the managed Ollama lane pool",
@@ -4394,6 +4500,9 @@ class Broker:
 
         if not routable or not model or not POOL_ENABLED:
             while True:
+                if routable and model and not allow_during_drain:
+                    require_gpu_health(request_id=request_id,
+                                       logical_request_id=logical_request_id)
                 if not connected():
                     raise ClientDisconnected("client disconnected before broker admission")
                 with self.cv:
@@ -4616,6 +4725,14 @@ class Broker:
                     )
                     self._remove_waiter_locked(waiter)
                 raise ClientDisconnected("client disconnected while queued")
+            try:
+                require_gpu_health(request_id=waiter.request_id,
+                                   logical_request_id=waiter.logical_request_id)
+            except CapacityError:
+                with self.cv:
+                    if waiter in self.waiters:
+                        self._remove_waiter_locked(waiter)
+                raise
             with self.cv:
                 if waiter.terminal_error:
                     raise self._waiter_terminal_failure(waiter)
@@ -5017,6 +5134,7 @@ class Broker:
             raise ValueError(
                 "lease acquisition requires expected_duration_seconds greater than zero"
             )
+        require_gpu_health(refresh=True)
         with self.transition:
             with self.cv:
                 if self.pending_lease():
@@ -5076,6 +5194,7 @@ class Broker:
                     raise RuntimeError(
                         f"requested {requested_mib} MiB but only {aggregate_free} MiB is free after Ollama unload"
                     )
+                require_gpu_health(refresh=True)
                 now = time.time()
                 token = "lease_" + secrets.token_urlsafe(24)
                 lease = Lease(
@@ -5103,6 +5222,7 @@ class Broker:
                 raise
 
     def ready(self, token: str) -> dict[str, Any]:
+        require_gpu_health(refresh=True)
         with self.transition:
             with self.cv:
                 lease = self.leases.get(token)
@@ -5131,6 +5251,7 @@ class Broker:
         the requested scope. The anonymous watcher continues to protect every
         unreserved GPU from later growth.
         """
+        require_gpu_health(refresh=True)
         with self.transition:
             requested = list(dict.fromkeys(requested_gpu_uuids))
             if not requested:
@@ -5220,6 +5341,7 @@ class Broker:
             }
 
     def prepare(self, token: str) -> dict[str, Any]:
+        require_gpu_health(refresh=True)
         with self.transition:
             with self.cv:
                 lease = self.leases.get(token)
@@ -5618,15 +5740,18 @@ class Broker:
                 model: list(gpus) for model, gpus in self.model_gpu_policy.items()
             }
         backend = probe_backend()
+        health = gpu_health_snapshot()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
                 "draining": draining, "active_requests": active,
                 "last_reason": reason, "leases": leases,
                 "lease_policy": lease_policy_document(),
                 "lease_summaries": lease_summaries,
-                "warnings": [lease_visibility_warning(lease_summaries)],
+                "warnings": [lease_visibility_warning(lease_summaries)]
+                + gpu_health_warnings(health),
                 "pending_transition_timeout_seconds": PENDING_TIMEOUT,
                 "gpus": gpu_snapshot(),
+                "gpu_health": health,
                 "parallel_pool": {
                     "enabled": POOL_ENABLED,
                     "max_managed_servers": POOL_MAX_SERVERS,
@@ -6065,9 +6190,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             with self.broker.cv:
                 lease_summaries = self.broker._public_lease_summaries_locked()
                 document["active_leases"] = lease_summaries
-                document["warnings"] = [
-                    lease_visibility_warning(lease_summaries)
-                ]
+                document["warnings"][0] = lease_visibility_warning(lease_summaries)
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
                 document["parallel_pool"]["queue"] = self.broker._queue_summary_locked()
                 document["parallel_pool"]["request_lifecycle"] = (
@@ -7001,12 +7124,12 @@ def main() -> int:
                 if isinstance(raw, dict)
             ]
             document["active_leases"] = summaries
-            document["warnings"] = [lease_visibility_warning(summaries)]
+            document["warnings"][0] = lease_visibility_warning(summaries)
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
-            document["warnings"] = [
+            document["warnings"][0] = (
                 LEASE_COORDINATION_WARNING
                 + " Live lease state is unavailable; do not assume GPUs are unleased."
-            ]
+            )
         print(json.dumps(document, indent=2, sort_keys=True))
         return 0
     if args.command_name == "agent-instructions":

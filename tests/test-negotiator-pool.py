@@ -1527,7 +1527,11 @@ def test_client_attribution(helper, fixture_bin):
         if "uid" in identity:
             assert identity["uid"] == os.getuid()
             assert identity.get("pid") == os.getpid(), identity
-            assert identity["label"].startswith(identity["process"])
+            # Hosted runners can execute the caller inside a systemd service;
+            # service identity intentionally takes precedence over process name.
+            unit = identity.get("unit", "")
+            expected_label = unit if unit.endswith(".service") else identity["process"]
+            assert identity["label"].startswith(expected_label), identity
 
         lanes = {lane["id"]: lane for lane in managed_lanes(current)}
         assert lanes[first_lane]["triggered_by"] == {
