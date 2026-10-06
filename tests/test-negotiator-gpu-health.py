@@ -60,6 +60,65 @@ class GpuHealthTests(unittest.TestCase):
                 self.assertFalse(n.gpu_health_snapshot()['admission_blocked'])
                 n.require_gpu_health()
 
+    def test_unknown_cuda_and_failed_process_telemetry_block_transitions(self):
+        broker = n.Broker()
+        for usage in ({'123@GPU-selected': 0}, RuntimeError('telemetry unavailable')):
+            with mock.patch.object(n, 'foreign_gpu_usage',
+                                   side_effect=usage if isinstance(usage, Exception) else None,
+                                   return_value=usage if isinstance(usage, dict) else None):
+                self.assertEqual(broker._ollama_blocked_gpus_locked(), {'GPU-selected'})
+                with self.assertRaises(n.CapacityError) as raised:
+                    broker._require_safe_gpu_transition('GPU-selected')
+                self.assertEqual(raised.exception.reason_code, 'gpu_unregistered_workload')
+
+    def test_quarantine_defers_stop_and_cancel_without_losing_reservation(self):
+        broker = n.Broker()
+        lane = n.Lane('test', 'managed', '127.0.0.1', 1, 'GPU-selected',
+                      'fixture:latest', 1, 4096, 0, 0, mock.Mock())
+        with mock.patch.object(n, 'foreign_gpu_usage', return_value={'123@GPU-selected': 4096}), mock.patch.object(
+            n, 'unload_models_at'
+        ) as unload, mock.patch.object(broker, '_terminate_process') as terminate:
+            self.assertEqual(broker._stop_lanes([lane], 'fixture'), [lane])
+            self.assertIs(broker.lanes['test'], lane)
+            self.assertTrue(lane.retiring)
+            broker._stop_expired_lane(lane)
+            unload.assert_not_called()
+            terminate.assert_not_called()
+
+    def test_transition_refreshes_cached_empty_process_inventory(self):
+        broker = n.Broker()
+        with mock.patch.object(n, 'foreign_gpu_usage', return_value={}) as usage:
+            self.assertFalse(broker._unregistered_gpus_locked())
+            broker._unregistered_gpus_locked()
+            self.assertEqual(usage.call_count, 1)
+            usage.return_value = {'123@GPU-selected': 4096}
+            with self.assertRaises(n.CapacityError):
+                broker._require_safe_gpu_transition('GPU-selected')
+            self.assertEqual(usage.call_count, 2)
+
+    def test_unknown_memory_size_still_identifies_foreign_context(self):
+        with mock.patch.object(n.subprocess, 'run', return_value=subprocess.CompletedProcess(
+            [], 0, '123, GPU-selected, [N/A]\n', ''
+        )), mock.patch.object(n, 'managed_cgroup_pids', return_value=set()):
+            self.assertEqual(n.foreign_gpu_usage(strict=True), {'123@GPU-selected': 0})
+        with mock.patch.object(n.subprocess, 'run', side_effect=subprocess.TimeoutExpired('nvidia-smi', 5)):
+            with self.assertRaises(RuntimeError):
+                n.foreign_gpu_usage(strict=True)
+
+    def test_scoped_prepare_does_not_retire_unrelated_lanes(self):
+        broker = n.Broker()
+        now = time.time()
+        broker.leases['scoped'] = n.Lease('scoped', 'owner', 'active', 1024,
+                                         now, now, now, 60, {}, ['GPU-selected'])
+        with mock.patch.object(n, 'require_gpu_health'), mock.patch.object(broker, 'begin_drain'), mock.patch.object(
+            broker, '_persist_leases_locked'
+        ), mock.patch.object(broker, 'stop_pool_lanes', return_value=[]) as stop, mock.patch.object(
+            broker, '_unload_base_models', return_value=[]
+        ), mock.patch.object(n, 'gpu_snapshot', return_value=[]):
+            result = broker.prepare('scoped')
+        self.assertEqual(result['lease']['state'], 'pending')
+        stop.assert_called_once_with('lease prepare', {'GPU-selected'})
+
     def test_recovery_actions_block_and_preserve_request_identity(self):
         for action in ('Reset', 'Reboot', 'Drain P2P', 'Drain and Reset', '[Unknown Error]'):
             with self.subTest(action=action), self.query('GPU-selected, ' + action + '\n'):

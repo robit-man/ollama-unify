@@ -400,7 +400,7 @@ class PoolHarness:
                  instance_parallel=1,
                  model_gpu_preferences=None, model_context_profiles=None,
                  profile="cuda_triple", selected_gpus=None,
-                 cpu_only=False, max_context=0):
+                 cpu_only=False, max_context=0, idle_timeout=30):
         self.profile = profile
         self.selected_gpus = selected_gpus or [
             "GPU-large-0", "GPU-large-1", "GPU-large-2",
@@ -429,6 +429,7 @@ class PoolHarness:
         self.model_context_profiles = model_context_profiles
         self.cpu_only = cpu_only
         self.max_context = max_context
+        self.idle_timeout = idle_timeout
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -484,7 +485,7 @@ class PoolHarness:
             "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": str(
                 self.instance_parallel
             ),
-            "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": "30",
+            "OLLAMA_UNIFY_POOL_IDLE_TIMEOUT": str(self.idle_timeout),
             "OLLAMA_UNIFY_POOL_READY_TIMEOUT": "3",
             "OLLAMA_UNIFY_POOL_LOAD_TIMEOUT": "3",
             "OLLAMA_UNIFY_POOL_VRAM_RESERVE_MIB": "1024",
@@ -1720,6 +1721,13 @@ def test_foreign_gpu_transition_stability(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
         status, capacity, _ = harness.capacity(MODEL)
         assert status == 200, capacity
+        # Warm-up and normal inference cannot restore native idle expiration.
+        assert all(event["keep_alive"] == -1 for event in events(harness.event_log)
+                   if event["kind"] == "request")
+        result = http_json(harness.proxy_port, "POST", "/api/generate",
+                           {"model": MODEL, "prompt": "fixture", "stream": False, "keep_alive": "1s"})
+        assert result[0] == 200, result
+        assert [event for event in events(harness.event_log) if event["kind"] == "request"][-1]["keep_alive"] == -1
         start = wait_until(
             lambda: next((event for event in events(harness.event_log)
                           if event["kind"] == "start"), None),
@@ -1748,43 +1756,52 @@ def test_foreign_gpu_transition_stability(helper, fixture_bin):
         assert not [event for event in events(harness.event_log)
                     if event["kind"] == "stop"]
 
-        # A stable new allocation on a selected GPU triggers one rebalance.
-        write_compute_apps(harness.compute_apps, [
-            (910002, "GPU-large-0", 1024),
-        ])
-        wait_until(
-            lambda: len([event for event in events(harness.event_log)
-                         if event["kind"] == "stop"]) >= 1,
-            "rebalance after selected-GPU allocation",
-        )
-        first_stop_count = len([event for event in events(harness.event_log)
-                                if event["kind"] == "stop"])
-        wait_until(
-            lambda: capacity_when_ready(harness, MODEL),
-            "capacity recovery after selected-GPU allocation",
-        )
-
-        # Growth by the same process is also material and triggers a new fit.
-        write_compute_apps(harness.compute_apps, [
-            (910002, "GPU-large-0", 2048),
-        ])
-        wait_until(
-            lambda: len([event for event in events(harness.event_log)
-                         if event["kind"] == "stop"]) > first_stop_count,
-            "rebalance after selected-GPU allocation growth",
-        )
-        second_stop_count = len([event for event in events(harness.event_log)
-                                 if event["kind"] == "stop"])
-        wait_until(
-            lambda: capacity_when_ready(harness, MODEL),
-            "capacity recovery after selected-GPU allocation growth",
-        )
-
-        # Releasing foreign VRAM must not destroy the newly fitted lane.
-        write_compute_apps(harness.compute_apps, [])
+        # Foreign CUDA never triggers weight eviction or a reload. It blocks
+        # even a resident lane until the unknown owner's complete scope exits.
+        write_compute_apps(harness.compute_apps, [(910002, start["gpu"], 1024)])
+        wait_until(lambda: start["gpu"] in harness.status()["unregistered_gpu_quarantine"],
+                   "unregistered allocation quarantined")
+        status, _, _ = harness.capacity(MODEL, gpu_uuids=[start["gpu"]])
+        assert status == 503
+        write_compute_apps(harness.compute_apps, [(910002, start["gpu"], 2048)])
         time.sleep(0.3)
-        assert len([event for event in events(harness.event_log)
-                    if event["kind"] == "stop"]) == second_stop_count
+        assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
+        assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
+        write_compute_apps(harness.compute_apps, [])
+        status, capacity, _ = harness.capacity(MODEL, gpu_uuids=[start["gpu"]])
+        assert status == 200, capacity
+        assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
+
+
+def test_unregistered_peer_work_defers_every_lane_transition(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=4, tags=[MODEL, OTHER_MODEL], idle_timeout=3) as harness:
+        pair = ["GPU-large-0", "GPU-large-2"]
+        for gpu in pair:
+            status, capacity, _ = harness.capacity(MODEL, gpu_uuids=[gpu])
+            assert status == 200, capacity
+        initial = managed_lanes(harness.status())
+        write_compute_apps(harness.compute_apps, [(910003, gpu, 4096) for gpu in pair])
+        wait_until(lambda: set(harness.status()["unregistered_gpu_quarantine"]) == set(pair),
+                   "both peer GPUs quarantined")
+        for gpu in pair:
+            status, _, _ = harness.capacity(OTHER_MODEL, gpu_uuids=[gpu])
+            assert status == 503
+        status, capacity, _ = harness.capacity(OTHER_MODEL, gpu_uuids=["GPU-large-1"])
+        assert status == 200, capacity
+        # Explicit stop must retain the process and reservation, too.
+        result = control_raw(harness.socket_path, {"action": "stop_lane", "lane_id": initial[0]["id"]})
+        assert not result["ok"], result
+        assert len(managed_lanes(harness.status())) == 3
+        assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
+        # Even idle expiry cannot unload until foreign CUDA has gone.
+        wait_until(lambda: any(event["kind"] == "stop" and event["gpu"] == "GPU-large-1"
+                               for event in events(harness.event_log)), "unrelated idle lane retires", timeout=6)
+        stopped_gpus = {event["gpu"] for event in events(harness.event_log) if event["kind"] == "stop"}
+        assert not stopped_gpus.intersection(pair), stopped_gpus
+        assert set(lane["gpu_uuid"] for lane in managed_lanes(harness.status())) == set(pair)
+        write_compute_apps(harness.compute_apps, [])
+        wait_until(lambda: not managed_lanes(harness.status()), "deferred lanes retire after peer exit", timeout=12)
+
 
 
 def test_implicit_latest_uses_one_lane(helper, fixture_bin):
@@ -3217,6 +3234,7 @@ def main():
     test_client_history_ttl_and_lane_bound(helper, fixture_bin)
     test_operator_model_gpu_policy(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
+    test_unregistered_peer_work_defers_every_lane_transition(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
