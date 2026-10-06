@@ -5743,6 +5743,8 @@ class Broker:
         health = gpu_health_snapshot()
         return {"ok": True, "backend_available": backend.available,
                 "backend_error": backend.error, "backend_checked_at": backend.checked_at,
+                "selected_gpu_ids": SELECTED_GPUS,
+                "selected_gpu_count": len(SELECTED_GPUS),
                 "draining": draining, "active_requests": active,
                 "last_reason": reason, "leases": leases,
                 "lease_policy": lease_policy_document(),
@@ -7124,7 +7126,17 @@ def main() -> int:
                 if isinstance(raw, dict)
             ]
             document["active_leases"] = summaries
-            document["warnings"][0] = lease_visibility_warning(summaries)
+            # The daemon can have systemd EnvironmentFile overrides that the
+            # CLI does not inherit. Publish its effective scope and health.
+            for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health"):
+                if key in live_status:
+                    document[key] = live_status[key]
+            selected = set(document.get("selected_gpu_ids", []))
+            for device in document.get("gpus", []):
+                device["selected_for_ollama"] = not selected or device.get("uuid") in selected
+            if "enabled" in live_status.get("parallel_pool", {}):
+                document["parallel_pool"]["enabled"] = live_status["parallel_pool"]["enabled"]
+            document["warnings"] = [lease_visibility_warning(summaries)] + gpu_health_warnings(document["gpu_health"])
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
             document["warnings"][0] = (
                 LEASE_COORDINATION_WARNING
