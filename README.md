@@ -116,6 +116,8 @@ Proceed? [N]: y
 - **Shell rc update** — appends `export OLLAMA_MODELS=…` to your `.bashrc` / `.zshrc` / `config.fish` so new shells use the canonical path natively
 - **Safety first** — never deletes data. Originals are renamed to `.bak` (or `.orphan-blobs` for stores with no manifests). You reclaim the space manually when you've confirmed everything works.
 
+CUDA admission also checks the NVIDIA driver's `gpu_recovery_action` before granting leases, preparing growth, starting managed lanes, or admitting inference (including reuse of resident lanes). A selected GPU requiring reset or drain blocks new work; a reported node reboot blocks work even if that GPU is outside the selected set. Missing selected devices and failed recovery queries also block admission. Discovery and status expose `gpu_health` and coordination warnings. Confirmed recovery requirements return HTTP 503 with `gpu_recovery_required` and `retryable: false`; unavailable telemetry returns `gpu_health_unavailable`. Existing owners can still heartbeat and release leases, and model-unload requests remain available. The broker never resets GPUs or reboots the host automatically. Drivers predating the recovery query retain their previous admission behavior and report that this protection is unavailable. This check contains an already reported driver fault; it cannot prevent the first hardware failure or repair an NVLink bridge.
+
 ## Quick start
 
 ```bash

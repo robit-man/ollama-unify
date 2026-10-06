@@ -66,6 +66,7 @@ python3 -m py_compile "$test_tmp/ollama-unify-gpu-negotiator"
 python3 -m py_compile "$test_tmp/ollama-unify-tray"
 python3 "$repo_dir/tests/test-tray.py" "$test_tmp/ollama-unify-tray"
 python3 "$repo_dir/tests/test-client-identity.py" "$test_tmp/ollama-unify-gpu-negotiator"
+python3 "$repo_dir/tests/test-negotiator-gpu-health.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
   "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/test-tray.py" "$repo_dir/tests/test-client-identity.py" \
   "$repo_dir/tests/fixtures/bin/ollama"

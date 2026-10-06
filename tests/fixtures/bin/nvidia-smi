@@ -6,6 +6,15 @@ if [[ "${MOCK_PROFILE:-}" != cuda* ]]; then
 fi
 
 case "$*" in
+  *--query-gpu=uuid,gpu_recovery_action*)
+    if [ "$MOCK_PROFILE" = "cuda_triple" ]; then
+      printf '%s\n' 'GPU-large-0, None' 'GPU-large-1, None' 'GPU-large-2, None'
+    elif [ "$MOCK_PROFILE" = "cuda_uneven" ]; then
+      printf '%s\n' 'GPU-uneven-0, None' 'GPU-uneven-1, None' 'GPU-uneven-2, None' 'GPU-uneven-3, None'
+    else
+      printf '%s\n' 'GPU-dedicated, None' 'GPU-display, N/A' 'GPU-small, N/A'
+    fi
+    ;;
   *--query-gpu=uuid,memory.total,memory.used,memory.free*)
     if [ "$MOCK_PROFILE" = "cuda_triple" ] || [ "$MOCK_PROFILE" = "cuda_uneven" ]; then
       if [ "$MOCK_PROFILE" = "cuda_uneven" ]; then
