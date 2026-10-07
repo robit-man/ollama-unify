@@ -1768,6 +1768,8 @@ def test_foreign_gpu_transition_stability(helper, fixture_bin):
         assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
         assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
         write_compute_apps(harness.compute_apps, [])
+        wait_until(lambda: not harness.status()["unregistered_gpu_quarantine"],
+                   "foreign process exit observed before resident lane reuse")
         status, capacity, _ = harness.capacity(MODEL, gpu_uuids=[start["gpu"]])
         assert status == 200, capacity
         assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
