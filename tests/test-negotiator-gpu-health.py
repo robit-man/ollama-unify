@@ -96,6 +96,14 @@ class GpuHealthTests(unittest.TestCase):
                 broker._require_safe_gpu_transition('GPU-selected')
             self.assertEqual(usage.call_count, 2)
 
+    def test_system_backend_cannot_bypass_quarantine_but_metadata_stays_available(self):
+        broker = n.Broker()
+        with mock.patch.object(n, 'POOL_ENABLED', False), mock.patch.object(
+            n, 'foreign_gpu_usage', return_value={'123@GPU-selected': 4096}
+        ):
+            self.assertIsNone(broker._select_lane_locked('fixture:latest', True))
+            self.assertIs(broker._select_lane_locked('', False), broker.lanes['base'])
+
     def test_unknown_memory_size_still_identifies_foreign_context(self):
         with mock.patch.object(n.subprocess, 'run', return_value=subprocess.CompletedProcess(
             [], 0, '123, GPU-selected, [N/A]\n', ''
@@ -192,7 +200,9 @@ class GpuHealthTests(unittest.TestCase):
 
     def test_fault_blocks_inference_but_allows_unload(self):
         broker = n.Broker()
-        with mock.patch.object(n, 'POOL_ENABLED', False), self.query('GPU-selected, Reboot\n'):
+        with mock.patch.object(n, 'POOL_ENABLED', False), self.query('GPU-selected, Reboot\n'), mock.patch.object(
+            n, 'foreign_gpu_usage', return_value={}
+        ):
             with self.assertRaises(n.PermanentCapacityError):
                 broker.proxy_enter('fixture:latest', True)
             self.assertEqual(broker.active_requests, 0)
