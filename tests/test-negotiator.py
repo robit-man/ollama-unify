@@ -586,8 +586,15 @@ def main():
             ]
             live_status = control(socket_path, {"action": "status"})
             assert live_status["draining"] is False
-            proxy_generate(proxy_port, 4096)
+            # A legacy system backend cannot prove it uses only the GPU
+            # outside this pending/exclusive scope. Keep inference blocked;
+            # an enabled managed pool can route to its exact unreserved UUID.
+            blocked_code, _, _ = proxy_generate(
+                proxy_port, 4096, admission_wait_ms=100,
+            )
+            assert blocked_code == 503
             control(socket_path, {"action": "release", "token": live_token})
+            proxy_generate(proxy_port, 4096)
 
             backend_port = backend.server_port
             backend.shutdown()
