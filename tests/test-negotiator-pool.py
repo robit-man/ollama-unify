@@ -208,6 +208,7 @@ def chat(
     mock_body_size=None,
     mock_backend_reset=False,
     mock_partial_stall=False,
+    mock_barrier_requests=None,
     gpu_uuids=None,
     client=None,
 ):
@@ -233,6 +234,8 @@ def chat(
     }
     if mock_body_size is not None:
         payload["mock_body_size"] = mock_body_size
+    if mock_barrier_requests is not None:
+        payload["mock_barrier_requests"] = mock_barrier_requests
     if mock_backend_reset:
         payload["mock_backend_reset"] = True
     if mock_partial_stall:
@@ -400,7 +403,9 @@ class PoolHarness:
                  instance_parallel=1,
                  model_gpu_preferences=None, model_context_profiles=None,
                  profile="cuda_triple", selected_gpus=None,
-                 cpu_only=False, max_context=0, idle_timeout=30):
+                 cpu_only=False, max_context=0, idle_timeout=30,
+                 runner_vram_by_gpu=None, runner_gpu_scope=None,
+                 partial_gpu_residency=False):
         self.profile = profile
         self.selected_gpus = selected_gpus or [
             "GPU-large-0", "GPU-large-1", "GPU-large-2",
@@ -430,6 +435,9 @@ class PoolHarness:
         self.cpu_only = cpu_only
         self.max_context = max_context
         self.idle_timeout = idle_timeout
+        self.runner_vram_by_gpu = runner_vram_by_gpu or {}
+        self.runner_gpu_scope = runner_gpu_scope
+        self.partial_gpu_residency = partial_gpu_residency
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -452,12 +460,15 @@ class PoolHarness:
             "MOCK_NVIDIA_COMPUTE_APPS_FILE": self.compute_apps,
             "MOCK_OLLAMA_GPU_USAGE_DIR": self.gpu_usage_dir,
             "MOCK_OLLAMA_VRAM_MIB": str(self.runner_vram_mib),
+            "MOCK_OLLAMA_GPU_USAGE_BY_GPU": json.dumps(self.runner_vram_by_gpu),
             "MOCK_OLLAMA_CPU_ONLY": "1" if self.cpu_only else "0",
+            "MOCK_OLLAMA_PARTIAL_GPU_RESIDENCY": "1" if self.partial_gpu_residency else "0",
             "OLLAMA_UNIFY_CONFIG": os.path.join(self.temp_dir, "missing.conf"),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{self.backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{self.proxy_port}",
             "OLLAMA_UNIFY_SOCKET": self.socket_path,
             "OLLAMA_UNIFY_LEASE_STATE": os.path.join(self.temp_dir, "leases.json"),
+            "OLLAMA_UNIFY_MODEL_POLICY_STATE": os.path.join(self.temp_dir, "model-gpu-policy.json"),
             "OLLAMA_UNIFY_BACKEND_TYPE": "cuda",
             "OLLAMA_UNIFY_SELECTED_GPUS": ",".join(self.selected_gpus),
             "OLLAMA_UNIFY_MODEL_GPU_PREFERENCES": json.dumps(
@@ -515,6 +526,8 @@ class PoolHarness:
                 self.client_lane_history_limit
             ),
         })
+        if self.runner_gpu_scope is not None:
+            env["MOCK_OLLAMA_GPU_USAGE_SCOPE"] = ",".join(self.runner_gpu_scope)
         self.daemon = subprocess.Popen(
             [self.helper, "serve"], env=env, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
@@ -529,6 +542,8 @@ class PoolHarness:
         except subprocess.TimeoutExpired:
             self.daemon.kill()
             self.daemon.wait()
+        self.daemon.stdout.close()
+        self.daemon.stderr.close()
         self.backend.shutdown()
         self.backend.server_close()
         self.temp.cleanup()
@@ -1800,6 +1815,8 @@ def test_unregistered_peer_work_defers_every_lane_transition(helper, fixture_bin
                                for event in events(harness.event_log)), "unrelated idle lane retires", timeout=6)
         stopped_gpus = {event["gpu"] for event in events(harness.event_log) if event["kind"] == "stop"}
         assert not stopped_gpus.intersection(pair), stopped_gpus
+        wait_until(lambda: set(lane["gpu_uuid"] for lane in managed_lanes(harness.status())) == set(pair),
+                   "unrelated backend process-group exit observed", timeout=3)
         assert set(lane["gpu_uuid"] for lane in managed_lanes(harness.status())) == set(pair)
         write_compute_apps(harness.compute_apps, [])
         wait_until(lambda: not managed_lanes(harness.status()), "deferred lanes retire after peer exit", timeout=12)
@@ -1894,7 +1911,8 @@ def test_lazy_parallel_scaling(helper, fixture_bin):
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [
                 executor.submit(
-                    chat, harness.proxy_port, MODEL, f"lazy-{index}", 0.5, 10
+                    chat, harness.proxy_port, MODEL, f"lazy-{index}", 0.5, 10,
+                    mock_barrier_requests=3,
                 )
                 for index in (1, 2, 3)
             ]
@@ -2778,7 +2796,7 @@ def test_temporary_and_permanent_placement_failures(helper, fixture_bin):
     oversized = {
         "name": OTHER_MODEL,
         "model": OTHER_MODEL,
-        "size": 100 * 1024**3,
+        "size": 300 * 1024**3,
         "capabilities": ["completion"],
     }
     with PoolHarness(

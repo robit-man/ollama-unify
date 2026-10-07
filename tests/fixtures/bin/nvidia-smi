@@ -57,6 +57,17 @@ case "$*" in
       && [ -r "$MOCK_NVIDIA_COMPUTE_APPS_FILE" ]; then
       sed -n '/[^[:space:]]/p' "$MOCK_NVIDIA_COMPUTE_APPS_FILE"
     fi
+    # Fake Ollama runners publish per-device usage under their own PID.
+    # This exercises actual-placement attestation without touching CUDA.
+    if [ -n "${MOCK_OLLAMA_GPU_USAGE_DIR:-}" ] \
+      && [ -d "$MOCK_OLLAMA_GPU_USAGE_DIR" ]; then
+      for usage_file in "$MOCK_OLLAMA_GPU_USAGE_DIR"/*.csv; do
+        [ -f "$usage_file" ] || continue
+        runner_pid=${usage_file##*/}
+        runner_pid=${runner_pid%.csv}
+        awk -F, -v pid="$runner_pid" '{ print pid ", " $1 ", " $2 }' "$usage_file"
+      done
+    fi
     ;;
   *--query-gpu=index,uuid,name,display_active,memory.total,compute_cap*)
     if [ "$MOCK_PROFILE" = "cuda_display" ]; then

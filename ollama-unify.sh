@@ -1675,6 +1675,37 @@ def foreign_gpu_usage(*, strict: bool = False) -> dict[str, int]:
     return usage
 
 
+def process_gpu_usage(process: Any) -> dict[str, int]:
+    """Attest every CUDA device used by one managed process group."""
+    try:
+        result = subprocess.run([
+            "nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ], check=True, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        raise CapacityError("cannot verify managed GPU placement", 503,
+                            "gpu_placement_unverified") from exc
+    usage: dict[str, int] = {}
+    for raw in result.stdout.splitlines():
+        fields = [field.strip() for field in raw.split(",")]
+        if len(fields) != 3 or not fields[0].isdigit():
+            raise CapacityError("invalid managed GPU placement telemetry", 503,
+                                "gpu_placement_unverified")
+        try:
+            owned = os.getpgid(int(fields[0])) == process.pid
+        except ProcessLookupError:
+            continue
+        except (OSError, AttributeError) as exc:
+            raise CapacityError("cannot identify managed CUDA process group", 503,
+                                "gpu_placement_unverified") from exc
+        if owned:
+            if not fields[2].isdigit():
+                raise CapacityError("managed CUDA memory is unverifiable", 503,
+                                    "gpu_placement_unverified")
+            usage[fields[1]] = usage.get(fields[1], 0) + int(fields[2])
+    return usage
+
+
 def increased_foreign_gpu_usage(previous: dict[str, int],
                                 current: dict[str, int]) -> dict[str, int]:
     """Return only new or larger foreign allocations on selected GPUs."""
@@ -1807,6 +1838,10 @@ def discovery_document() -> dict[str, Any]:
                     "reclaimable_placement_wait",
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
+                    "gpu_peer_group_wait",
+                    "gpu_peer_group_reserved",
+                    "gpu_placement_unverified",
+                    "invalid_gpu_scope",
                     "model_not_installed",
                     "gpu_runtime_unavailable",
                     "gpu_recovery_required",
@@ -2357,6 +2392,22 @@ class Lane:
     triggered_by: dict[str, str] | None = None
     clients: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_clients: dict[str, int] = field(default_factory=dict)
+    gpu_uuids: tuple[str, ...] = ()
+    reserved_mib_by_gpu: dict[str, int] = field(default_factory=dict)
+    observed_vram_mib_by_gpu: dict[str, int] = field(default_factory=dict)
+    loading: bool = False
+
+    @property
+    def scope(self) -> tuple[str, ...]:
+        return self.gpu_uuids or ((self.gpu_uuid,) if self.gpu_uuid else ())
+
+    def allows(self, gpu_uuids: tuple[str, ...] | list[str] | None) -> bool:
+        return gpu_uuids is None or set(self.scope).issubset(gpu_uuids)
+
+    @property
+    def protected_scope(self) -> tuple[str, ...]:
+        # Failed placement must retain protection for observed devices too.
+        return tuple(dict.fromkeys((*self.scope, *self.observed_vram_mib_by_gpu)))
 
     def public_summary(self) -> dict[str, Any]:
         alive = self.kind == "system" or process_group_alive(self.process)
@@ -2364,8 +2415,14 @@ class Lane:
             "id": self.lane_id,
             "kind": self.kind,
             "gpu_uuid": self.gpu_uuid,
+            "gpu_uuids": list(self.scope),
+            "reserved_mib_by_gpu": self.reserved_mib_by_gpu or {
+                gpu: self.reserved_mib for gpu in self.scope
+            },
+            "observed_vram_mib_by_gpu": self.observed_vram_mib_by_gpu,
+            "exclusive": len(self.scope) > 1,
             "state": "retiring" if alive and self.retiring else (
-                "ready" if alive else "stopped"
+                "loading" if alive and self.loading else "ready" if alive else "stopped"
             ),
             "model": self.model or None,
             "parallel": self.parallel,
@@ -2624,12 +2681,12 @@ class CompletedResponse:
 class Broker:
     def __init__(self) -> None:
         self.cv = threading.Condition()
-        self.transition = threading.Lock()
+        self.transition = threading.RLock()
         self.leases = self._load_leases()
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
         self.draining = any(
-            lease.state in ("pending", "revoking") and not lease.gpu_uuids
+            lease.state in ("pending", "active", "revoking") and not lease.gpu_uuids
             for lease in self.leases.values()
         )
         self.active_requests = 0
@@ -2837,14 +2894,30 @@ class Broker:
             return set()
         return {key.rsplit("@", 1)[-1] for key in usage} - self._reserved_gpus_locked()
 
-    def _require_safe_gpu_transition(self, gpu_uuid: str) -> None:
+    def _peer_reserved_gpus_locked(self, ignore_lane_id: str | None = None) -> set[str]:
+        return {gpu for lane in self.lanes.values()
+                if lane.kind == "managed" and len(lane.scope) > 1
+                and lane.lane_id != ignore_lane_id for gpu in lane.protected_scope}
+
+    def _require_safe_gpu_transition(
+        self, gpu_uuids: str | tuple[str, ...], ignore_lane_id: str | None = None,
+    ) -> None:
+        scope = {gpu_uuids} if isinstance(gpu_uuids, str) else set(gpu_uuids)
+        if scope - set(SELECTED_GPUS):
+            raise CapacityError("CUDA transition touches an unmonitored GPU; retaining the process reservation",
+                                503, "gpu_placement_unverified", False, None)
         with self.cv:
             blocked = self._unregistered_gpus_locked(refresh=True)
-        if gpu_uuid in blocked:
+            peers = self._peer_reserved_gpus_locked(ignore_lane_id)
+            leases = self._lease_blocked_gpus_locked()
+        affected = scope.intersection(blocked | peers | leases)
+        if affected:
             raise CapacityError(
-                "Unregistered CUDA activity or unavailable process telemetry on "
-                f"{gpu_uuid}; model load/unload is deferred until it clears",
-                503, "gpu_unregistered_workload", True, 1,
+                "CUDA activity, unavailable telemetry, or a managed peer group on "
+                f"{sorted(affected)}; model load/unload is deferred until it clears",
+                503, "gpu_unregistered_workload" if scope.intersection(blocked)
+                else "lease_transition" if scope.intersection(leases)
+                else "gpu_peer_group_reserved", True, 1,
             )
 
     def _unload_base_models(self) -> list[str]:
@@ -2855,9 +2928,11 @@ class Broker:
         if not models:
             return []
         with self.cv:
-            if self._unregistered_gpus_locked(refresh=True):
+            if (self._unregistered_gpus_locked(refresh=True)
+                    or self._peer_reserved_gpus_locked()
+                    or self._lease_blocked_gpus_locked()):
                 raise CapacityError(
-                    "Base model unload deferred around unregistered CUDA activity",
+                    "Base model unload deferred around CUDA activity or a managed GPU group",
                     503, "gpu_unregistered_workload", True, 1,
                 )
         return unload_all_models()
@@ -2876,7 +2951,13 @@ class Broker:
         `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
         set. Two external owners never share a scoped GPU.
         """
-        return self._unregistered_gpus_locked() | {
+        return self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
+
+    def _lease_blocked_gpus_locked(self) -> set[str]:
+        if any(not lease.gpu_uuids and lease.state in ("pending", "active", "revoking")
+               for lease in self.leases.values()):
+            return set(SELECTED_GPUS)
+        return {
             gpu_uuid
             for lease in self.leases.values()
             for gpu_uuid in lease.gpu_uuids
@@ -2889,7 +2970,7 @@ class Broker:
         return next(
             (
                 lease for lease in self.leases.values()
-                if lease.state in ("pending", "revoking")
+                if lease.state in ("pending", "active", "revoking")
                 and not lease.gpu_uuids
             ),
             None,
@@ -3291,8 +3372,9 @@ class Broker:
         gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
-                    and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)
-                    and lane.gpu_uuid not in blocked_gpus
+                    and lane.allows(gpu_uuids)
+                    and not set(lane.scope).intersection(blocked_gpus)
+                    and not lane.loading
                     and not lane.retiring
                     and lane.in_flight < lane.parallel]
         managed_model_exists = any(
@@ -3385,10 +3467,13 @@ class Broker:
         Treat that promise as committed until the complete process group exits
         so another lane cannot consume the same capacity.
         """
+        with self.cv:
+            peer_reserved = self._peer_reserved_gpus_locked()
         devices = [
             device for device in gpu_snapshot()
             if device.get("uuid") in SELECTED_GPUS
             and device.get("uuid") not in blocked
+            and device.get("uuid") not in peer_reserved
         ]
         foreign_by_gpu: dict[str, int] = {}
         for key, used_mib in foreign_gpu_usage().items():
@@ -3401,12 +3486,11 @@ class Broker:
             self._prune_dead_lanes_locked()
             reserved_by_gpu: dict[str, int] = {}
             for lane in self.lanes.values():
-                if lane.kind != "managed" or not lane.gpu_uuid:
+                if lane.kind != "managed" or not lane.scope:
                     continue
-                reserved_by_gpu[lane.gpu_uuid] = (
-                    reserved_by_gpu.get(lane.gpu_uuid, 0)
-                    + max(0, int(lane.reserved_mib))
-                )
+                for gpu in lane.scope:
+                    reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + max(
+                        0, int(lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib)))
         available = []
         for device in devices:
             gpu_uuid = str(device.get("uuid") or "")
@@ -3517,11 +3601,15 @@ class Broker:
                 time.sleep(0.05)
         return process.poll() is not None and not process_group_alive(process)
 
-    def _spawn_lane(self, model: str, gpu_uuid: str, required_mib: int,
+    def _spawn_lane(self, model: str, gpu_uuid: str | tuple[str, ...], required_mib: int,
                     capabilities: set[str], request_path: str,
-                    triggered_by: dict[str, str] | None = None) -> Lane:
+                    triggered_by: dict[str, str] | None = None,
+                    reserved_mib_by_gpu: dict[str, int] | None = None) -> Lane:
+        scope = (gpu_uuid,) if isinstance(gpu_uuid, str) else tuple(gpu_uuid)
+        if not scope or len(set(scope)) != len(scope) or any(gpu not in SELECTED_GPUS for gpu in scope):
+            raise PermanentCapacityError("invalid managed GPU scope", 422, "invalid_gpu_scope")
         require_gpu_health(refresh=True)
-        self._require_safe_gpu_transition(gpu_uuid)
+        self._require_safe_gpu_transition(scope)
         model = canonical_model_tag(model)
         if not os.access(OLLAMA_BINARY, os.X_OK):
             raise PermanentCapacityError(
@@ -3534,10 +3622,16 @@ class Broker:
             lane_id = f"lane-{self.next_lane_id}"
             self.next_lane_id += 1
         env = os.environ.copy()
+        if len(scope) > 1:
+            # These GGML flags are enabled by their presence, including a
+            # value of "0". Keep layer splitting on the host-staged path;
+            # never inherit peer access or unified-memory spill into a group.
+            env.pop("GGML_CUDA_P2P", None)
+            env.pop("GGML_CUDA_ENABLE_UNIFIED_MEMORY", None)
         env.update({
             "HOME": OLLAMA_CHILD_HOME,
             "OLLAMA_HOST": f"127.0.0.1:{port}",
-            "CUDA_VISIBLE_DEVICES": gpu_uuid,
+            "CUDA_VISIBLE_DEVICES": ",".join(scope),
             "HIP_VISIBLE_DEVICES": "-1",
             "ROCR_VISIBLE_DEVICES": "-1",
             "GPU_DEVICE_ORDINAL": "-1",
@@ -3546,7 +3640,7 @@ class Broker:
             "OLLAMA_IGPU_ENABLE": "0",
             "OLLAMA_MAX_LOADED_MODELS": "1",
             "OLLAMA_NUM_PARALLEL": str(POOL_INSTANCE_PARALLEL),
-            "OLLAMA_SCHED_SPREAD": "0",
+            "OLLAMA_SCHED_SPREAD": "1" if len(scope) > 1 else "0",
             "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_MAX_QUEUE": "64",
             "OLLAMA_GPU_OVERHEAD": str(POOL_VRAM_RESERVE_MIB * 1024 * 1024),
@@ -3572,6 +3666,18 @@ class Broker:
         )
         LOG.info("managed lane spawned id=%s gpu=%s model=%s pid=%s",
                  lane_id, gpu_uuid, model, process.pid)
+        now = time.time()
+        lane = Lane(lane_id, "managed", "127.0.0.1", port, scope[0], model,
+                    POOL_INSTANCE_PARALLEL, required_mib, now, now, process,
+                    gpu_uuids=scope,
+                    reserved_mib_by_gpu=dict(reserved_mib_by_gpu or {scope[0]: required_mib}),
+                    loading=True)
+        lane.triggered_by = triggered_by
+        with self.cv:
+            # Publish the entire reservation before warm-up can start peer
+            # traffic. Loading lanes are never eligible for inference.
+            self.lanes[lane_id] = lane
+            self.cv.notify_all()
         deadline = time.monotonic() + POOL_READY_TIMEOUT
         try:
             while time.monotonic() < deadline:
@@ -3598,7 +3704,7 @@ class Broker:
                 model, capabilities, request_path
             )
             require_gpu_health(refresh=True)
-            self._require_safe_gpu_transition(gpu_uuid)
+            self._require_safe_gpu_transition(scope, lane_id)
             LOG.info("managed lane loading id=%s gpu=%s model=%s pid=%s",
                      lane_id, gpu_uuid, model, process.pid)
             backend_json_at(
@@ -3634,14 +3740,36 @@ class Broker:
                     "gpu_runtime_unavailable",
                 )
             actual_context = verified_model_context(model, resident)
+            if len(scope) > 1:
+                total_size = resident_model.get("size")
+                if (isinstance(total_size, bool) or not isinstance(total_size, (int, float))
+                        or total_size <= 0 or size_vram < total_size):
+                    raise PermanentCapacityError(
+                        "split model did not become fully GPU-resident", 503,
+                        "gpu_runtime_unavailable")
+                observed = process_gpu_usage(process)
+                lane.observed_vram_mib_by_gpu = observed
+                if set(observed) != set(scope) or any(used <= 0 for used in observed.values()):
+                    raise CapacityError(
+                        f"managed GPU placement differs from reserved group: expected={list(scope)} observed={observed}",
+                        503, "gpu_placement_unverified")
+                require_gpu_health(refresh=True)
+                self._require_safe_gpu_transition(scope, lane_id)
+            with self.cv:
+                allowed = self._policy_constraint_locked(model, scope)
+                if (lane.retiring or process.poll() is not None
+                        or not lane.allows(allowed)):
+                    raise CapacityError("managed lane retired during warm-up",
+                                        reason_code="lane_capacity_wait")
+                lane.resolved_context_length = actual_context
+                lane.loading = False
+                self.cv.notify_all()
         except Exception as exc:
             LOG.error("managed lane load failed id=%s gpu=%s model=%s pid=%s: %s",
                       lane_id, gpu_uuid, model, process.pid, exc)
-            now = time.time()
-            failed_lane = Lane(lane_id, "managed", "127.0.0.1", port,
-                               gpu_uuid, model, POOL_INSTANCE_PARALLEL,
-                               required_mib, now, now, process)
-            self._stop_lanes([failed_lane], "warm-up failed")
+            lane.retiring = True
+            lane.loading = False
+            self._stop_lanes([lane], "warm-up failed")
             if (isinstance(exc, BackendHTTPError)
                     and 400 <= exc.status < 500
                     and exc.status not in (408, 409, 425, 429)):
@@ -3649,16 +3777,6 @@ class Broker:
                     str(exc), exc.status, "backend_rejected_model"
                 ) from exc
             raise
-        now = time.time()
-        lane = Lane(
-            lane_id, "managed", "127.0.0.1", port, gpu_uuid, model,
-            POOL_INSTANCE_PARALLEL, required_mib, now, now, process,
-        )
-        lane.resolved_context_length = actual_context
-        lane.triggered_by = triggered_by
-        with self.cv:
-            self.lanes[lane_id] = lane
-            self.cv.notify_all()
         LOG.info(
             "managed Ollama lane warm and ready id=%s gpu=%s model=%s "
             "reserved_mib=%s triggered_by=%s",
@@ -3668,10 +3786,24 @@ class Broker:
         return lane
 
     def _stop_lanes(self, lanes: list[Lane], reason: str) -> list[Lane]:
+        # Hold the same transition lock through the final safety check and
+        # teardown, so lease acquisition cannot grant a scope in between.
+        with self.transition:
+            return self._stop_lanes_under_transition(lanes, reason)
+
+    def _stop_lanes_under_transition(self, lanes: list[Lane], reason: str) -> list[Lane]:
         failed: list[Lane] = []
         for lane in lanes:
+            if not process_group_alive(lane.process):
+                # A repeated stop must not address an old private port that
+                # may already belong to a replacement backend.
+                with self.cv:
+                    if self.lanes.get(lane.lane_id) is lane:
+                        self.lanes.pop(lane.lane_id, None)
+                    self.cv.notify_all()
+                continue
             try:
-                self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
+                self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
             except CapacityError:
                 # Keep both process and reservation: CUDA teardown itself is
                 # unsafe while an unknown owner could be doing peer traffic.
@@ -3692,6 +3824,10 @@ class Broker:
             except Exception as exc:
                 LOG.warning("managed lane unload failed id=%s: %s", lane.lane_id, exc)
             if self._terminate_process(lane.process):
+                with self.cv:
+                    if self.lanes.get(lane.lane_id) is lane:
+                        self.lanes.pop(lane.lane_id, None)
+                    self.cv.notify_all()
                 LOG.info(
                     "managed Ollama lane stopped id=%s gpu=%s model=%s exit=%s reason=%s",
                     lane.lane_id, lane.gpu_uuid, lane.model,
@@ -3719,10 +3855,10 @@ class Broker:
             lanes = [
                 lane for lane in self.lanes.values()
                 if lane.kind == "managed"
-                and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)
+                and (gpu_uuids is None or set(lane.protected_scope).intersection(gpu_uuids))
             ]
             for lane in lanes:
-                self.lanes.pop(lane.lane_id, None)
+                lane.retiring = True
             self.cv.notify_all()
         failed = self._stop_lanes(lanes, reason)
         if failed:
@@ -3731,6 +3867,105 @@ class Broker:
                 + ", ".join(lane.lane_id for lane in failed)
             )
         return [lane.lane_id for lane in lanes]
+
+    def _ensure_group_capacity(
+        self, model: str, parallel: int, required_mib: int,
+        capabilities: set[str], request_path: str,
+        gpu_uuids: tuple[str, ...] | None,
+        triggered_by: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Create exclusive whole-process peer groups under the transition lock.
+
+        Ollama chooses the tensor partition from actual device memory. We do
+        not guess equal shards: every member's entire capacity stays reserved
+        until the backend process group has completely exited.
+        """
+        wanted = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
+        while True:
+            with self.cv:
+                self._prune_dead_lanes_locked()
+                if any(not lease.gpu_uuids and lease.state in ("pending", "active", "revoking")
+                       for lease in self.leases.values()):
+                    raise CapacityError("unscoped external lease prevents exclusive GPU group placement",
+                                        reason_code="lease_transition")
+                blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked()
+                existing = [lane for lane in self.lanes.values()
+                            if lane.kind == "managed" and lane.model == model
+                            and len(lane.scope) > 1 and lane.allows(gpu_uuids)
+                            and not lane.retiring and not lane.loading
+                            and not set(lane.scope).intersection(blocked)]
+                if len(existing) >= wanted:
+                    break
+                queued_models = {waiter.model for waiter in self.waiters if waiter.model != model}
+                # An idle different-model group may be retired as one whole
+                # owner. Any demand, activity, or blocked member protects all
+                # its members from reclamation.
+                blocked |= {gpu for lane in self.lanes.values()
+                            if lane.kind == "managed" and len(lane.scope) > 1
+                            and (lane.model == model or lane.in_flight or lane.loading
+                                 or lane.model in queued_models
+                                 or set(lane.protected_scope).intersection(blocked))
+                            for gpu in lane.protected_scope}
+                blocked |= {gpu for lane in self.lanes.values()
+                            if lane.kind == "managed"
+                            and (lane.in_flight or lane.loading or lane.model in queued_models)
+                            for gpu in lane.scope}
+            inventory = {str(device["uuid"]): device for device in gpu_snapshot()
+                         if device.get("uuid") in SELECTED_GPUS}
+            order = list(gpu_uuids) if gpu_uuids is not None else list(dict.fromkeys(
+                MODEL_GPU_PREFERENCES.get(model, []) + list(SELECTED_GPUS)))
+            scope: list[str] = []
+            capacity = 0
+            for gpu in order:
+                if gpu in blocked or gpu not in inventory:
+                    continue
+                scope.append(gpu)
+                capacity += max(0, int(inventory[gpu]["total_mib"]) - POOL_VRAM_RESERVE_MIB)
+                if len(scope) > 1 and capacity >= required_mib:
+                    break
+            if len(scope) < 2 or capacity < required_mib:
+                raise CapacityError("no complete exclusive GPU group is currently available",
+                                    reason_code="gpu_peer_group_wait")
+            members = set(scope)
+            with self.cv:
+                victims = [lane for lane in self.lanes.values()
+                           if lane.kind == "managed" and set(lane.scope).intersection(members)]
+                if any(lane.in_flight or lane.loading or lane.model in queued_models
+                       or set(lane.protected_scope).intersection(blocked) for lane in victims):
+                    raise CapacityError("GPU group still has active owners",
+                                        reason_code="gpu_peer_group_wait")
+                if len(self.lanes) - 1 - len(victims) + 1 > POOL_MAX_SERVERS:
+                    raise CapacityError("managed lane limit reached for GPU group")
+                for lane in victims:
+                    lane.retiring = True
+                self.cv.notify_all()
+            if self._stop_lanes(victims, "exclusive GPU group placement"):
+                raise CapacityError("GPU group retirement is not complete",
+                                    reason_code="lane_stop_failed")
+            self._require_safe_gpu_transition(tuple(scope))
+            inventory = {str(device["uuid"]): device for device in gpu_snapshot()}
+            usable = sum(max(0, int(inventory.get(gpu, {}).get("free_mib") or 0)
+                             - POOL_VRAM_RESERVE_MIB) for gpu in scope)
+            if usable < required_mib:
+                raise CapacityError("GPU group lacks live free VRAM after retirement",
+                                    reason_code="gpu_peer_group_wait")
+            available_host = int(host_memory_snapshot().get("memavailable_mib") or 0)
+            if available_host and available_host < POOL_HOST_RESERVE_MIB:
+                raise CapacityError("host memory unavailable for GPU group",
+                                    reason_code="host_memory_unavailable")
+            self._spawn_lane(model, tuple(scope), required_mib, capabilities,
+                             request_path, triggered_by,
+                             {gpu: int(inventory[gpu]["total_mib"]) for gpu in scope})
+        with self.cv:
+            lanes = [lane.public_summary() for lane in existing]
+        return {
+            "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
+            "requested_model": model, "canonical_model": model,
+            "requested_parallel": parallel,
+            "requested_gpu_uuids": list(gpu_uuids) if gpu_uuids is not None else None,
+            "admitted_parallel": sum(lane["parallel"] for lane in lanes),
+            "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}", "lanes": lanes,
+        }
 
     def ensure_capacity(
         self,
@@ -3797,8 +4032,8 @@ class Broker:
                 blocked = self._ollama_blocked_gpus_locked()
                 existing = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
-                            and lane.gpu_uuid not in blocked and not lane.retiring
-                            and (gpu_uuids is None or lane.gpu_uuid in gpu_uuids)]
+                            and not set(lane.scope).intersection(blocked) and not lane.retiring
+                            and not lane.loading and lane.allows(gpu_uuids)]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 required_mib, capabilities = self._model_profile(model)
@@ -3811,16 +4046,16 @@ class Broker:
                     int(device.get("total_mib") or 0)
                     for device in selected_devices
                 ):
-                    capacity = max(
-                        int(device.get("total_mib") or 0)
-                        for device in selected_devices
-                    )
-                    raise PermanentCapacityError(
-                        f"model {model!r} requires {required_mib} MiB per lane, "
-                        f"but the largest selected GPU has {capacity} MiB total",
-                        422,
-                        "model_exceeds_gpu_capacity",
-                    )
+                    capacity = sum(max(0, int(device.get("total_mib") or 0))
+                                   for device in selected_devices)
+                    if required_mib > capacity or len(selected_devices) < 2:
+                        raise PermanentCapacityError(
+                            f"model {model!r} requires {required_mib} MiB per lane, "
+                            f"but selected GPUs have {capacity} MiB combined physical capacity",
+                            422, "model_exceeds_gpu_capacity")
+                    return self._ensure_group_capacity(
+                        model, parallel, required_mib, capabilities, request_path,
+                        gpu_uuids, triggered_by)
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
@@ -3837,9 +4072,12 @@ class Broker:
                         (lane for lane in managed
                          if (lane.model != model
                              or (gpu_uuids is not None
-                                 and lane.gpu_uuid not in gpu_uuids))
+                                 and not lane.allows(gpu_uuids)))
                          and lane.in_flight == 0
-                         and lane.gpu_uuid not in blocked
+                         and not lane.loading
+                         and not set(lane.protected_scope).intersection(blocked)
+                         and (len(lane.scope) == 1 or not set(lane.protected_scope).intersection(
+                             self._reserved_gpus_locked()))
                          and lane.model not in queued_models),
                         key=lambda lane: (lane.last_used, lane.created_at),
                     )
@@ -3851,7 +4089,6 @@ class Broker:
                     retired = replaceable[:overflow]
                     for lane in retired:
                         lane.retiring = True
-                        self.lanes.pop(lane.lane_id, None)
                     if retired:
                         self.cv.notify_all()
                 if retired:
@@ -3933,6 +4170,8 @@ class Broker:
                     device_uuids = set(virtual_free)
                     with self.cv:
                         self._prune_dead_lanes_locked()
+                        group_candidate_gpus = set(gpu_uuids or SELECTED_GPUS)
+                        group_blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked()
                         queued_models = {
                             waiter.model for waiter in self.waiters
                             if waiter.model != model
@@ -3943,9 +4182,13 @@ class Broker:
                                 if lane.kind == "managed"
                                 and (lane.model != model
                                      or (gpu_uuids is not None
-                                         and lane.gpu_uuid not in gpu_uuids))
+                                         and not lane.allows(gpu_uuids)))
                                 and lane.in_flight == 0
-                                and lane.gpu_uuid in device_uuids
+                                and not lane.loading
+                                and (bool(set(lane.scope).intersection(device_uuids))
+                                     or (len(lane.scope) > 1
+                                         and bool(set(lane.scope).intersection(group_candidate_gpus))
+                                         and not set(lane.protected_scope).intersection(group_blocked)))
                                 and lane.model not in queued_models
                             ),
                             key=lambda lane: (lane.last_used, lane.created_at),
@@ -3953,7 +4196,6 @@ class Broker:
                         victim = replaceable[0] if replaceable else None
                         if victim is not None:
                             victim.retiring = True
-                            self.lanes.pop(victim.lane_id, None)
                             self.cv.notify_all()
                     if victim is None:
                         free = sorted(
@@ -3965,7 +4207,7 @@ class Broker:
                             reclaimable_later = any(
                                 lane.kind == "managed"
                                 and lane.model != model
-                                and lane.gpu_uuid in device_uuids
+                                and bool(set(lane.scope).intersection(device_uuids))
                                 for lane in self.lanes.values()
                             )
                         raise CapacityError(
@@ -3997,7 +4239,7 @@ class Broker:
                 except Exception:
                     with self.cv:
                         for lane in created:
-                            self.lanes.pop(lane.lane_id, None)
+                            lane.retiring = True
                         self.cv.notify_all()
                     self._stop_lanes(created, "capacity rollback")
                     raise
@@ -4005,7 +4247,7 @@ class Broker:
                 lanes = [lane for lane in self._lane_summaries_locked()
                          if lane["kind"] == "managed" and lane["model"] == model
                          and (gpu_uuids is None
-                              or lane["gpu_uuid"] in gpu_uuids)]
+                              or set(lane["gpu_uuids"]).issubset(gpu_uuids))]
                 admitted = sum(
                     int(lane["parallel"]) for lane in lanes
                     if lane["state"] == "ready"
@@ -4349,7 +4591,6 @@ class Broker:
             and not lane.in_flight
             and self.lanes.get(lane.lane_id) is lane
         ):
-            self.lanes.pop(lane.lane_id)
             retired = lane
         self.cv.notify_all()
         return retired
@@ -4377,11 +4618,19 @@ class Broker:
         return True
 
     def _stop_expired_lane(self, lane: Lane) -> None:
-        try:
-            self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
-            group_stopped = self._terminate_process(lane.process)
-        except CapacityError:
-            group_stopped = False
+        group_stopped = False
+        # A drain may own transition while waiting for this exact active
+        # request. Never wait for that lock: retain ownership and retry after
+        # the bounded drain finishes or aborts instead of deadlocking it.
+        acquired = self.transition.acquire(blocking=False)
+        if acquired:
+            try:
+                self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
+                group_stopped = self._terminate_process(lane.process)
+            except CapacityError:
+                pass
+            finally:
+                self.transition.release()
         if not group_stopped:
             LOG.error(
                 "managed Ollama lane did not stop after request cancellation "
@@ -4959,9 +5208,9 @@ class Broker:
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
                             and (waiter.gpu_uuids is None
-                                 or lane.gpu_uuid in waiter.gpu_uuids)
-                            and lane.gpu_uuid not in blocked_gpus
-                            and not lane.retiring]
+                                 or lane.allows(waiter.gpu_uuids))
+                            and not set(lane.scope).intersection(blocked_gpus)
+                            and not lane.retiring and not lane.loading]
                 if any(lane.in_flight < lane.parallel for lane in matching):
                     waiter.phase = "ready"
                     self.cv.notify_all()
@@ -5049,7 +5298,7 @@ class Broker:
         if not isinstance(payload, dict):
             return body
         if payload.get("keep_alive") == 0:
-            self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
+            self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
             # Do not leave an empty backend that can reload implicitly on its
             # next request. Retire it through the guarded process lifecycle.
             with self.cv:
@@ -5257,6 +5506,7 @@ class Broker:
                 "lease acquisition requires expected_duration_seconds greater than zero"
             )
         require_gpu_health(refresh=True)
+        requested_scope = requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
         with self.transition:
             with self.cv:
                 if self.pending_lease():
@@ -5270,11 +5520,12 @@ class Broker:
                         f"{visible['owner']} ({visible['justification']}; expected release "
                         f"{visible['expected_release_utc'] or 'unknown'})"
                     )
+                live = [lease for lease in self.leases.values()
+                        if lease.state in ("pending", "active", "revoking")]
+                if any(not lease.gpu_uuids for lease in live) or (not requested_scope and live):
+                    raise RuntimeError("unscoped leases require exclusive host-wide ownership")
             self.begin_drain(f"lease acquire by {owner}")
             try:
-                requested_scope = (
-                    requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
-                )
                 stopped: list[str] = []
                 # The system lane is not GPU-scoped, so unload any model it
                 # holds before measuring a scoped reservation. Managed lanes
@@ -5288,7 +5539,10 @@ class Broker:
                     aggregate_free = sum(
                         int(device["free_mib"]) for device in devices
                     )
-                    if lease_requires_exclusive_gpus(gpu_uuids):
+                    with self.cv:
+                        overlaps_group = bool(set(gpu_uuids).intersection(
+                            self._peer_reserved_gpus_locked()))
+                    if lease_requires_exclusive_gpus(gpu_uuids) or overlaps_group:
                         # Retire lanes before the owner starts peer traffic;
                         # the scope stays blocked for the lease's lifetime.
                         stopped = self.stop_pool_lanes(
@@ -5360,7 +5614,8 @@ class Broker:
                 lease.heartbeat_at = time.time()
                 self._persist_leases_locked()
             devices = gpu_snapshot()
-            self.end_drain()
+            if lease.gpu_uuids:
+                self.end_drain()
             LOG.info("lease ready owner=%s", lease.owner)
             return {"ok": True, "lease": asdict(lease), "gpus": devices,
                     "host_memory": host_memory_snapshot()}
@@ -5408,6 +5663,14 @@ class Broker:
                     raise RuntimeError(
                         f"requested GPU UUIDs are already leased: {sorted(conflicts)}"
                     )
+                if any(lane.kind == "managed"
+                       and set(requested).intersection(lane.protected_scope)
+                       and (len(lane.scope) > 1 or lease_requires_exclusive_gpus(requested))
+                       for lane in self.lanes.values()):
+                    raise RuntimeError(
+                        "live scope change would overlap managed peer traffic; "
+                        "stop the external owner and acquire a new scoped lease"
+                    )
                 baseline = lease.foreign_baseline or {}
                 outside_growth = {
                     key: used - baseline.get(key, 0)
@@ -5435,8 +5698,10 @@ class Broker:
                 self._persist_leases_locked()
                 state = lease.state
                 result = asdict(lease)
-            if state == "pending":
-                self.end_drain()
+            with self.cv:
+                if self._global_transition_lease_locked() is None:
+                    self.draining = False
+                    self.cv.notify_all()
             stopped = []
             if lease_requires_exclusive_gpus(requested):
                 # The scope is now blocked, so no new lane lands here. Retire
@@ -5514,12 +5779,11 @@ class Broker:
                 self.begin_drain(f"{reason} by {lease.owner}")
             completed = False
             try:
-                if scoped_release:
-                    stopped = []
-                    unloaded = []
-                else:
-                    stopped = self.stop_pool_lanes(reason)
-                    unloaded = self._unload_base_models()
+                # Acquisition already drained an unscoped owner. Release
+                # must never tear down CUDA alongside that owner's remaining
+                # allocations, including after a broker restart.
+                stopped = []
+                unloaded = []
                 if force:
                     # Operator override for a lease whose owner is gone. The
                     # settle check can never pass once the owner's allocation
@@ -5617,14 +5881,13 @@ class Broker:
             moved, retiring = [], []
             for lane in list(self.lanes.values()):
                 if (lane.kind != "managed" or lane.model != model
-                        or allowed is None or lane.gpu_uuid in allowed
+                        or allowed is None or lane.allows(allowed)
                         or lane.retiring):
                     continue
                 lane.retiring = True
                 if lane.in_flight:
                     retiring.append(lane.lane_id)
                 else:
-                    self.lanes.pop(lane.lane_id)
                     moved.append(lane)
             staying = sum(
                 lane.parallel for lane in self.lanes.values()
@@ -5677,7 +5940,6 @@ class Broker:
                     "retry when idle or force the stop"
                 )
             lane.retiring = True
-            self.lanes.pop(lane_id, None)
             self.cv.notify_all()
         failed = self._stop_lanes([lane], "operator stop")
         if failed:
@@ -5704,6 +5966,7 @@ class Broker:
                 record["models"][model] = record["models"].get(model, 0) + 1
             usage = record["lanes"].setdefault(lane.lane_id, {
                 "model": model or lane.model, "gpu_uuid": lane.gpu_uuid,
+                "gpu_uuids": list(lane.scope),
                 "kind": lane.kind, "requests": 0,
             })
             usage["requests"] += 1
@@ -5843,6 +6106,7 @@ class Broker:
                 model["ollama_unify_lane"] = lane.lane_id
                 if lane.gpu_uuid:
                     model["ollama_unify_gpu_uuid"] = lane.gpu_uuid
+                    model["ollama_unify_gpu_uuids"] = list(lane.scope)
                 models.append(model)
         return {"models": models}
 
@@ -5950,11 +6214,11 @@ class Broker:
                     blocked = self._unregistered_gpus_locked()
                     lanes = [lane for lane in self.lanes.values()
                              if lane.kind == "managed" and lane.in_flight == 0
-                             and lane.gpu_uuid not in blocked
+                             and not lane.loading
+                             and not set(lane.scope).intersection(blocked)
                              and (lane.retiring or lane.last_used < cutoff)]
                     for lane in lanes:
                         lane.retiring = True
-                        self.lanes.pop(lane.lane_id, None)
                     if lanes:
                         self.cv.notify_all()
                 self._stop_lanes(lanes, "idle timeout")
@@ -7753,7 +8017,7 @@ def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
                                    key=lambda item: -item[1])
     ]
     for usage in client.get("lanes") or []:
-        where = (gpu_name(usage.get("gpu_uuid"), inventory)
+        where = (gpu_list(usage.get("gpu_uuids") or [usage.get("gpu_uuid")], inventory)
                  if usage.get("kind") == "managed" else "base Ollama")
         state = "live" if usage.get("id") in live else "ended"
         details.append(
@@ -7862,7 +8126,8 @@ def build_menu_model(
 
     lane_entries = []
     for lane in sorted(lanes, key=lambda item: str(item.get("id"))):
-        gpu = gpu_name(lane.get("gpu_uuid"), inventory)
+        scope = lane.get("gpu_uuids") or [lane.get("gpu_uuid")]
+        gpu = gpu_list(scope, inventory)
         lane_entries.append({
             "key": str(lane.get("id")),
             "title": f"{lane.get('model')} · {gpu} · {lane.get('state')}",
@@ -7872,7 +8137,7 @@ def build_menu_model(
                 f"GPU: {gpu}",
                 f"State: {lane.get('state')}",
                 f"Serving: {lane.get('in_flight') or 0} of {lane.get('parallel')}",
-                f"Reserved: {memory(lane.get('reserved_mib'))}",
+                f"Reserved: {memory(sum((lane.get('reserved_mib_by_gpu') or {}).values()) or lane.get('reserved_mib'))}",
             ] + ([f"Context: {lane['resolved_context_length']} tokens"]
                  if lane.get("resolved_context_length") else [])
             + [f"Started for: {(lane.get('triggered_by') or {}).get('label', 'unknown')}"]
@@ -7898,7 +8163,8 @@ def build_menu_model(
         info = inventory.get(gpu_uuid, {})
         holders = [lease.get("owner") for lease in leases
                    if gpu_uuid in (lease.get("gpu_uuids") or [])]
-        gpu_lanes = [lane for lane in lanes if lane.get("gpu_uuid") == gpu_uuid]
+        gpu_lanes = [lane for lane in lanes if gpu_uuid in (
+            lane.get("gpu_uuids") or [lane.get("gpu_uuid")])]
         brokered = not selected_gpus or gpu_uuid in selected_gpus
         title = (
             f"{gpu_name(gpu_uuid, inventory)} · {info.get('name', 'GPU')} · "
@@ -7915,7 +8181,8 @@ def build_menu_model(
             "Lease: " + (", ".join(holders) if holders else "none"),
         ]
         details += [
-            f"Ollama: {lane.get('model')} ({memory(lane.get('reserved_mib'))})"
+            f"Ollama: {lane.get('model')} "
+            f"({memory((lane.get('reserved_mib_by_gpu') or {}).get(gpu_uuid, lane.get('reserved_mib')))})"
             for lane in gpu_lanes
         ]
         details += [

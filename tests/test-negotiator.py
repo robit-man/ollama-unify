@@ -289,15 +289,6 @@ def main():
             assert "token" not in json.dumps(pending_discovery["active_leases"])
             assert "fixture until" in pending_discovery["warnings"][0]
 
-            blocked_error = []
-            blocked = threading.Thread(
-                target=lambda: proxy_generate(proxy_port, 4096),
-                daemon=True,
-            )
-            blocked.start()
-            time.sleep(0.25)
-            assert blocked.is_alive(), "proxy request was not held during pending lease"
-
             bounded_started = time.monotonic()
             bounded_status, bounded_body, bounded_headers = proxy_generate(
                 proxy_port, 4096, admission_wait_ms=150,
@@ -315,11 +306,16 @@ def main():
 
             ready = control(socket_path, {"action": "ready", "token": token})
             assert ready["lease"]["state"] == "active"
-            blocked.join(5)
-            assert not blocked.is_alive(), (
-                "proxy request did not resume after lease readiness"
+            # Readiness cannot prove placement for a legacy unscoped owner.
+            # Keep the host blocked until that owner releases or scopes it.
+            assert control(socket_path, {"action": "status"})["draining"] is True
+            active_code, active_body, _ = proxy_generate(
+                proxy_port, 4096, admission_wait_ms=150,
             )
-            assert not blocked_error
+            assert active_code == 503, (active_code, active_body)
+            assert json.loads(active_body)["reason_code"] == "queue_admission_timeout"
+            with backend.lock:
+                assert backend.models == []
 
             daemon.terminate()
             daemon.wait(timeout=5)

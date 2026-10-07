@@ -25,7 +25,10 @@ host, port = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434").rsplit(":", 1)
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 gpu_usage_dir = os.environ.get("MOCK_OLLAMA_GPU_USAGE_DIR", "")
 gpu_usage_mib = int(os.environ.get("MOCK_OLLAMA_VRAM_MIB", "2048"))
+gpu_usage_by_gpu = json.loads(os.environ.get("MOCK_OLLAMA_GPU_USAGE_BY_GPU", "{}"))
+gpu_usage_scope = os.environ.get("MOCK_OLLAMA_GPU_USAGE_SCOPE", gpu).split(",")
 cpu_only = os.environ.get("MOCK_OLLAMA_CPU_ONLY", "0") == "1"
+partial_gpu_residency = os.environ.get("MOCK_OLLAMA_PARTIAL_GPU_RESIDENCY", "0") == "1"
 context_length = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "0") or "0")
 gpu_usage_path = (
     os.path.join(gpu_usage_dir, f"{os.getpid()}.csv") if gpu_usage_dir else ""
@@ -39,7 +42,11 @@ def set_gpu_usage(loaded):
     if loaded:
         replacement = gpu_usage_path + ".new"
         with open(replacement, "w", encoding="utf-8") as stream:
-            stream.write(f"{gpu},{gpu_usage_mib}\n")
+            for gpu_uuid in gpu_usage_scope:
+                if gpu_uuid:
+                    amount = gpu_usage_by_gpu.get(gpu_uuid, gpu_usage_mib)
+                    if int(amount) > 0:
+                        stream.write(f"{gpu_uuid},{int(amount)}\n")
         os.replace(replacement, gpu_usage_path)
     else:
         try:
@@ -88,6 +95,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         emit("request", host=f"{host}:{port}", gpu=gpu, path=self.path,
              model=model, request_id=payload.get("mock_request_id"),
              options=payload.get("options") or {}, keep_alive=payload.get("keep_alive"))
+        barrier_requests = int(payload.get("mock_barrier_requests") or 0)
+        if barrier_requests:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                with open(os.environ["MOCK_OLLAMA_EVENT_LOG"], encoding="utf-8") as stream:
+                    arrived = sum(
+                        1 for event in map(json.loads, stream)
+                        if event.get("kind") == "request"
+                        and event.get("model") == model
+                        and event.get("request_id") is not None
+                    )
+                if arrived >= barrier_requests:
+                    break
+                time.sleep(0.01)
+            else:
+                self.send_json({"error": "fixture parallel request barrier expired"}, 503)
+                return
         if self.path == "/api/generate" and model.startswith("fixture-embed:"):
             self.send_json({"error": f"{model!r} does not support generate"}, 400)
             return
@@ -172,9 +196,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.models = []
                 set_gpu_usage(False)
             elif model:
+                resident_bytes = sum(
+                    int(gpu_usage_by_gpu.get(gpu_uuid, gpu_usage_mib))
+                    for gpu_uuid in gpu_usage_scope if gpu_uuid
+                ) * 1024 * 1024
                 self.server.models = [{
                     "name": model,
-                    "size_vram": 0 if cpu_only else 1024,
+                    "size": resident_bytes,
+                    "size_vram": (0 if cpu_only else resident_bytes // 2
+                                  if partial_gpu_residency else resident_bytes),
                     "context_length": context_length,
                 }]
                 set_gpu_usage(not cpu_only)
@@ -205,7 +235,11 @@ def stop(_signum, _frame):
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 emit("start", host=f"{host}:{port}", gpu=gpu, ppid=os.getppid(),
-     context_length=context_length)
+     context_length=context_length,
+     sched_spread=os.environ.get("OLLAMA_SCHED_SPREAD"),
+     cuda_p2p=os.environ.get("GGML_CUDA_P2P"),
+     unified_memory=os.environ.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY"),
+     no_pinned=os.environ.get("GGML_CUDA_NO_PINNED"))
 try:
     server.serve_forever()
 finally:
