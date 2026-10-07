@@ -2009,6 +2009,7 @@ def discovery_document() -> dict[str, Any]:
                     "lease_transition",
                     "lane_capacity_wait",
                     "reclaimable_placement_wait",
+                    "background_capacity_deferred",
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
                     "model_context_memory_unverified",
@@ -2684,6 +2685,13 @@ class PermanentCapacityError(CapacityError):
             queue_position=queue_position,
             queue_ticket=queue_ticket,
         )
+
+
+class BackgroundCapacityDeferred(CapacityError):
+    """Yield optional work without reclaiming another resident model."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, 503, "background_capacity_deferred", True, 2)
 
 
 class AdmissionTimeoutError(CapacityError):
@@ -4067,6 +4075,7 @@ class Broker:
         gpu_uuids: tuple[str, ...] | None,
         triggered_by: dict[str, str] | None,
         expected_profile: Any = CONTEXT_PROFILE_UNSET,
+        *, allow_reclaim: bool = True,
     ) -> dict[str, Any]:
         """Create exclusive whole-process peer groups under the transition lock.
 
@@ -4125,6 +4134,10 @@ class Broker:
             with self.cv:
                 victims = [lane for lane in self.lanes.values()
                            if lane.kind == "managed" and set(lane.scope).intersection(members)]
+                if victims and not allow_reclaim:
+                    raise BackgroundCapacityDeferred(
+                        "background work yields because GPU group placement would retire resident lanes"
+                    )
                 if any(lane.in_flight or lane.loading or lane.model in queued_models
                        or set(lane.protected_scope).intersection(blocked) for lane in victims):
                     raise CapacityError("GPU group still has active owners",
@@ -4170,6 +4183,7 @@ class Broker:
         request_path: str = "",
         gpu_uuids: tuple[str, ...] | None = None,
         triggered_by: dict[str, str] | None = None,
+        *, allow_reclaim: bool = True,
     ) -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
@@ -4234,6 +4248,10 @@ class Broker:
                 stale = [lane for lane in self.lanes.values()
                          if lane.kind == "managed" and lane.model == model
                          and not lane.context_profile_matches()]
+                if stale and not allow_reclaim:
+                    raise BackgroundCapacityDeferred(
+                        "background work yields because the resident model context would need replacement"
+                    )
                 if any(lane.in_flight or lane.loading for lane in stale):
                     raise CapacityError("previous model context identity is still in use",
                                         503, "model_context_identity_changed")
@@ -4275,7 +4293,8 @@ class Broker:
                             422, "model_exceeds_gpu_capacity")
                     return self._ensure_group_capacity(
                         model, parallel, required_mib, capabilities, request_path,
-                        gpu_uuids, triggered_by, expected_profile)
+                        gpu_uuids, triggered_by, expected_profile,
+                        allow_reclaim=allow_reclaim)
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
@@ -4284,6 +4303,10 @@ class Broker:
                     overflow = max(
                         0, len(managed) + missing - POOL_MAX_SERVERS,
                     )
+                    if overflow and not allow_reclaim:
+                        raise BackgroundCapacityDeferred(
+                            "background work yields because the managed lane limit requires replacement"
+                        )
                     queued_models = {
                         waiter.model for waiter in self.waiters
                         if waiter.model != model
@@ -4386,6 +4409,11 @@ class Broker:
                         virtual_free[chosen_uuid] -= required_mib
                     if len(placements) == missing:
                         break
+
+                    if not allow_reclaim:
+                        raise BackgroundCapacityDeferred(
+                            "background work yields because no unreserved GPU placement fits without reclamation"
+                        )
 
                     device_uuids = set(virtual_free)
                     with self.cv:
@@ -5458,6 +5486,10 @@ class Broker:
                     waiter.request_path,
                     waiter.gpu_uuids,
                     triggered_by=waiter.client,
+                    allow_reclaim=not (
+                        waiter.workload_class == "background"
+                        and waiter.queue_policy == "yield"
+                    ),
                 )
                 with self.cv:
                     self.reconcile_retry_at = 0.0
@@ -5466,7 +5498,7 @@ class Broker:
                     if waiter in self.waiters:
                         waiter.phase = "ready"
                     self.cv.notify_all()
-            except PermanentCapacityError as exc:
+            except (PermanentCapacityError, BackgroundCapacityDeferred) as exc:
                 message = str(exc)
                 with self.cv:
                     if waiter in self.waiters:
@@ -5489,7 +5521,10 @@ class Broker:
                     self.reconcile_last_error = ""
                     self.reconciling_model = None
                     self.cv.notify_all()
-                LOG.error("managed capacity rejected model=%s: %s", model, message)
+                if isinstance(exc, BackgroundCapacityDeferred):
+                    LOG.info("background capacity deferred model=%s: %s", model, message)
+                else:
+                    LOG.error("managed capacity rejected model=%s: %s", model, message)
             except (CapacityError, OSError, RuntimeError, TimeoutError) as exc:
                 message = str(exc)
                 reason_code = (

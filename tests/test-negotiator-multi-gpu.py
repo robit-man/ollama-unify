@@ -57,6 +57,50 @@ def acquire(case, scope):
 
 
 class MultiGpuIntegrationTests(unittest.TestCase):
+    def test_background_embedding_yields_without_evicting_idle_group(self):
+        embedding = {'name': 'fixture-embed:latest', 'model': 'fixture-embed:latest',
+                     'size': 256 * 1024**2, 'capabilities': ['embedding']}
+        with harness(selected_gpus=PAIR, tags=[LARGE_TAG, embedding]) as case:
+            code, capacity, _ = case.capacity(LARGE, gpu_uuids=PAIR)
+            self.assertEqual(code, 200, capacity)
+            lane_id = capacity['lanes'][0]['id']
+            result = p.http_json(
+                case.proxy_port, 'POST', '/api/embed',
+                {'model': embedding['name'], 'input': ['optional memory']},
+                extra_headers={
+                    'X-Ollama-Unify-Workload-Class': 'background',
+                    'X-Ollama-Unify-Queue-Policy': 'yield',
+                    'X-Ollama-Unify-Logical-Request-Id': 'optional:embedding',
+                },
+            )
+            self.assertEqual(result[0], 503, result)
+            self.assertEqual(result[1]['reason_code'], 'background_capacity_deferred')
+            self.assertTrue(result[1]['retryable'])
+            self.assertNotIn('admission_retained', result[1])
+            queue = case.status()['parallel_pool']['queue']
+            self.assertEqual(queue['depth'], 0)
+            self.assertEqual(queue['retained_request_bytes'], 0)
+            self.assertEqual([lane['id'] for lane in p.managed_lanes(case.status())], [lane_id])
+            self.assertEqual(len(starts(case)), 1)
+            self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'stop'])
+            reused = p.chat(case.proxy_port, LARGE, 'foreground-after-optional', gpu_uuids=PAIR)
+            self.assertEqual(reused[0], 200, reused)
+            self.assertEqual(reused[2]['X-Ollama-Unify-Lane'], lane_id)
+
+    def test_background_group_cannot_retire_overlapping_singleton(self):
+        with harness(selected_gpus=PAIR, runner_vram_by_gpu={}) as case:
+            code, first, _ = case.capacity(p.MODEL, gpu_uuids=[PAIR[0]])
+            self.assertEqual(code, 200, first)
+            result = p.chat(case.proxy_port, LARGE, 'optional-group', gpu_uuids=PAIR,
+                            workload_class='background', queue_policy='yield')
+            self.assertEqual(result[0], 503, result)
+            self.assertEqual(result[1]['reason_code'], 'background_capacity_deferred')
+            self.assertTrue(result[1]['retryable'])
+            self.assertEqual([lane['id'] for lane in p.managed_lanes(case.status())],
+                             [first['lanes'][0]['id']])
+            self.assertEqual(len(starts(case)), 1)
+            self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'stop'])
+
     def test_oversized_model_loads_one_exact_group_with_observed_accounting(self):
         with harness() as case:
             code, capacity, _ = case.capacity(LARGE, gpu_uuids=PAIR)
@@ -278,6 +322,23 @@ class MultiGpuLifecycleTests(unittest.TestCase):
         alive = mock.patch.object(n, 'process_group_alive', return_value=True)
         alive.start()
         self.addCleanup(alive.stop)
+
+    def test_background_context_replacement_preserves_resident_identity(self):
+        with mock.patch.object(n, 'require_gpu_health'), mock.patch.object(
+            n, 'AUTO_MODEL_CONTEXT', False
+        ), mock.patch.object(n, 'POOL_ENABLED', True), mock.patch.object(
+            n, 'POOL_MAX_SERVERS', 4
+        ), mock.patch.object(n, 'effective_model_context_profile', return_value=None), mock.patch.object(
+            self.lane, 'context_profile_matches', return_value=False
+        ), mock.patch.object(self.broker, '_stop_lanes') as stop:
+            with self.assertRaises(n.BackgroundCapacityDeferred) as raised:
+                self.broker.ensure_capacity(LARGE, 1, allow_reclaim=False)
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(raised.exception.reason_code, 'background_capacity_deferred')
+        self.assertTrue(raised.exception.retryable)
+        self.assertIs(self.broker.lanes['group'], self.lane)
+        self.assertFalse(self.lane.retiring)
+        stop.assert_not_called()
 
     def test_failed_process_exit_retains_all_member_reservations(self):
         with mock.patch.object(n, 'foreign_gpu_usage', return_value={}), mock.patch.object(

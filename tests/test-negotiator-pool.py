@@ -1903,6 +1903,86 @@ def test_idle_lane_replacement(helper, fixture_bin):
         assert lanes[0]["model"] == OTHER_MODEL
 
 
+def test_background_yield_preserves_idle_lane_at_process_ceiling(helper, fixture_bin):
+    for replacement_class, replacement_policy in (
+        ("foreground", "yield"), ("background", "wait"),
+    ):
+        with PoolHarness(
+            helper, fixture_bin, max_servers=1, tags=[MODEL, OTHER_MODEL]
+        ) as harness:
+            status, first, _ = harness.capacity(MODEL)
+            assert status == 200, first
+            first_lane = first["lanes"][0]["id"]
+            started = time.monotonic()
+            result = chat(
+                harness.proxy_port, OTHER_MODEL, "optional-replacement",
+                logical_request_id="turn:optional-replacement",
+                workload_class="background", queue_policy="yield",
+            )
+            assert result[0] == 503, result
+            assert result[1]["reason_code"] == "background_capacity_deferred"
+            assert result[1]["retryable"] is True
+            assert result[2]["X-Ollama-Unify-Retryable"] == "true"
+            assert "Retry-After" in result[2]
+            assert "admission_retained" not in result[1]
+            assert time.monotonic() - started < 2, result
+            pool = harness.status()["parallel_pool"]
+            assert pool["queue"]["depth"] == 0
+            assert pool["queue"]["retained_request_bytes"] == 0
+            assert [lane["id"] for lane in managed_lanes(harness.status())] == [first_lane]
+            assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
+            assert not any(event.get("request_id") == "optional-replacement"
+                           for event in request_events(harness.event_log))
+            reused = chat(harness.proxy_port, MODEL, "still-warm")
+            assert reused[0] == 200, reused
+            assert reused[2]["X-Ollama-Unify-Lane"] == first_lane
+
+            # Only the explicit background/yield combination is non-disruptive.
+            replacement = chat(
+                harness.proxy_port, OTHER_MODEL, "allowed-replacement",
+                workload_class=replacement_class, queue_policy=replacement_policy,
+            )
+            assert replacement[0] == 200, replacement
+            assert replacement[2]["X-Ollama-Unify-Lane"] != first_lane
+            assert len([event for event in events(harness.event_log)
+                        if event["kind"] == "stop"]) == 1
+
+
+def test_background_yield_preserves_vram_without_process_overflow(helper, fixture_bin):
+    model_size = 60 * 1024**3
+    tags = [{"name": model, "model": model, "size": model_size,
+             "capabilities": ["completion"]} for model in (MODEL, OTHER_MODEL)]
+    with PoolHarness(
+        helper, fixture_bin, max_servers=4, tags=tags,
+        selected_gpus=["GPU-large-0"],
+        runner_vram_mib=model_size // (1024 * 1024) + 1024,
+    ) as harness:
+        status, first, _ = harness.capacity(MODEL)
+        assert status == 200, first
+        result = chat(harness.proxy_port, OTHER_MODEL, "optional-vram",
+                      workload_class="background", queue_policy="yield")
+        assert result[0] == 503, result
+        assert result[1]["reason_code"] == "background_capacity_deferred"
+        assert result[1]["retryable"] is True
+        assert [lane["id"] for lane in managed_lanes(harness.status())] == [first["lanes"][0]["id"]]
+        assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
+
+
+def test_background_yield_can_cold_load_free_capacity_and_reuse_it(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin, max_servers=2,
+                     tags=[MODEL, OTHER_MODEL]) as harness:
+        assert harness.capacity(MODEL)[0] == 200
+        first = chat(harness.proxy_port, OTHER_MODEL, "optional-free-placement",
+                     workload_class="background", queue_policy="yield")
+        assert first[0] == 200, first
+        reused = chat(harness.proxy_port, OTHER_MODEL, "optional-reuse",
+                      workload_class="background", queue_policy="yield")
+        assert reused[0] == 200, reused
+        assert reused[2]["X-Ollama-Unify-Lane"] == first[2]["X-Ollama-Unify-Lane"]
+        assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 2
+        assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
+
+
 def test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin):
     model_size = 60 * 1024**3
     tags = [
@@ -3298,6 +3378,9 @@ def main():
     test_native_explicit_unload_retires_backend(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
+    test_background_yield_preserves_idle_lane_at_process_ceiling(helper, fixture_bin)
+    test_background_yield_preserves_vram_without_process_overflow(helper, fixture_bin)
+    test_background_yield_can_cold_load_free_capacity_and_reuse_it(helper, fixture_bin)
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
