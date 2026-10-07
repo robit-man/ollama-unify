@@ -1768,6 +1768,8 @@ def test_foreign_gpu_transition_stability(helper, fixture_bin):
         assert not [event for event in events(harness.event_log) if event["kind"] == "stop"]
         assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
         write_compute_apps(harness.compute_apps, [])
+        wait_until(lambda: not harness.status()["unregistered_gpu_quarantine"],
+                   "foreign process exit observed before resident lane reuse")
         status, capacity, _ = harness.capacity(MODEL, gpu_uuids=[start["gpu"]])
         assert status == 200, capacity
         assert len([event for event in events(harness.event_log) if event["kind"] == "start"]) == 1
@@ -1801,6 +1803,19 @@ def test_unregistered_peer_work_defers_every_lane_transition(helper, fixture_bin
         assert set(lane["gpu_uuid"] for lane in managed_lanes(harness.status())) == set(pair)
         write_compute_apps(harness.compute_apps, [])
         wait_until(lambda: not managed_lanes(harness.status()), "deferred lanes retire after peer exit", timeout=12)
+
+
+def test_native_explicit_unload_retires_backend(helper, fixture_bin):
+    with PoolHarness(helper, fixture_bin) as harness:
+        code, capacity, _ = harness.capacity(MODEL, gpu_uuids=['GPU-large-0'])
+        assert code == 200, capacity
+        code, response, _ = http_json(harness.proxy_port, 'POST', '/api/generate',
+                                     {'model': MODEL, 'keep_alive': 0, 'stream': False},
+                                     extra_headers={'X-Ollama-Unify-GPU-UUIDs': 'GPU-large-0'})
+        assert code == 200, response
+        wait_until(lambda: any(event['kind'] == 'stop' for event in events(harness.event_log)),
+                   'explicit unload retires the empty backend')
+        assert not managed_lanes(harness.status())
 
 
 
@@ -3235,6 +3250,7 @@ def main():
     test_operator_model_gpu_policy(helper, fixture_bin)
     test_foreign_gpu_transition_stability(helper, fixture_bin)
     test_unregistered_peer_work_defers_every_lane_transition(helper, fixture_bin)
+    test_native_explicit_unload_retires_backend(helper, fixture_bin)
     test_implicit_latest_uses_one_lane(helper, fixture_bin)
     test_idle_lane_replacement(helper, fixture_bin)
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)

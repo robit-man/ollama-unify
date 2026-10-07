@@ -104,6 +104,22 @@ class GpuHealthTests(unittest.TestCase):
             self.assertIsNone(broker._select_lane_locked('fixture:latest', True))
             self.assertIs(broker._select_lane_locked('', False), broker.lanes['base'])
 
+    def test_explicit_native_unload_refreshes_telemetry_then_retires_backend(self):
+        broker = n.Broker()
+        lane = n.Lane('test', 'managed', '127.0.0.1', 1, 'GPU-selected',
+                      'fixture:latest', 1, 4096, 0, 0, mock.Mock())
+        body = b'{"model":"fixture:latest","keep_alive":0}'
+        with mock.patch.object(n, 'foreign_gpu_usage', return_value={}) as usage:
+            broker._unregistered_gpus_locked()
+            usage.return_value = {'123@GPU-selected': 4096}
+            with self.assertRaises(n.CapacityError):
+                broker.prepare_managed_body(lane, '/api/generate', body)
+            self.assertFalse(lane.retiring)
+            usage.return_value = {}
+            prepared = broker.prepare_managed_body(lane, '/api/generate', body)
+            self.assertEqual(json.loads(prepared)['keep_alive'], 0)
+            self.assertTrue(lane.retiring)
+
     def test_unknown_memory_size_still_identifies_foreign_context(self):
         with mock.patch.object(n.subprocess, 'run', return_value=subprocess.CompletedProcess(
             [], 0, '123, GPU-selected, [N/A]\n', ''

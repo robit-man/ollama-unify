@@ -5039,6 +5039,28 @@ class Broker:
                 if changed:
                     LOG.warning("managed capacity queued model=%s: %s", model, message)
 
+    def prepare_managed_body(self, lane: Lane, path: str, body: bytes) -> bytes:
+        if lane.kind != "managed" or path not in NATIVE_MODEL_PATHS or not body:
+            return body
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            return body
+        if not isinstance(payload, dict):
+            return body
+        if payload.get("keep_alive") == 0:
+            self._require_safe_gpu_transition(str(lane.gpu_uuid or ""))
+            # Do not leave an empty backend that can reload implicitly on its
+            # next request. Retire it through the guarded process lifecycle.
+            with self.cv:
+                lane.retiring = True
+                self.cv.notify_all()
+            LOG.info("managed explicit unload id=%s gpu=%s model=%s",
+                     lane.lane_id, lane.gpu_uuid, lane.model)
+        else:
+            payload["keep_alive"] = -1
+        return json.dumps(payload, separators=(",", ":")).encode()
+
     def proxy_exit(
         self,
         admission: Admission,
@@ -6464,14 +6486,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         lane = admission.lane
-        if lane.kind == "managed" and path in NATIVE_MODEL_PATHS and body:
-            try:
-                managed_payload = json.loads(body)
-                if isinstance(managed_payload, dict) and managed_payload.get("keep_alive") != 0:
-                    managed_payload["keep_alive"] = -1
-                    body = json.dumps(managed_payload, separators=(",", ":")).encode()
-            except (TypeError, ValueError):
-                pass
+        try:
+            body = self.broker.prepare_managed_body(lane, path, body)
+        except CapacityError as exc:
+            self.broker.proxy_exit(admission, model, False)
+            with self.broker.cv:
+                queue = self.broker._queue_summary_locked()
+            self._send_capacity_failure(
+                exc, request_id=request_id, logical_request_id=logical_request_id,
+                workload_class=workload_class, queue_policy=queue_policy, queue=queue,
+            )
+            return
         client_key = self.broker.record_client_use(
             self._client_identity(), lane, model
         )
