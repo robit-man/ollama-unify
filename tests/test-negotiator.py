@@ -171,7 +171,8 @@ def main():
         assert discovery["lease_policy"]["required_acquire_fields"] == [
             "owner", "justification", "expected_duration_seconds",
         ]
-        assert discovery["warnings"]
+        assert any("Live lease state is unavailable" in warning
+                   for warning in discovery["warnings"])
         instructions = subprocess.run(
             [helper, "agent-instructions"],
             env=env,
@@ -205,6 +206,21 @@ def main():
                 time.sleep(0.05)
             else:
                 raise RuntimeError("negotiator did not become ready")
+
+            empty_discovery = well_known(proxy_port)
+            assert empty_discovery["active_leases"] == []
+            assert empty_discovery["warnings"] == [], empty_discovery["warnings"]
+            assert empty_discovery["lease_policy"]["required_acquire_fields"] == [
+                "owner", "justification", "expected_duration_seconds",
+            ]
+            empty_status = control(socket_path, {"action": "status"})
+            assert empty_status["lease_summaries"] == []
+            assert empty_status["warnings"] == [], empty_status["warnings"]
+            empty_cli = subprocess.run(
+                [helper, "discover"], env=env, check=True,
+                capture_output=True, text=True,
+            )
+            assert json.loads(empty_cli.stdout)["warnings"] == []
 
             proxy_generate(proxy_port)
             with backend.lock:
