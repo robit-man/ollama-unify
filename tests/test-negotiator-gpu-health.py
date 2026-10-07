@@ -77,7 +77,9 @@ class GpuHealthTests(unittest.TestCase):
                       'fixture:latest', 1, 4096, 0, 0, mock.Mock())
         with mock.patch.object(n, 'foreign_gpu_usage', return_value={'123@GPU-selected': 4096}), mock.patch.object(
             n, 'unload_models_at'
-        ) as unload, mock.patch.object(broker, '_terminate_process') as terminate:
+        ) as unload, mock.patch.object(broker, '_terminate_process') as terminate, mock.patch.object(
+            n, 'process_group_alive', return_value=True
+        ):
             self.assertEqual(broker._stop_lanes([lane], 'fixture'), [lane])
             self.assertIs(broker.lanes['test'], lane)
             self.assertTrue(lane.retiring)

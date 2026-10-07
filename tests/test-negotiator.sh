@@ -69,10 +69,13 @@ python3 "$repo_dir/tests/test-client-identity.py" "$test_tmp/ollama-unify-gpu-ne
 python3 "$repo_dir/tests/test-negotiator-gpu-health.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
   "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/test-tray.py" "$repo_dir/tests/test-client-identity.py" \
+  "$repo_dir/tests/test-negotiator-multi-gpu.py" \
   "$repo_dir/tests/fixtures/bin/ollama"
 "$test_tmp/ollama-unify-gpu-negotiator" self-test
 python3 "$repo_dir/tests/test-negotiator.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin" \
   "$repo_dir/ollama-unify.sh"
 python3 "$repo_dir/tests/test-negotiator-pool.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+python3 "$repo_dir/tests/test-negotiator-multi-gpu.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
