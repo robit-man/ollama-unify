@@ -3312,6 +3312,10 @@ class Broker:
             return None
         if POOL_ENABLED:
             return None
+        if blocked_gpus:
+            # A legacy system backend has no exact UUID scope. It must not
+            # bypass scoped quarantine or an exclusive peer lease.
+            return None
         if any(lane.kind == "managed" for lane in self.lanes.values()):
             return None
         return base if base.in_flight < base.parallel else None
