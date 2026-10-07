@@ -20,28 +20,40 @@ EMBED_MODEL = "fixture-embed:latest"
 REJECT_MODEL = "fixture-reject:latest"
 RETRY_MODEL = "fixture-retry:latest"
 MODEL_DIGEST = "a" * 64
+FIXTURE_MODEL_INFO = {
+    "general.architecture": "fixture",
+    "fixture.context_length": 262144,
+    "fixture.block_count": 2,
+    "fixture.embedding_length": 128,
+    "fixture.attention.head_count": 2,
+    "fixture.attention.head_count_kv": 1,
+    "fixture.attention.key_length": 64,
+    "fixture.attention.value_length": 64,
+}
 
 
 class Backend(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, tags=None):
+    def __init__(self, tags=None, model_info=None):
         super().__init__(("127.0.0.1", 0), Handler)
         self.models = []
         names = tags if tags is not None else [MODEL]
         self.tags = []
         for item in names:
             if isinstance(item, dict):
-                self.tags.append(dict(item))
+                self.tags.append({"digest": MODEL_DIGEST, **item})
             else:
                 self.tags.append({
                     "name": item,
                     "model": item,
+                    "digest": MODEL_DIGEST,
                     "size": 1024**3,
                     "capabilities": ["completion"],
                 })
         self.lock = threading.Lock()
+        self.model_info = dict(FIXTURE_MODEL_INFO if model_info is None else model_info)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -73,10 +85,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/api/show":
             self.send_json({
-                "model_info": {
-                    "general.architecture": "fixture",
-                    "fixture.context_length": 262144,
-                },
+                "model_info": self.server.model_info,
+                "capabilities": next((tag.get("capabilities", ["completion"])
+                                      for tag in self.server.tags
+                                      if tag.get("name") == payload.get("model")), ["completion"]),
             })
             return
         with self.server.lock:
@@ -405,7 +417,8 @@ class PoolHarness:
                  profile="cuda_triple", selected_gpus=None,
                  cpu_only=False, max_context=0, idle_timeout=30,
                  runner_vram_by_gpu=None, runner_gpu_scope=None,
-                 partial_gpu_residency=False):
+                 partial_gpu_residency=False, auto_model_context=False,
+                 model_info=None, runner_context_length=None):
         self.profile = profile
         self.selected_gpus = selected_gpus or [
             "GPU-large-0", "GPU-large-1", "GPU-large-2",
@@ -438,6 +451,9 @@ class PoolHarness:
         self.runner_vram_by_gpu = runner_vram_by_gpu or {}
         self.runner_gpu_scope = runner_gpu_scope
         self.partial_gpu_residency = partial_gpu_residency
+        self.auto_model_context = auto_model_context
+        self.model_info = model_info
+        self.runner_context_length = runner_context_length
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ollama-unify-pool-case-")
@@ -448,7 +464,7 @@ class PoolHarness:
         self.gpu_usage_dir = os.path.join(self.temp_dir, "gpu-usage")
         os.mkdir(self.gpu_usage_dir)
         write_compute_apps(self.compute_apps, [])
-        self.backend = Backend(self.tags)
+        self.backend = Backend(self.tags, self.model_info)
         threading.Thread(target=self.backend.serve_forever, daemon=True).start()
         self.proxy_port = free_port()
         pool_port = free_port()
@@ -463,6 +479,10 @@ class PoolHarness:
             "MOCK_OLLAMA_GPU_USAGE_BY_GPU": json.dumps(self.runner_vram_by_gpu),
             "MOCK_OLLAMA_CPU_ONLY": "1" if self.cpu_only else "0",
             "MOCK_OLLAMA_PARTIAL_GPU_RESIDENCY": "1" if self.partial_gpu_residency else "0",
+            "MOCK_OLLAMA_MODEL_DIGESTS": json.dumps({
+                str(tag.get("name") or tag.get("model")): tag.get("digest")
+                for tag in self.backend.tags
+            }),
             "OLLAMA_UNIFY_CONFIG": os.path.join(self.temp_dir, "missing.conf"),
             "OLLAMA_UNIFY_BACKEND": f"127.0.0.1:{self.backend.server_port}",
             "OLLAMA_UNIFY_LISTEN": f"127.0.0.1:{self.proxy_port}",
@@ -478,6 +498,9 @@ class PoolHarness:
                 self.model_context_profiles or {}
             ),
             "OLLAMA_UNIFY_MAX_CONTEXT": str(self.max_context),
+            # Scheduler fixtures retain their deliberate small fixed memory
+            # promises; automatic maximum/KV admission has separate cases.
+            "OLLAMA_UNIFY_AUTO_MODEL_CONTEXT": "1" if self.auto_model_context else "0",
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": str(self.max_servers),
             "OLLAMA_UNIFY_POOL_MAX_QUEUE": str(self.max_queue),
@@ -526,6 +549,8 @@ class PoolHarness:
                 self.client_lane_history_limit
             ),
         })
+        if self.runner_context_length is not None:
+            env["MOCK_OLLAMA_CONTEXT_LENGTH"] = str(self.runner_context_length)
         if self.runner_gpu_scope is not None:
             env["MOCK_OLLAMA_GPU_USAGE_SCOPE"] = ",".join(self.runner_gpu_scope)
         self.daemon = subprocess.Popen(
@@ -587,6 +612,7 @@ def test_existing_pool_contract(helper, fixture_bin):
             "OLLAMA_UNIFY_BACKEND_TYPE": "cuda",
             "OLLAMA_UNIFY_SELECTED_GPUS": "GPU-large-0,GPU-large-1,GPU-large-2",
             "OLLAMA_UNIFY_POOL_ENABLED": "1",
+            "OLLAMA_UNIFY_AUTO_MODEL_CONTEXT": "0",
             "OLLAMA_UNIFY_POOL_MAX_SERVERS": "3",
             "OLLAMA_UNIFY_POOL_PORT_START": str(pool_port),
             "OLLAMA_UNIFY_POOL_INSTANCE_PARALLEL": "1",
@@ -839,11 +865,12 @@ def test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin):
             "/.well-known/ollama-unify-gpu-negotiator",
         )
         assert status == 200, discovery
-        assert discovery["context_policy"] == {
-            "default_max_context": 0,
-            "model_profiles": {MODEL: profile},
-            "profile_context_is_fixed": True,
-        }
+        policy = discovery["context_policy"]
+        assert policy["default_max_context"] == 0
+        assert policy["model_profiles"] == {MODEL: profile}
+        assert policy["profile_context_is_fixed"] is True
+        assert policy["managed_context_policy"] == "legacy_default"
+        assert policy["model_query_parameter"] == "model"
 
         status, capacity, _ = harness.capacity(MODEL)
         assert status == 200, capacity

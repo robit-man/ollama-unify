@@ -29,7 +29,9 @@ gpu_usage_by_gpu = json.loads(os.environ.get("MOCK_OLLAMA_GPU_USAGE_BY_GPU", "{}
 gpu_usage_scope = os.environ.get("MOCK_OLLAMA_GPU_USAGE_SCOPE", gpu).split(",")
 cpu_only = os.environ.get("MOCK_OLLAMA_CPU_ONLY", "0") == "1"
 partial_gpu_residency = os.environ.get("MOCK_OLLAMA_PARTIAL_GPU_RESIDENCY", "0") == "1"
-context_length = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "0") or "0")
+context_length = int(os.environ.get("MOCK_OLLAMA_CONTEXT_LENGTH",
+                                   os.environ.get("OLLAMA_CONTEXT_LENGTH", "0")) or "0")
+model_digests = json.loads(os.environ.get("MOCK_OLLAMA_MODEL_DIGESTS", "{}"))
 gpu_usage_path = (
     os.path.join(gpu_usage_dir, f"{os.getpid()}.csv") if gpu_usage_dir else ""
 )
@@ -202,6 +204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ) * 1024 * 1024
                 self.server.models = [{
                     "name": model,
+                    "digest": model_digests.get(model),
                     "size": resident_bytes,
                     "size_vram": (0 if cpu_only else resident_bytes // 2
                                   if partial_gpu_residency else resident_bytes),
