@@ -7642,7 +7642,9 @@ def lease_run(args: argparse.Namespace) -> int:
 def self_test() -> int:
     global MAX_CONTEXT
     MAX_CONTEXT = 8192
-    original = json.dumps({"model": "test", "options": {
+    # Test request shaping without requiring a synthetic installed model.
+    # Exact model metadata admission is covered by the model-context suite.
+    original = json.dumps({"options": {
         "num_gpu": 999, "main_gpu": 2, "num_ctx": 262144,
     }}).encode()
     clamped = json.loads(clamp_request("/api/generate", "application/json", original))
