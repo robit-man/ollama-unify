@@ -1935,7 +1935,7 @@ def discovery_document() -> dict[str, Any]:
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
         "lease_policy": lease_policy_document(),
         "active_leases": [],
-        "warnings": [lease_visibility_warning([])] + gpu_health_warnings(health),
+        "warnings": gpu_health_warnings(health),
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
         "client_history_policy": {
@@ -2527,19 +2527,21 @@ def lease_public_summary(
     }
 
 
-def lease_visibility_warning(summaries: list[dict[str, Any]]) -> str:
+def lease_visibility_warnings(summaries: list[dict[str, Any]]) -> list[str]:
     if not summaries:
-        return LEASE_COORDINATION_WARNING + " No active external leases are registered."
+        # Coordination requirements remain in lease_policy. A confirmed empty
+        # lease list is healthy state, not an operational warning.
+        return []
     visible = []
     for lease in summaries:
         horizon = lease.get("expected_release_utc") or "unknown release time"
         visible.append(f"{lease.get('owner')} until {horizon}")
-    return (
+    return [(
         LEASE_COORDINATION_WARNING
         + " Active external leases: "
         + "; ".join(visible)
         + "."
-    )
+    )]
 
 
 def process_group_alive(process: Any) -> bool:
@@ -6378,7 +6380,7 @@ class Broker:
                 "last_reason": reason, "leases": leases,
                 "lease_policy": lease_policy_document(),
                 "lease_summaries": lease_summaries,
-                "warnings": [lease_visibility_warning(lease_summaries)]
+                "warnings": lease_visibility_warnings(lease_summaries)
                 + gpu_health_warnings(health)
                 + (["Unregistered CUDA activity or unavailable process telemetry: "
                     "model load/unload deferred on " + ", ".join(unregistered_gpus)]
@@ -6775,7 +6777,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "model load/unload deferred on " + ", ".join(unregistered_gpus)
                     )
                 document["active_leases"] = lease_summaries
-                document["warnings"][0] = lease_visibility_warning(lease_summaries)
+                document["warnings"] = lease_visibility_warnings(lease_summaries) + document["warnings"]
                 document["parallel_pool"]["lanes"] = self.broker._lane_summaries_locked()
                 document["parallel_pool"]["queue"] = self.broker._queue_summary_locked()
                 document["parallel_pool"]["request_lifecycle"] = (
@@ -7733,7 +7735,7 @@ def main() -> int:
                 device["selected_for_ollama"] = not selected or device.get("uuid") in selected
             if "enabled" in live_status.get("parallel_pool", {}):
                 document["parallel_pool"]["enabled"] = live_status["parallel_pool"]["enabled"]
-            document["warnings"] = [lease_visibility_warning(summaries)] + gpu_health_warnings(document["gpu_health"])
+            document["warnings"] = lease_visibility_warnings(summaries) + gpu_health_warnings(document["gpu_health"])
             if document.get("unregistered_gpu_quarantine"):
                 document["warnings"].append(
                     "Unregistered CUDA activity or unavailable process telemetry: "
@@ -7741,10 +7743,10 @@ def main() -> int:
                     + ", ".join(document["unregistered_gpu_quarantine"])
                 )
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
-            document["warnings"][0] = (
+            document["warnings"].insert(0, (
                 LEASE_COORDINATION_WARNING
                 + " Live lease state is unavailable; do not assume GPUs are unleased."
-            )
+            ))
         print(json.dumps(document, indent=2, sort_keys=True))
         return 0
     if args.command_name == "agent-instructions":

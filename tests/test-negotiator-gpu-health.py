@@ -257,12 +257,14 @@ class GpuHealthTests(unittest.TestCase):
                   'missing_selected_gpu_ids': [], 'error': None}
         for unavailable in (False, True):
             with self.subTest(unavailable=unavailable), mock.patch.object(sys, 'argv', ['broker', 'discover']), mock.patch.object(
-                n, 'discovery_document', return_value={'gpu_health': health, 'warnings': ['lease warning', *n.gpu_health_warnings(health)]}
+                n, 'discovery_document', return_value={'gpu_health': health, 'warnings': n.gpu_health_warnings(health)}
             ), mock.patch.object(n, 'send_control', return_value={'leases': []}, side_effect=OSError('offline') if unavailable else None), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(n.main(), 0)
                 document = json.loads(output.getvalue())
-                self.assertEqual(len(document['warnings']), 2)
-                self.assertIn('New GPU work is blocked', document['warnings'][1])
+                self.assertEqual(len(document['warnings']), 2 if unavailable else 1)
+                self.assertIn('New GPU work is blocked', document['warnings'][-1])
+                if unavailable:
+                    self.assertIn('Live lease state is unavailable', document['warnings'][0])
 
     def test_cli_discovery_uses_daemon_quarantine_instead_of_file_defaults(self):
         healthy = {'supported': True, 'admission_blocked': False,
@@ -270,7 +272,7 @@ class GpuHealthTests(unittest.TestCase):
         document = {'selected_gpu_ids': ['GPU-selected', 'GPU-quarantined'],
                     'selected_gpu_count': 2, 'gpu_health': {'admission_blocked': True},
                     'parallel_pool': {'enabled': True}, 'gpus': [],
-                    'warnings': ['lease warning', 'stale fault warning']}
+                    'warnings': ['stale fault warning']}
         live = {'leases': [], 'selected_gpu_ids': ['GPU-selected'], 'selected_gpu_count': 1,
                 'gpu_health': healthy, 'gpus': [{'uuid': 'GPU-selected'}, {'uuid': 'GPU-display'}],
                 'parallel_pool': {'enabled': False}}
@@ -283,8 +285,22 @@ class GpuHealthTests(unittest.TestCase):
         self.assertEqual(actual['selected_gpu_count'], 1)
         self.assertFalse(actual['parallel_pool']['enabled'])
         self.assertFalse(actual['gpu_health']['admission_blocked'])
-        self.assertEqual(len(actual['warnings']), 1)
+        self.assertEqual(actual['warnings'], [])
         self.assertEqual([gpu['selected_for_ollama'] for gpu in actual['gpus']], [True, False])
+
+    def test_empty_leases_are_quiet_but_every_reserved_state_remains_visible(self):
+        self.assertEqual(n.lease_visibility_warnings([]), [])
+        self.assertEqual(n.lease_policy_document()['required_acquire_fields'], [
+            'owner', 'justification', 'expected_duration_seconds',
+        ])
+        for state in ('pending', 'active', 'revoking'):
+            with self.subTest(state=state):
+                warnings = n.lease_visibility_warnings([{
+                    'owner': 'fixture-owner', 'state': state,
+                    'expected_release_utc': '2026-10-07T18:00:00Z',
+                }])
+                self.assertEqual(len(warnings), 1)
+                self.assertIn('fixture-owner until 2026-10-07T18:00:00Z', warnings[0])
 
 
 if __name__ == '__main__':
