@@ -84,6 +84,15 @@ class ModelContextTests(unittest.TestCase):
         self.assertEqual(payload['options']['num_ctx'], MAXIMUM)
         self.assertIn(('POST', '/api/show', {'model': MODEL}), self.calls)
 
+    def test_service_startup_self_test_requires_no_installed_synthetic_model(self):
+        with mock.patch.object(n, 'discovery_document', return_value={
+            'schema': 'io.ollama-unify.gpu-negotiator.discovery.v1',
+            'commands': {'discover': 'docker gpu discover'},
+            'heartbeat_reconnect_grace_seconds': 90,
+        }):
+            self.assertEqual(n.self_test(), 0)
+        self.assertEqual(self.calls, [])
+
     def test_automatic_kv_reservation_covers_q8_cache_for_every_parallel_slot(self):
         required, capabilities = self.broker._model_profile(MODEL)
         # q8_0 stores 32 values plus a two-byte scale per block. K and V
