@@ -1997,6 +1997,12 @@ def discovery_document() -> dict[str, Any]:
                 "admission_wait_header": "X-Ollama-Unify-Admission-Wait-Ms",
                 "queue_policy_header": "X-Ollama-Unify-Queue-Policy",
                 "queue_policies": ["wait", "yield"],
+                "unlabelled_embedding_defaults": {
+                    "paths": list(EMBEDDING_PATHS),
+                    "workload_class": "background",
+                    "queue_policy": "yield",
+                    "explicit_headers_override": True,
+                },
                 "gpu_uuids_header": GPU_UUIDS_HEADER,
                 "gpu_constraint_semantics": (
                     "ordered hard allowlist intersected with broker-selected GPUs; "
@@ -6645,7 +6651,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         return max(0.1, min(DRAIN_TIMEOUT, milliseconds / 1000.0))
 
-    def _requested_admission_controls(self) -> tuple[str, str, str]:
+    def _requested_admission_controls(self, path: str) -> tuple[str, str, str]:
         logical_request_id = self.headers.get(
             LOGICAL_REQUEST_HEADER, ""
         ).strip()
@@ -6664,9 +6670,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 400,
                 "invalid_admission_header",
             )
-        workload_class = self.headers.get(
-            "X-Ollama-Unify-Workload-Class", "unspecified"
-        ).strip().lower() or "unspecified"
+        declared_workload_class = self.headers.get(
+            "X-Ollama-Unify-Workload-Class", ""
+        ).strip().lower()
+        # Older embedding clients omit scheduling labels. Treat that endpoint
+        # family as optional by default so it cannot evict warm foreground
+        # weights. Explicit scheduling headers retain their existing meaning.
+        unlabelled_embedding = path in EMBEDDING_PATHS and not declared_workload_class
+        workload_class = declared_workload_class or (
+            "background" if unlabelled_embedding else "unspecified"
+        )
         if workload_class not in {
             "foreground", "interactive-control", "background", "unspecified",
         }:
@@ -6677,8 +6690,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 logical_request_id=logical_request_id,
             )
         queue_policy = self.headers.get(
-            "X-Ollama-Unify-Queue-Policy", "wait"
-        ).strip().lower() or "wait"
+            "X-Ollama-Unify-Queue-Policy", ""
+        ).strip().lower() or ("yield" if unlabelled_embedding else "wait")
         if queue_policy not in {"wait", "yield"}:
             raise PermanentCapacityError(
                 "queue policy must be wait or yield",
@@ -6898,7 +6911,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 logical_request_id,
                 workload_class,
                 queue_policy,
-            ) = self._requested_admission_controls()
+            ) = self._requested_admission_controls(path)
             gpu_uuids = self._requested_gpu_uuids()
             resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
             if resume_header and resume_header.lower() != "true":

@@ -56,7 +56,126 @@ def acquire(case, scope):
     })['lease']['token']
 
 
+class EmbeddingAdmissionDefaultsTests(unittest.TestCase):
+    def controls(self, path, headers=None):
+        handler = object.__new__(n.ProxyHandler)
+        handler.headers = headers or {}
+        return handler._requested_admission_controls(path)
+
+    def test_unlabelled_embedding_family_defaults_to_optional(self):
+        for path in n.EMBEDDING_PATHS:
+            for headers in ({}, {'X-Ollama-Unify-Workload-Class': '  '}):
+                with self.subTest(path=path, headers=headers):
+                    self.assertEqual(self.controls(path, headers), ('', 'background', 'yield'))
+
+    def test_explicit_labels_keep_existing_defaults_and_queue_policy(self):
+        for path in n.EMBEDDING_PATHS:
+            for workload in ('foreground', 'interactive-control', 'background', 'unspecified'):
+                for policy in (None, 'wait', 'yield'):
+                    headers = {'X-Ollama-Unify-Workload-Class': workload}
+                    if policy is not None:
+                        headers['X-Ollama-Unify-Queue-Policy'] = policy
+                    with self.subTest(path=path, workload=workload, policy=policy):
+                        self.assertEqual(self.controls(path, headers), ('', workload, policy or 'wait'))
+            self.assertEqual(self.controls(path, {'X-Ollama-Unify-Queue-Policy': 'wait'}),
+                             ('', 'background', 'wait'))
+
+    def test_generation_and_other_endpoint_defaults_are_unchanged(self):
+        for path in ('/api/chat', '/api/generate', '/v1/chat/completions',
+                     '/v1/completions', '/v1/responses', '/api/rerank'):
+            with self.subTest(path=path):
+                self.assertEqual(self.controls(path), ('', 'unspecified', 'wait'))
+
+    def test_invalid_explicit_headers_are_not_hidden_by_endpoint_defaults(self):
+        for headers in ({'X-Ollama-Unify-Workload-Class': 'optional'},
+                        {'X-Ollama-Unify-Queue-Policy': 'optional'},
+                        {'X-Ollama-Unify-Logical-Request-Id': 'unsafe id'}):
+            with self.subTest(headers=headers), self.assertRaises(n.PermanentCapacityError) as raised:
+                self.controls('/api/embed', headers)
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(raised.exception.reason_code, 'invalid_admission_header')
+
+
 class MultiGpuIntegrationTests(unittest.TestCase):
+    def test_unlabelled_embedding_family_preserves_idle_group_and_cleans_up(self):
+        embedding = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL,
+                     'size': 256 * 1024**2, 'capabilities': ['embedding']}
+        for path in ('/api/embed', '/api/embeddings', '/v1/embeddings'):
+            with self.subTest(path=path), harness(selected_gpus=PAIR, tags=[LARGE_TAG, embedding]) as case:
+                code, capacity, _ = case.capacity(LARGE, gpu_uuids=PAIR)
+                self.assertEqual(code, 200, capacity)
+                lane_id = capacity['lanes'][0]['id']
+                result = p.http_json(
+                    case.proxy_port, 'POST', path + '?default-policy-check=1',
+                    {'model': p.EMBED_MODEL, 'input': ['optional memory'], 'prompt': 'optional memory'},
+                    extra_headers={
+                        'X-Ollama-Unify-GPU-UUIDs': ','.join(PAIR),
+                        'X-Ollama-Unify-Logical-Request-Id': 'unlabelled:embedding',
+                    },
+                )
+                self.assertEqual(result[0], 503, result)
+                self.assertEqual(result[1]['reason_code'], 'background_capacity_deferred')
+                self.assertTrue(result[1]['retryable'])
+                self.assertEqual(result[2]['X-Ollama-Unify-Workload-Class'], 'background')
+                self.assertEqual(result[2]['X-Ollama-Unify-Queue-Policy'], 'yield')
+                self.assertNotIn('admission_retained', result[1])
+                queue = case.status()['parallel_pool']['queue']
+                self.assertEqual(queue['depth'], 0)
+                self.assertEqual(queue['retained_request_bytes'], 0)
+                self.assertEqual([lane['id'] for lane in p.managed_lanes(case.status())], [lane_id])
+                self.assertEqual(len(starts(case)), 1)
+                self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'stop'])
+                reused = p.chat(case.proxy_port, LARGE, 'still-resident', gpu_uuids=PAIR)
+                self.assertEqual(reused[0], 200, reused)
+                self.assertEqual(reused[2]['X-Ollama-Unify-Lane'], lane_id)
+
+    def test_explicit_foreground_embedding_can_reclaim_idle_group(self):
+        embedding = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL,
+                     'size': 256 * 1024**2, 'capabilities': ['embedding']}
+        with harness(selected_gpus=PAIR, tags=[LARGE_TAG, embedding]) as case:
+            self.assertEqual(case.capacity(LARGE, gpu_uuids=PAIR)[0], 200)
+            result = p.http_json(
+                case.proxy_port, 'POST', '/api/embed',
+                {'model': p.EMBED_MODEL, 'input': ['foreground embedding']},
+                extra_headers={'X-Ollama-Unify-Workload-Class': 'foreground',
+                               'X-Ollama-Unify-GPU-UUIDs': ','.join(PAIR)},
+            )
+            self.assertEqual(result[0], 200, result)
+            self.assertEqual(result[2]['X-Ollama-Unify-Workload-Class'], 'foreground')
+            self.assertEqual(result[2]['X-Ollama-Unify-Queue-Policy'], 'wait')
+            self.assertEqual([lane['model'] for lane in p.managed_lanes(case.status())], [p.EMBED_MODEL])
+            self.assertEqual(len([event for event in p.events(case.event_log)
+                                  if event['kind'] == 'stop']), 1)
+
+    def test_unlabelled_embedding_can_cold_load_free_capacity_and_reuse(self):
+        embedding = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL,
+                     'size': 256 * 1024**2, 'capabilities': ['embedding']}
+        with p.PoolHarness(HELPER, FIXTURE_BIN, max_servers=2,
+                           tags=[p.MODEL, embedding]) as case:
+            self.assertEqual(case.capacity(p.MODEL)[0], 200)
+            results = [p.http_json(case.proxy_port, 'POST', '/api/embed',
+                                  {'model': p.EMBED_MODEL, 'input': ['optional memory']})
+                       for _ in range(2)]
+            for result in results:
+                self.assertEqual(result[0], 200, result)
+                self.assertEqual(result[2]['X-Ollama-Unify-Workload-Class'], 'background')
+                self.assertEqual(result[2]['X-Ollama-Unify-Queue-Policy'], 'yield')
+            self.assertEqual(results[0][2]['X-Ollama-Unify-Lane'], results[1][2]['X-Ollama-Unify-Lane'])
+            self.assertEqual(len(starts(case)), 2)
+            self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'stop'])
+
+    def test_unlabelled_generation_still_reclaims_at_process_ceiling(self):
+        with p.PoolHarness(HELPER, FIXTURE_BIN, max_servers=1,
+                           tags=[p.MODEL, p.OTHER_MODEL]) as case:
+            self.assertEqual(case.capacity(p.MODEL)[0], 200)
+            result = p.http_json(case.proxy_port, 'POST', '/api/chat',
+                                 {'model': p.OTHER_MODEL, 'messages': [], 'stream': False})
+            self.assertEqual(result[0], 200, result)
+            self.assertEqual(result[2]['X-Ollama-Unify-Workload-Class'], 'unspecified')
+            self.assertEqual(result[2]['X-Ollama-Unify-Queue-Policy'], 'wait')
+            self.assertEqual(len([event for event in p.events(case.event_log)
+                                  if event['kind'] == 'stop']), 1)
+
     def test_background_embedding_yields_without_evicting_idle_group(self):
         embedding = {'name': 'fixture-embed:latest', 'model': 'fixture-embed:latest',
                      'size': 256 * 1024**2, 'capabilities': ['embedding']}
