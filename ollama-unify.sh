@@ -3715,7 +3715,7 @@ class Broker:
 
     def _warm_runtime_identity_locked(self, lane: Lane) -> dict[str, Any]:
         if (lane.kind != "managed" or lane.retiring or lane.loading
-                or not lane.context_profile_matches() or not lane.context_profile
+                or not lane.context_profile_matches()
                 or not process_group_alive(lane.process)):
             raise WarmPreflightRequired()
         try:
@@ -3729,10 +3729,21 @@ class Broker:
                 "digest": row.get("digest"), "context_length": row.get("context_length"),
                 "size": row.get("size"), "size_vram": row.get("size_vram"),
             }
+            if lane.context_profile is None:
+                # Embedding runners have no completion/KV context profile.
+                # Certify their observed native context only after verifying
+                # the current installed artifact and embedding-only capability.
+                expected_digest = self._warm_embedding_digest(lane.model)
+                expected_context = native["context_length"]
+            else:
+                expected_digest = lane.context_profile["model_digest"]
+                expected_context = lane.context_profile["context_length"]
             if (native["name"] != lane.model
-                    or native["digest"] != lane.context_profile["model_digest"]
+                    or native["digest"] != expected_digest
                     or type(native["context_length"]) is not int
-                    or native["context_length"] != lane.context_profile["context_length"]
+                    or not 1 <= native["context_length"] <= 2 ** 31 - 1
+                    or native["context_length"] != expected_context
+                    or (HARD_MAX_CONTEXT > 0 and native["context_length"] > HARD_MAX_CONTEXT)
                     or type(native["size"]) is not int or native["size"] <= 0
                     or type(native["size_vram"]) is not int
                     or native["size_vram"] != native["size"]):
@@ -3746,6 +3757,31 @@ class Broker:
             }
         except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise WarmPreflightRequired() from exc
+
+    @staticmethod
+    def _warm_embedding_digest(model: str) -> str:
+        def installed() -> dict[str, Any]:
+            rows = backend_json("GET", "/api/tags", timeout=2.0).get("models", [])
+            matching = [item for item in rows if isinstance(item, dict)
+                        and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model]
+            if len(matching) != 1:
+                raise ValueError("exact embedding artifact is not installed")
+            return matching[0]
+
+        before = installed()
+        digest = before.get("digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("embedding artifact digest is not verified")
+        capabilities = before.get("capabilities")
+        if not isinstance(capabilities, list) or not capabilities:
+            capabilities = backend_json("POST", "/api/show", {"model": model}, timeout=2.0).get("capabilities")
+        after = installed()
+        if (after.get("digest") != digest or not isinstance(capabilities, list)
+                or "embedding" not in capabilities or "completion" in capabilities
+                or (isinstance(after.get("capabilities"), list) and after["capabilities"]
+                    and set(after["capabilities"]) != set(capabilities))):
+            raise ValueError("current artifact is not embedding-only")
+        return digest
 
     def warm_admission_proof(self, model: str, parallel: int,
                              gpu_uuids: tuple[str, ...] | None) -> dict[str, Any]:
@@ -3812,10 +3848,11 @@ class Broker:
                 continue
             if (lane.warm_generation_id != identity["generation_id"]
                     or lane.model != model or not lane.allows(allowed)
-                    or set(lane.scope).intersection(blocked)
-                    or not lane.context_profile
-                    or lane.context_profile["model_digest"] != proof["model_digest"]
-                    or lane.context_profile["context_length"] != proof["context_length"]):
+                    or set(lane.scope).intersection(blocked)):
+                continue
+            expected = lane.context_profile or ((lane.warm_runtime_identity or {}).get("native_ps"))
+            if (not expected or expected.get("model_digest", expected.get("digest")) != proof["model_digest"]
+                    or expected.get("context_length") != proof["context_length"]):
                 continue
             try:
                 runtime = self._warm_runtime_identity_locked(lane)
@@ -5867,7 +5904,8 @@ class Broker:
                 if changed:
                     LOG.warning("managed capacity queued model=%s: %s", model, message)
 
-    def prepare_managed_body(self, lane: Lane, path: str, body: bytes) -> bytes:
+    def prepare_managed_body(self, lane: Lane, path: str, body: bytes,
+                             warm_admission: str | None = None) -> bytes:
         if lane.kind != "managed" or not body:
             return body
         if not lane.context_profile_matches():
@@ -5887,7 +5925,24 @@ class Broker:
             return body
         if not isinstance(payload, dict):
             return body
-        if lane.context_profile:
+        prepared_context = lane.context_profile["context_length"] if lane.context_profile else None
+        if warm_admission is not None and lane.context_profile is None:
+            # The original body was checked before clamping/registration.
+            # Replace only the legacy unprofiled MAX_CONTEXT projection with
+            # this verified embedding runner's exact native allocation.
+            proof = json.loads(warm_admission)
+            native = (lane.warm_runtime_identity or {}).get("native_ps", {})
+            try:
+                installed_digest = self._warm_embedding_digest(lane.model)
+            except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
+                raise WarmPreflightRequired(admission_retained=True) from exc
+            if (native.get("digest") != proof["model_digest"]
+                    or native.get("context_length") != proof["context_length"]
+                    or installed_digest != proof["model_digest"]
+                    or (HARD_MAX_CONTEXT > 0 and proof["context_length"] > HARD_MAX_CONTEXT)):
+                raise WarmPreflightRequired(admission_retained=True)
+            prepared_context = proof["context_length"]
+        if prepared_context is not None:
             # A queued/retained request may have been prepared before a tag's
             # context identity changed. The selected lane owns the final
             # allocation contract; never reload it from a stale request cap.
@@ -5895,7 +5950,7 @@ class Broker:
             if not isinstance(options, dict):
                 raise PermanentCapacityError("model options must be a JSON object", 400,
                                              "invalid_model_options")
-            options["num_ctx"] = lane.context_profile["context_length"]
+            options["num_ctx"] = prepared_context
         if payload.get("keep_alive") == 0:
             self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
             # Do not leave an empty backend that can reload implicitly on its
@@ -7396,7 +7451,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         lane = admission.lane
         try:
-            body = self.broker.prepare_managed_body(lane, path, body)
+            body = self.broker.prepare_managed_body(lane, path, body, admission.warm_admission)
             if admission.warm_admission is not None:
                 self.broker.validate_warm_body(admission.warm_admission, model, path, body, prepared=True)
                 with self.broker.cv:

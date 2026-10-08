@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -286,6 +288,102 @@ class WarmAdmissionHTTPTests(unittest.TestCase):
             self.stale(proof(h))
             self.assertEqual(p.request_events(h.event_log), [])
 
+    def test_embedding_only_native_context_can_use_warm_background_yield_without_growth(self):
+        # Observe the exact synthetic native input in the existing CPU backend;
+        # the broker, loader, scheduler and proof path remain production code.
+        with tempfile.TemporaryDirectory(prefix='warm-embed-fixture-') as directory:
+            fixture_bin = pathlib.Path(directory) / 'bin'
+            shutil.copytree(FIXTURE_BIN, fixture_bin)
+            backend = fixture_bin / 'ollama'
+            original = backend.read_text()
+            marker = 'options=payload.get("options") or {}, keep_alive=payload.get("keep_alive"))'
+            self.assertEqual(original.count(marker), 1)
+            backend.write_text(original.replace(marker, marker[:-1] + ', observed_input=payload.get("input"))'))
+            tag = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL, 'size': 1024 ** 3,
+                   'digest': DIGEST, 'capabilities': ['embedding']}
+            with p.PoolHarness(HELPER, str(fixture_bin), tags=[tag], max_servers=3,
+                               selected_gpus=GPUS, auto_model_context=True,
+                               runner_context_length=2048, max_context=8192) as h:
+                setup = h.capacity(p.EMBED_MODEL, 1, '/api/embed', GPUS)
+                self.assertEqual(setup[0], 200, setup)
+                self.assertIsNone(setup[1]['lanes'][0]['context_profile'])
+                issued = p.http_json(h.proxy_port, 'POST', CAPACITY, {
+                    'model': p.EMBED_MODEL, 'parallel': 1, 'endpoint': '/api/embed',
+                    'gpu_uuids': GPUS, 'warm_admission_proof': True,
+                })
+                self.assertEqual(issued[0], 200, issued)
+                certificate = issued[1]['warm_admission']
+                self.assertEqual(certificate['model'], p.EMBED_MODEL)
+                self.assertEqual(certificate['model_digest'], DIGEST)
+                self.assertEqual(certificate['context_length'], 2048)
+                inputs = ['synthetic embedding alpha', 'synthetic embedding beta']
+                headers = {
+                    HEADER: json.dumps(certificate), 'X-Ollama-Unify-GPU-UUIDs': ','.join(GPUS),
+                    'X-Ollama-Unify-Workload-Class': 'background', 'X-Ollama-Unify-Queue-Policy': 'yield',
+                }
+                for options in [None, {'num_ctx': 2048}]:
+                    body = {'model': p.EMBED_MODEL, 'input': inputs,
+                            'mock_request_id': 'warm-embedding-input'}
+                    if options is not None:
+                        body['options'] = options
+                    response = p.http_json(h.proxy_port, 'POST', '/api/embed', body, extra_headers=headers)
+                    self.assertEqual(response[0], 200, response)
+                    self.assertEqual(response[2]['X-Ollama-Unify-Workload-Class'], 'background')
+                    self.assertEqual(response[2]['X-Ollama-Unify-Queue-Policy'], 'yield')
+                records = p.request_events(h.event_log)
+                self.assertEqual(len(records), 2)
+                for record in records:
+                    self.assertEqual(record['path'], '/api/embed')
+                    self.assertEqual(record['observed_input'], inputs)
+                    self.assertEqual(record['options'], {'num_ctx': 2048, 'num_gpu': -1})
+                conflict = p.http_json(h.proxy_port, 'POST', '/api/embed', {
+                    'model': p.EMBED_MODEL, 'input': inputs, 'options': {'num_ctx': 8192},
+                }, extra_headers={**headers, 'X-Ollama-Unify-Logical-Request-Id': 'warm:embed-conflict'})
+                self.assertEqual(conflict[0], 400, conflict)
+                self.assertEqual(h.status()['parallel_pool']['queue']['enqueued_total'], 2)
+                self.assertEqual(len(p.request_events(h.event_log)), 2)
+                self.assertEqual(len(p.managed_lanes(h.status())), 1)
+                self.assertEqual(len([event for event in p.events(h.event_log) if event['kind'] == 'start']), 1)
+
+    def test_embedding_metadata_failure_after_admission_releases_owned_request_before_backend(self):
+        tag = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL, 'size': 1024 ** 3,
+               'digest': DIGEST, 'capabilities': ['embedding']}
+        calls = {'enabled': False, 'tags': 0}
+        original_get = p.Handler.do_GET
+
+        def change_metadata(handler):
+            if calls['enabled'] and handler.path == '/api/tags':
+                calls['tags'] += 1
+                # Original-body clamp + two warm admission inspections read
+                # five tag snapshots. Refuse the preparation reopen next.
+                if calls['tags'] >= 6:
+                    handler.send_json({'models': [{**tag, 'capabilities': ['embedding', 'completion']}]})
+                    return
+            original_get(handler)
+
+        with mock.patch.object(p.Handler, 'do_GET', change_metadata), \
+             p.PoolHarness(HELPER, FIXTURE_BIN, tags=[tag], max_servers=3,
+                           selected_gpus=GPUS, auto_model_context=True,
+                           runner_context_length=2048, max_context=8192) as h:
+            self.assertEqual(h.capacity(p.EMBED_MODEL, 1, '/api/embed', GPUS)[0], 200)
+            issued = p.http_json(h.proxy_port, 'POST', CAPACITY, {
+                'model': p.EMBED_MODEL, 'parallel': 1, 'endpoint': '/api/embed',
+                'gpu_uuids': GPUS, 'warm_admission_proof': True})
+            self.assertEqual(issued[0], 200, issued)
+            calls['enabled'] = True
+            response = p.http_json(h.proxy_port, 'POST', '/api/embed', {
+                'model': p.EMBED_MODEL, 'input': ['must-not-reach-native-backend'],
+                'mock_request_id': 'metadata-changed-after-admission',
+            }, extra_headers={HEADER: json.dumps(issued[1]['warm_admission']),
+                'X-Ollama-Unify-GPU-UUIDs': ','.join(GPUS),
+                'X-Ollama-Unify-Logical-Request-Id': 'warm:embedding-after-admission'})
+            self.stale(response, retained=True)
+            state = h.status()
+            self.assertEqual(state['parallel_pool']['queue']['admitted_total'], 1)
+            self.assertEqual(state['active_requests'], 0)
+            self.assertEqual(state['parallel_pool']['request_lifecycle']['tracked'], 0)
+            self.assertEqual(p.request_events(h.event_log), [])
+
     def test_broker_restart_and_reused_lane_id_cannot_reuse_old_certificate(self):
         with harness() as first:
             original = self.prepare(first)['warm_admission']
@@ -295,6 +393,94 @@ class WarmAdmissionHTTPTests(unittest.TestCase):
             self.assertNotEqual(original['broker_instance_id'], current['broker_instance_id'])
             self.stale(send(second, original, logical_id='warm:restart'))
             self.assertEqual(send(second, current, logical_id='warm:restart')[0], 200)
+
+
+class WarmEmbeddingIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.process = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        self.addCleanup(self.stop_process)
+        self.tag = {'name': p.EMBED_MODEL, 'digest': DIGEST, 'capabilities': ['embedding']}
+        self.show = {'capabilities': ['embedding']}
+        self.row = {'name': p.EMBED_MODEL, 'digest': DIGEST, 'context_length': 2048,
+                    'size': 4096, 'size_vram': 4096}
+        self.lane = n.Lane('lane-1', 'managed', '127.0.0.1', 1, GPUS[0], p.EMBED_MODEL, 1, 1,
+                           time.time(), time.time(), self.process, gpu_uuids=(GPUS[0],))
+        self.broker = n.Broker()
+        self.broker.lanes[self.lane.lane_id] = self.lane
+        for patcher in [
+            mock.patch.object(n, 'POOL_ENABLED', True),
+            mock.patch.object(n, 'HARD_MAX_CONTEXT', 0),
+            mock.patch.object(n, 'effective_model_context_profile', return_value=None),
+            mock.patch.object(n, 'backend_json_at', side_effect=lambda *a, **kw: {'models': [copy.deepcopy(self.row)]}),
+            mock.patch.object(n, 'backend_json', side_effect=self.metadata),
+            mock.patch.object(self.broker, '_ollama_blocked_gpus_locked', return_value=set()),
+            mock.patch.object(self.broker, '_policy_constraint_locked', side_effect=lambda _model, scope: scope),
+        ]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def stop_process(self):
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, 15)
+        self.process.wait(timeout=3)
+
+    def metadata(self, method, path, *args, **kwargs):
+        if (method, path) == ('GET', '/api/tags'):
+            return {'models': [copy.deepcopy(self.tag)]}
+        if (method, path) == ('POST', '/api/show'):
+            return copy.deepcopy(self.show)
+        raise AssertionError((method, path))
+
+    def issue(self):
+        return self.broker.warm_admission_proof(p.EMBED_MODEL, 1, tuple(GPUS))
+
+    def test_missing_tag_capabilities_are_reopened_from_show_without_completion_profile(self):
+        self.tag.pop('capabilities')
+        issued = self.issue()
+        self.assertIsNone(self.lane.context_profile)
+        self.assertEqual(issued['warm_admission']['context_length'], 2048)
+        self.assertEqual(issued['warm_admission']['model_digest'], DIGEST)
+
+    def test_unprofiled_completion_mixed_and_unknown_capabilities_cannot_certify(self):
+        for capabilities in [['completion'], ['embedding', 'completion'], [], ['unknown']]:
+            with self.subTest(capabilities=capabilities):
+                self.tag['capabilities'] = capabilities
+                self.show['capabilities'] = capabilities
+                with self.assertRaises(n.WarmPreflightRequired):
+                    self.issue()
+        self.tag.pop('capabilities')
+        self.show.pop('capabilities')
+        with self.assertRaises(n.WarmPreflightRequired):
+            self.issue()
+
+    def test_installed_and_native_digests_must_match(self):
+        self.tag['digest'] = 'b' * 64
+        with self.assertRaises(n.WarmPreflightRequired):
+            self.issue()
+
+    def test_tag_replacement_during_show_cannot_certify_old_artifact(self):
+        before = {'models': [{'name': p.EMBED_MODEL, 'digest': DIGEST}]}
+        after = {'models': [{'name': p.EMBED_MODEL, 'digest': 'b' * 64}]}
+        with mock.patch.object(n, 'backend_json', side_effect=[before, self.show, after]):
+            with self.assertRaises(n.WarmPreflightRequired):
+                self.issue()
+
+    def test_observed_embedding_context_must_be_positive_and_within_hard_limit(self):
+        for context in [0, -1, True, '2048', 2 ** 31]:
+            with self.subTest(context=context):
+                self.row['context_length'] = context
+                with self.assertRaises(n.WarmPreflightRequired):
+                    self.issue()
+        self.row['context_length'] = 2048
+        with mock.patch.object(n, 'HARD_MAX_CONTEXT', 1024):
+            with self.assertRaises(n.WarmPreflightRequired):
+                self.issue()
+
+    def test_native_context_change_invalidates_issued_embedding_certificate(self):
+        certificate = n.parse_warm_admission(json.dumps(self.issue()['warm_admission']))
+        self.row['context_length'] = 4096
+        with self.broker.cv, self.assertRaises(n.WarmPreflightRequired):
+            self.broker._validate_warm_admission_locked(certificate, p.EMBED_MODEL, tuple(GPUS))
 
 
 class WarmNativeIdentityTests(unittest.TestCase):
