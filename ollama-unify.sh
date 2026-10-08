@@ -1384,6 +1384,8 @@ CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
 GPU_UUIDS_HEADER = "X-Ollama-Unify-GPU-UUIDs"
+WARM_ADMISSION_HEADER = "X-Ollama-Unify-Warm-Admission"
+WARM_ADMISSION_SCHEMA = "io.ollama-unify.warm-admission.v1"
 
 
 def canonical_model_tag(model: str) -> str:
@@ -2004,6 +2006,9 @@ def discovery_document() -> dict[str, Any]:
                     "explicit_headers_override": True,
                 },
                 "gpu_uuids_header": GPU_UUIDS_HEADER,
+                "warm_admission_header": WARM_ADMISSION_HEADER,
+                "warm_admission_schema": WARM_ADMISSION_SCHEMA,
+                "warm_admission_proof_only_capacity_field": "warm_admission_proof",
                 "gpu_constraint_semantics": (
                     "ordered hard allowlist intersected with broker-selected GPUs; "
                     "rejected only when the intersection is empty"
@@ -2016,6 +2021,8 @@ def discovery_document() -> dict[str, Any]:
                     "lane_capacity_wait",
                     "reclaimable_placement_wait",
                     "background_capacity_deferred",
+                    "warm_preflight_required",
+                    "invalid_warm_admission",
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
                     "model_context_memory_unverified",
@@ -2563,6 +2570,63 @@ def process_group_alive(process: Any) -> bool:
         return True
 
 
+def process_group_identity(process: Any) -> list[dict[str, int]]:
+    """Include native runner children, not just the long-lived Ollama server."""
+    if process is None or process.poll() is not None:
+        raise RuntimeError("managed server is not alive")
+    members = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat", encoding="utf-8") as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            continue
+        if int(fields[2]) == process.pid and fields[0] not in {"Z", "X"}:
+            members.append({"pid": int(entry.name), "start_time_ticks": int(fields[19])})
+    if not any(item["pid"] == process.pid for item in members):
+        raise RuntimeError("managed server process identity is unavailable")
+    return sorted(members, key=lambda item: item["pid"])
+
+
+def parse_warm_admission(raw: str) -> str:
+    """Canonicalize a bounded, closed certificate; it grants no GPU authority."""
+    try:
+        if not raw or len(raw) > 16384:
+            raise ValueError("invalid certificate length")
+        proof = json.loads(raw)
+        if not isinstance(proof, dict) or set(proof) != {
+            "schema", "broker_instance_id", "model", "model_digest",
+            "context_length", "gpu_uuids", "lanes",
+        }:
+            raise ValueError("invalid certificate fields")
+        if proof["schema"] != WARM_ADMISSION_SCHEMA:
+            raise ValueError("invalid certificate schema")
+        for key in ("broker_instance_id", "model_digest"):
+            if not isinstance(proof[key], str) or not re.fullmatch(r"[0-9a-f]{64}", proof[key]):
+                raise ValueError("invalid certificate identity")
+        if not isinstance(proof["model"], str) or not proof["model"] or canonical_model_tag(proof["model"]) != proof["model"]:
+            raise ValueError("invalid certificate model")
+        if type(proof["context_length"]) is not int or not 1 <= proof["context_length"] <= 2 ** 31 - 1:
+            raise ValueError("invalid certificate context")
+        scope = proof["gpu_uuids"]
+        if not isinstance(scope, list) or not scope or any(not isinstance(gpu, str) or not gpu for gpu in scope) or len(set(scope)) != len(scope):
+            raise ValueError("invalid certificate scope")
+        lanes = proof["lanes"]
+        if not isinstance(lanes, list) or not 1 <= len(lanes) <= 128:
+            raise ValueError("invalid certificate lanes")
+        for lane in lanes:
+            if not isinstance(lane, dict) or set(lane) != {"id", "generation_id"} or not isinstance(lane["id"], str) or not re.fullmatch(r"lane-\d+", lane["id"]) or not isinstance(lane["generation_id"], str) or not re.fullmatch(r"[0-9a-f]{64}", lane["generation_id"]):
+                raise ValueError("invalid certificate lane identity")
+        if len({lane["id"] for lane in lanes}) != len(lanes):
+            raise ValueError("duplicate certificate lane")
+        return json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    except (ValueError, TypeError) as exc:
+        raise PermanentCapacityError("invalid warm admission certificate", 400,
+                                     "invalid_warm_admission") from exc
+
+
 @dataclass
 class Lane:
     lane_id: str
@@ -2589,6 +2653,8 @@ class Lane:
     loading: bool = False
     context_profile: dict | None = None
     openai_context_compatible: bool = True
+    warm_generation_id: str = ""
+    warm_runtime_identity: dict[str, Any] | None = None
 
     def context_profile_matches(self) -> bool:
         return self.context_profile == effective_model_context_profile(self.model)
@@ -2700,6 +2766,13 @@ class BackgroundCapacityDeferred(CapacityError):
         super().__init__(message, 503, "background_capacity_deferred", True, 2)
 
 
+class WarmPreflightRequired(CapacityError):
+    def __init__(self, *, admission_retained: bool = False, **kwargs: Any) -> None:
+        super().__init__("verified warm lanes changed; fresh hardware preflight is required",
+                         503, "warm_preflight_required", True, 2,
+                         admission_retained=admission_retained, **kwargs)
+
+
 class AdmissionTimeoutError(CapacityError):
     def __init__(
         self,
@@ -2758,6 +2831,7 @@ class RetainedRequest:
     model: str
     fingerprint: str
     gpu_uuids: tuple[str, ...] | None = None
+    warm_admission: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2766,6 +2840,7 @@ class LogicalRequestTombstone:
     request_id: str
     reason_code: str
     expires_at: float
+    warm_admission: str | None = None
 
 
 @dataclass
@@ -2795,6 +2870,7 @@ class QueuedRequest:
     attached: bool = True
     resume_deadline: float | None = None
     client: dict[str, str] | None = None
+    warm_admission: str | None = None
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
@@ -2835,6 +2911,7 @@ class ActiveRequest:
     cancel_reason: str = ""
     backend: Any = None
     backend_started: bool = False
+    warm_admission: str | None = None
     backend_completed: bool = False
     lane_stop_started: bool = False
     lane_stopped: bool = False
@@ -2855,6 +2932,7 @@ class Admission:
     initial_position: int
     queue_ticket: int
     retained_request: RetainedRequest | None = None
+    warm_admission: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2880,12 +2958,14 @@ class CompletedResponse:
     unavailable_reason: str | None
     completed_at: float
     expires_at: float
+    warm_admission: str | None = None
 
 
 class Broker:
     def __init__(self) -> None:
         self.cv = threading.Condition()
         self.transition = threading.RLock()
+        self.instance_id = secrets.token_hex(32)
         self.leases = self._load_leases()
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
@@ -3236,13 +3316,15 @@ class Broker:
             self.completed_response_bytes = max(
                 0, self.completed_response_bytes - len(response.body)
             )
-        if expired:
-            self.completed_response_expired_total += 1
+        if expired or (evicted and response.warm_admission is not None):
             self._record_logical_tombstone_locked(
                 logical_request_id,
                 response.request_id,
-                "logical_request_expired",
+                "logical_request_expired" if expired else "completed_response_evicted",
+                warm_admission=response.warm_admission,
             )
+        if expired:
+            self.completed_response_expired_total += 1
         if evicted:
             self.completed_response_evicted_total += 1
 
@@ -3300,14 +3382,18 @@ class Broker:
 
     def _record_logical_tombstone_locked(
         self, logical_request_id: str, request_id: str, reason_code: str,
+        *, warm_admission: str | None = None,
     ) -> None:
         if not logical_request_id:
             return
+        owner = next((item for item in self.waiters if item.request_id == request_id), None)
+        owner = owner or self.active_request_records.get(request_id)
         self.logical_tombstones[logical_request_id] = LogicalRequestTombstone(
             logical_request_id=logical_request_id,
             request_id=request_id,
             reason_code=reason_code,
             expires_at=time.monotonic() + COMPLETED_RESPONSE_TTL,
+            warm_admission=warm_admission or (owner.warm_admission if owner is not None else None),
         )
 
     def _prune_logical_tombstones_locked(
@@ -3335,6 +3421,8 @@ class Broker:
 
     def resume_request_lookup(
         self, logical_request_id: str, method: str, path: str,
+        warm_admission: str | None = None,
+        gpu_uuids: tuple[str, ...] | None = None,
     ) -> tuple[RetainedRequest | None, CompletedResponse | None]:
         if not logical_request_id:
             raise PermanentCapacityError(
@@ -3349,6 +3437,13 @@ class Broker:
             self._raise_logical_tombstone_locked(logical_request_id)
             response = self.completed_responses.get(logical_request_id)
             if response is not None:
+                if warm_admission is not None and warm_admission != response.warm_admission:
+                    raise PermanentCapacityError("resume warm certificate differs from original request", 409,
+                                                 "logical_request_conflict")
+                if (response.warm_admission is not None and gpu_uuids is not None
+                        and list(gpu_uuids) != json.loads(response.warm_admission)["gpu_uuids"]):
+                    raise PermanentCapacityError("resume GPU constraint differs from original request", 409,
+                                                 "logical_request_conflict")
                 if response.request_method != method or response.request_path != path:
                     raise PermanentCapacityError(
                         "logical request ID was resumed on a different method or path",
@@ -3366,6 +3461,10 @@ class Broker:
             active = self.logical_in_flight.get(logical_request_id)
             if active is not None:
                 _, request_id, queue_ticket = active
+                active_record = self.active_request_records.get(request_id)
+                if warm_admission is not None and (active_record is None or warm_admission != active_record.warm_admission):
+                    raise PermanentCapacityError("resume warm certificate differs from original request", 409,
+                                                 "logical_request_conflict")
                 self.queue_duplicate_total += 1
                 raise CapacityError(
                     "logical request is already admitted and in progress",
@@ -3400,6 +3499,9 @@ class Broker:
                     request_id=waiter.request_id,
                     logical_request_id=logical_request_id,
                 )
+            if warm_admission is not None and warm_admission != retained.warm_admission:
+                raise PermanentCapacityError("resume warm certificate differs from retained request", 409,
+                                             "logical_request_conflict")
             if retained.method != method or retained.path != path:
                 raise PermanentCapacityError(
                     "logical request ID was resumed on a different method or path",
@@ -3425,6 +3527,7 @@ class Broker:
         body_bytes: int,
         body_sha256: str,
         unavailable_reason: str | None = None,
+        warm_admission: str | None = None,
     ) -> None:
         if not logical_request_id:
             return
@@ -3482,6 +3585,7 @@ class Broker:
                 ),
                 completed_at=now,
                 expires_at=now + COMPLETED_RESPONSE_TTL,
+                warm_admission=warm_admission,
             )
             self.completed_responses[logical_request_id] = response
             self.completed_response_bytes += retained_bytes
@@ -3567,6 +3671,7 @@ class Broker:
         model: str,
         routable: bool,
         gpu_uuids: tuple[str, ...] | None = None,
+        certified_lane_ids: set[str] | None = None,
     ) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
@@ -3576,6 +3681,7 @@ class Broker:
         gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
+                    and (certified_lane_ids is None or lane.lane_id in certified_lane_ids)
                     and lane.context_profile_matches()
                     and lane.allows(gpu_uuids)
                     and not set(lane.scope).intersection(blocked_gpus)
@@ -3606,6 +3712,152 @@ class Broker:
         if any(lane.kind == "managed" for lane in self.lanes.values()):
             return None
         return base if base.in_flight < base.parallel else None
+
+    def _warm_runtime_identity_locked(self, lane: Lane) -> dict[str, Any]:
+        if (lane.kind != "managed" or lane.retiring or lane.loading
+                or not lane.context_profile_matches() or not lane.context_profile
+                or not process_group_alive(lane.process)):
+            raise WarmPreflightRequired()
+        try:
+            before = process_group_identity(lane.process)
+            rows = backend_json_at(lane.host, lane.port, "GET", "/api/ps", timeout=2.0).get("models")
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                raise ValueError("exactly one resident model is required")
+            row = rows[0]
+            native = {
+                "name": canonical_model_tag(str(row.get("name") or row.get("model") or "")),
+                "digest": row.get("digest"), "context_length": row.get("context_length"),
+                "size": row.get("size"), "size_vram": row.get("size_vram"),
+            }
+            if (native["name"] != lane.model
+                    or native["digest"] != lane.context_profile["model_digest"]
+                    or type(native["context_length"]) is not int
+                    or native["context_length"] != lane.context_profile["context_length"]
+                    or type(native["size"]) is not int or native["size"] <= 0
+                    or type(native["size_vram"]) is not int
+                    or native["size_vram"] != native["size"]):
+                raise ValueError("resident model is not fully verified")
+            after = process_group_identity(lane.process)
+            if before != after:
+                raise ValueError("runtime process identity changed during inspection")
+            return {
+                "server_process": next(item for item in before if item["pid"] == lane.process.pid),
+                "runtime_processes": before, "native_ps": native,
+            }
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise WarmPreflightRequired() from exc
+
+    def warm_admission_proof(self, model: str, parallel: int,
+                             gpu_uuids: tuple[str, ...] | None) -> dict[str, Any]:
+        """Inspect existing warm capacity only. Never load, grow, or refresh idle time."""
+        model = canonical_model_tag(model)
+        if not POOL_ENABLED or not model or gpu_uuids is None or parallel < 1:
+            raise PermanentCapacityError("warm proof requires a model, positive parallel and explicit GPU scope",
+                                         400, "invalid_warm_admission")
+        with self.cv:
+            blocked = self._ollama_blocked_gpus_locked()
+            allowed = self._policy_constraint_locked(model, gpu_uuids)
+            lanes = [lane for lane in self.lanes.values()
+                     if lane.kind == "managed" and lane.model == model
+                     and lane.allows(allowed) and not set(lane.scope).intersection(blocked)
+                     and not lane.retiring and not lane.loading]
+            if self.draining or not lanes or sum(lane.parallel for lane in lanes) < parallel:
+                raise WarmPreflightRequired()
+            descriptors = []
+            for lane in lanes:
+                runtime = self._warm_runtime_identity_locked(lane)
+                if runtime != lane.warm_runtime_identity:
+                    lane.warm_generation_id = secrets.token_hex(32)
+                    lane.warm_runtime_identity = runtime
+                descriptors.append({
+                    "id": lane.lane_id, "generation_id": lane.warm_generation_id,
+                    "model": model, "model_digest": runtime["native_ps"]["digest"],
+                    "context_length": runtime["native_ps"]["context_length"],
+                    "gpu_uuids": list(lane.scope), **runtime,
+                })
+            identities = {(item["model_digest"], item["context_length"]) for item in descriptors}
+            if len(identities) != 1:
+                raise WarmPreflightRequired()
+            digest, context = next(iter(identities))
+            proof = {"schema": WARM_ADMISSION_SCHEMA, "broker_instance_id": self.instance_id,
+                     "model": model, "model_digest": digest, "context_length": context,
+                     "gpu_uuids": list(gpu_uuids),
+                     "lanes": [{"id": item["id"], "generation_id": item["generation_id"]}
+                               for item in descriptors]}
+            return {
+                "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
+                "requested_model": model, "canonical_model": model,
+                "requested_parallel": parallel, "requested_gpu_uuids": list(gpu_uuids),
+                "admitted_parallel": sum(lane.parallel for lane in lanes),
+                "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
+                "lanes": [lane.public_summary() for lane in lanes],
+                "warm_admission": proof, "warm_admission_lanes": descriptors,
+            }
+
+    def _validate_warm_admission_locked(self, certificate: str, model: str,
+                                        gpu_uuids: tuple[str, ...] | None) -> set[str]:
+        proof = json.loads(certificate)
+        if (proof["broker_instance_id"] != self.instance_id or proof["model"] != model
+                or gpu_uuids is None or proof["gpu_uuids"] != list(gpu_uuids)
+                or self.draining):
+            raise WarmPreflightRequired()
+        allowed = self._policy_constraint_locked(model, gpu_uuids)
+        blocked = self._ollama_blocked_gpus_locked()
+        valid = set()
+        for identity in proof["lanes"]:
+            lane = self.lanes.get(identity["id"])
+            # A retired member may disappear normally. Only current certified
+            # generations can be selected; at least one must still be ready.
+            if lane is None:
+                continue
+            if (lane.warm_generation_id != identity["generation_id"]
+                    or lane.model != model or not lane.allows(allowed)
+                    or set(lane.scope).intersection(blocked)
+                    or not lane.context_profile
+                    or lane.context_profile["model_digest"] != proof["model_digest"]
+                    or lane.context_profile["context_length"] != proof["context_length"]):
+                continue
+            try:
+                runtime = self._warm_runtime_identity_locked(lane)
+            except WarmPreflightRequired:
+                continue
+            if runtime == lane.warm_runtime_identity:
+                valid.add(lane.lane_id)
+        if not valid:
+            raise WarmPreflightRequired()
+        return valid
+
+    @staticmethod
+    def validate_warm_body(certificate: str, model: str, path: str, body: bytes,
+                           *, prepared: bool = False) -> None:
+        proof = json.loads(certificate)
+        if model != proof["model"] or path not in INFERENCE_PATHS:
+            raise PermanentCapacityError("warm certificate does not bind the request model/path", 400,
+                                         "invalid_warm_admission")
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise PermanentCapacityError("warm inference requires a JSON object", 400, "invalid_warm_admission")
+        if path in NATIVE_MODEL_PATHS:
+            options = payload.get("options", {})
+            # Only prediction options are variable in a certified request.
+            # Unknown/new loader options fail closed until explicitly reviewed.
+            prediction_options = {
+                "num_keep", "seed", "num_predict", "top_k", "top_p", "min_p", "typical_p",
+                "repeat_last_n", "temperature", "repeat_penalty", "presence_penalty",
+                "frequency_penalty", "stop", "mirostat", "mirostat_tau", "mirostat_eta",
+                "penalize_newline", "tfs_z", "num_ctx", "num_gpu",
+            }
+            if (not isinstance(options, dict)
+                    or set(options).difference(prediction_options)
+                    or ("num_ctx" in options and (type(options["num_ctx"]) is not int
+                        or options["num_ctx"] != proof["context_length"]))
+                    or ("num_gpu" in options and (type(options["num_gpu"]) is not int or options["num_gpu"] != -1))
+                    or payload.get("runner") not in (None, "")
+                    or (payload.get("keep_alive") is not None
+                        and not (prepared and type(payload["keep_alive"]) is int
+                                 and payload["keep_alive"] == -1))):
+                raise PermanentCapacityError("warm inference cannot change the certified runtime allocation or unload it",
+                                             400, "invalid_warm_admission")
 
     def _model_profile(self, model: str) -> tuple[int, set[str]]:
         model = canonical_model_tag(model)
@@ -4592,6 +4844,20 @@ class Broker:
             active = self.active_request_records.get(admission.request_id)
             if active is None or active.cancel_requested_at is not None:
                 return False
+            if admission.warm_admission is not None:
+                proof = json.loads(admission.warm_admission)
+                try:
+                    eligible = self._validate_warm_admission_locked(
+                        admission.warm_admission, active.lane.model,
+                        tuple(proof["gpu_uuids"]))
+                    if active.lane.lane_id not in eligible:
+                        raise WarmPreflightRequired()
+                except WarmPreflightRequired as exc:
+                    self._record_logical_tombstone_locked(
+                        active.logical_request_id, active.request_id, "warm_preflight_required")
+                    raise WarmPreflightRequired(admission_retained=True,
+                        request_id=active.request_id,
+                        logical_request_id=active.logical_request_id) from exc
             active.backend = backend
             active.backend_started = True
             active.phase = "backend_connecting"
@@ -5068,9 +5334,12 @@ class Broker:
                     workload_class: str = "unspecified",
                     queue_policy: str = "wait",
                     gpu_uuids: tuple[str, ...] | None = None,
+                    warm_admission: str | None = None,
                     client: dict[str, str] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
+        if warm_admission is not None and (not routable or not model or not POOL_ENABLED):
+            raise PermanentCapacityError("warm admission requires managed inference", 400, "invalid_warm_admission")
         if routable and model and not allow_during_drain:
             require_gpu_health(request_id=request_id,
                                logical_request_id=logical_request_id)
@@ -5252,6 +5521,22 @@ class Broker:
                     logical_request_id=logical_request_id,
                 )
             if waiter is None:
+                # This precedes logical ownership and body retention. A caller
+                # can recertify and reuse this ID only when no work was admitted.
+                self._prune_logical_tombstones_locked()
+                tombstone = self.logical_tombstones.get(logical_request_id)
+                if tombstone is not None and tombstone.warm_admission != warm_admission:
+                    raise PermanentCapacityError("logical request warm certificate changed", 409,
+                                                 "logical_request_conflict")
+                if warm_admission is not None:
+                    try:
+                        self._validate_warm_admission_locked(warm_admission, model, gpu_uuids)
+                    except WarmPreflightRequired as exc:
+                        if tombstone is not None:
+                            raise WarmPreflightRequired(admission_retained=True,
+                                request_id=tombstone.request_id,
+                                logical_request_id=logical_request_id) from exc
+                        raise
                 if resume_request:
                     raise PermanentCapacityError(
                         "logical request is not retained by this broker",
@@ -5305,6 +5590,7 @@ class Broker:
                     queue_policy=queue_policy,
                     initial_position=len(self.waiters) + 1,
                     client=client,
+                    warm_admission=warm_admission,
                 )
                 self.waiters.append(waiter)
                 if retained_request is not None:
@@ -5334,6 +5620,9 @@ class Broker:
             except CapacityError:
                 with self.cv:
                     if waiter in self.waiters:
+                        if waiter.warm_admission is not None:
+                            self._record_logical_tombstone_locked(waiter.logical_request_id,
+                                waiter.request_id, "gpu_health_unavailable")
                         self._remove_waiter_locked(waiter)
                 raise
             with self.cv:
@@ -5363,6 +5652,9 @@ class Broker:
                     waiter.phase = "timed-out"
                     queue_position = self.waiters.index(waiter) + 1
                     self.queue_timed_out_total += 1
+                    if waiter.warm_admission is not None:
+                        self._record_logical_tombstone_locked(waiter.logical_request_id,
+                            waiter.request_id, "queue_admission_timeout")
                     self._remove_waiter_locked(waiter)
                     raise AdmissionTimeoutError(
                         f"broker queue admission deadline expired{detail}",
@@ -5372,6 +5664,23 @@ class Broker:
                         queue_ticket=waiter.queue_ticket,
                     )
                 self._prune_dead_lanes_locked()
+                certified_ids = None
+                if waiter.warm_admission is not None:
+                    try:
+                        certified_ids = self._validate_warm_admission_locked(
+                            waiter.warm_admission, model, waiter.gpu_uuids)
+                    except WarmPreflightRequired as exc:
+                        # Keep exact retained ownership until its ordinary TTL.
+                        # A different certificate cannot widen an admitted job.
+                        if waiter.logical_request_id:
+                            waiter.attached = False
+                            waiter.phase = "detached"
+                            waiter.resume_deadline = time.monotonic() + POOL_RESUME_TTL
+                            raise WarmPreflightRequired(admission_retained=True,
+                                request_id=waiter.request_id,
+                                logical_request_id=waiter.logical_request_id) from exc
+                        self._remove_waiter_locked(waiter)
+                        raise
                 waiter_index = next(
                     (index for index, item in enumerate(self.waiters)
                      if item is waiter),
@@ -5381,7 +5690,7 @@ class Broker:
                     item.model == model for item in self.waiters[:waiter_index]
                 )
                 if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids)
+                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids, certified_ids)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
@@ -5400,6 +5709,7 @@ class Broker:
                             waiter.request_id,
                             waiter.logical_request_id,
                         )
+                        self.active_request_records[waiter.request_id].warm_admission = waiter.warm_admission
                         if waiter.logical_request_id:
                             self.logical_in_flight[waiter.logical_request_id] = (
                                 waiter.request_fingerprint,
@@ -5415,6 +5725,7 @@ class Broker:
                             waiter.initial_position,
                             waiter.queue_ticket,
                             retained_for_admission,
+                            waiter.warm_admission,
                         )
                 self.cv.wait(min(remaining, 0.25))
 
@@ -5427,7 +5738,12 @@ class Broker:
                         or not self.waiters):
                     self.cv.wait(0.5)
                     continue
-                waiter = self.waiters[0]
+                # Conditional warm requests never authorize capacity creation.
+                # Unbound requests still use the ordinary scheduler unchanged.
+                waiter = next((item for item in self.waiters if item.warm_admission is None), None)
+                if waiter is None:
+                    self.cv.wait(0.25)
+                    continue
                 blocked_gpus = self._ollama_blocked_gpus_locked()
                 selected_gpus = set(waiter.gpu_uuids or SELECTED_GPUS)
                 if selected_gpus and selected_gpus.issubset(blocked_gpus):
@@ -6709,6 +7025,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             GPU_UUIDS_HEADER,
         )
 
+    def _requested_warm_admission(self) -> str | None:
+        if WARM_ADMISSION_HEADER not in self.headers:
+            return None
+        if len(self.headers.get_all(WARM_ADMISSION_HEADER, [])) != 1:
+            raise PermanentCapacityError("duplicate warm admission header", 400, "invalid_warm_admission")
+        return parse_warm_admission(self.headers.get(WARM_ADMISSION_HEADER, ""))
+
     def _send_capacity_failure(
         self,
         failure: CapacityError,
@@ -6740,6 +7063,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if failure.admission_retained:
             payload["admission_retained"] = True
             payload["resume_ttl_ms"] = int(POOL_RESUME_TTL * 1000)
+        if isinstance(failure, WarmPreflightRequired):
+            payload["admission_retained"] = failure.admission_retained
+            payload["backend_started"] = False
         if failure.queue_position is not None:
             payload["queue_position"] = failure.queue_position
         if failure.queue_ticket is not None:
@@ -6860,13 +7186,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if "gpu_uuids" in payload else None,
                     "gpu_uuids",
                 )
-                result = self.broker.ensure_capacity(
-                    str(payload.get("model") or ""),
-                    parallel,
-                    endpoint,
-                    gpu_uuids,
-                    triggered_by=self._client_reference(),
-                )
+                proof_only = payload.get("warm_admission_proof", False)
+                if type(proof_only) is not bool:
+                    raise ValueError("warm_admission_proof must be boolean")
+                if proof_only:
+                    result = self.broker.warm_admission_proof(
+                        str(payload.get("model") or ""), parallel, gpu_uuids)
+                else:
+                    result = self.broker.ensure_capacity(
+                        str(payload.get("model") or ""), parallel, endpoint, gpu_uuids,
+                        triggered_by=self._client_reference(),
+                    )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
                 self._send_capacity_failure(exc)
@@ -6904,6 +7234,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         queue_policy = "wait"
         retained_request = None
         gpu_uuids = None
+        warm_admission = None
         is_resume = False
         client_key = ""
         try:
@@ -6913,6 +7244,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 queue_policy,
             ) = self._requested_admission_controls(path)
             gpu_uuids = self._requested_gpu_uuids()
+            warm_admission = self._requested_warm_admission()
             resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
             if resume_header and resume_header.lower() != "true":
                 raise PermanentCapacityError(
@@ -6937,7 +7269,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 retained_request, completed = self.broker.resume_request_lookup(
-                    logical_request_id, self.command, path
+                    logical_request_id, self.command, path, warm_admission, gpu_uuids
                 )
                 if completed is not None:
                     self._send_completed_response(completed)
@@ -6964,7 +7296,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 gpu_uuids = retained_request.gpu_uuids
+                warm_admission = retained_request.warm_admission
             else:
+                if warm_admission is not None:
+                    try:
+                        original_payload = json.loads(body)
+                        original_model = canonical_model_tag(str(original_payload.get("model") or "")) if isinstance(original_payload, dict) else ""
+                        self.broker.validate_warm_body(warm_admission, original_model, path, body)
+                    except (ValueError, TypeError) as exc:
+                        raise PermanentCapacityError("warm inference requires valid JSON", 400,
+                                                     "invalid_warm_admission") from exc
                 body = clamp_request(self.path, content_type, body)
                 # The routed model is read from the body on path alone, for the
                 # same reason the clamp above is. Keying this on the declared
@@ -6991,6 +7332,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     + b"\0"
                     + ",".join(gpu_uuids or ()).encode()
                     + b"\0"
+                    + ((b"warm-admission\0" + warm_admission.encode() + b"\0")
+                       if warm_admission is not None else b"")
                     + body
                 ).hexdigest()
                 if logical_request_id and path in INFERENCE_PATHS:
@@ -7008,6 +7351,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         model=model,
                         fingerprint=fingerprint,
                         gpu_uuids=gpu_uuids,
+                        warm_admission=warm_admission,
                     )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
@@ -7021,6 +7365,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 workload_class=workload_class,
                 queue_policy=queue_policy,
                 gpu_uuids=gpu_uuids,
+                warm_admission=warm_admission,
                 client=self._client_reference(),
             )
         except ClientDisconnected:
@@ -7052,7 +7397,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         lane = admission.lane
         try:
             body = self.broker.prepare_managed_body(lane, path, body)
+            if admission.warm_admission is not None:
+                self.broker.validate_warm_body(admission.warm_admission, model, path, body, prepared=True)
+                with self.broker.cv:
+                    eligible = self.broker._validate_warm_admission_locked(
+                        admission.warm_admission, model, gpu_uuids)
+                    if lane.lane_id not in eligible:
+                        raise WarmPreflightRequired(admission_retained=True)
         except CapacityError as exc:
+            if admission.warm_admission is not None:
+                with self.broker.cv:
+                    self.broker._record_logical_tombstone_locked(
+                        admission.logical_request_id, admission.request_id, "warm_preflight_required")
+                if isinstance(exc, WarmPreflightRequired):
+                    exc.admission_retained = True
             self.broker.proxy_exit(admission, model, False)
             with self.broker.cv:
                 queue = self.broker._queue_summary_locked()
@@ -7095,6 +7453,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "x-ollama-unify-workload-class",
                 "x-ollama-unify-queue-policy",
                 "x-ollama-unify-gpu-uuids",
+                "x-ollama-unify-warm-admission",
             }
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS
@@ -7285,7 +7644,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body_bytes=response_body_bytes,
                     body_sha256=response_digest.hexdigest(),
                     unavailable_reason=unavailable_reason,
+                    warm_admission=admission.warm_admission,
                 )
+        except WarmPreflightRequired as exc:
+            # Ownership was admitted, but no backend request was sent. Keep
+            # the original certificate bound; do not advertise safe recertify.
+            self._send_capacity_failure(exc, request_id=admission.request_id,
+                                        logical_request_id=admission.logical_request_id)
         except ClientDisconnected:
             pass
         except Exception as exc:

@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""CPU-only HTTP/proc regressions for conditional warm-lane admission."""
+import concurrent.futures
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import unittest
+from unittest import mock
+
+HELPER = sys.argv.pop(1)
+FIXTURE_BIN = sys.argv.pop(1)
+os.environ['OLLAMA_UNIFY_CONFIG'] = '/nonexistent/warm-admission-config'
+os.environ['OLLAMA_UNIFY_LEASE_STATE'] = '/nonexistent/warm-admission-leases'
+os.environ['OLLAMA_UNIFY_MODEL_POLICY_STATE'] = '/nonexistent/warm-admission-policy'
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+n = load('warm_admission_negotiator', HELPER)
+p = load('warm_admission_pool_fixture', pathlib.Path(__file__).with_name('test-negotiator-pool.py'))
+MODEL, DIGEST = p.MODEL, p.MODEL_DIGEST
+GPUS = ['GPU-large-0', 'GPU-large-1']
+HEADER = 'X-Ollama-Unify-Warm-Admission'
+CAPACITY = '/.well-known/ollama-unify-gpu-negotiator/capacity'
+
+
+def harness(**kwargs):
+    return p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True,
+                         selected_gpus=GPUS, max_servers=3, **kwargs)
+
+
+def proof(h, parallel=1):
+    return p.http_json(h.proxy_port, 'POST', CAPACITY, {
+        'model': MODEL, 'parallel': parallel, 'endpoint': '/api/chat',
+        'gpu_uuids': GPUS, 'warm_admission_proof': True,
+    })
+
+
+def send(h, certificate, request_id='warm-request', logical_id=None, delay=0,
+         extra=None, body=None, gpu_uuids=GPUS):
+    headers = {'X-Ollama-Unify-Workload-Class': 'foreground'}
+    if gpu_uuids is not None:
+        headers['X-Ollama-Unify-GPU-UUIDs'] = ','.join(gpu_uuids)
+    if certificate is not None:
+        headers[HEADER] = json.dumps(certificate)
+    if logical_id:
+        headers['X-Ollama-Unify-Logical-Request-Id'] = logical_id
+    headers.update(extra or {})
+    payload = body if body is not None else {
+        'model': MODEL, 'stream': False, 'mock_request_id': request_id,
+        'mock_delay': delay, 'options': {'num_ctx': 262144},
+    }
+    return p.http_json(h.proxy_port, 'POST', '/api/chat', payload,
+                       timeout=8, extra_headers=headers)
+
+
+def resume(h, logical_id, certificate=None, extra=None):
+    headers = {'X-Ollama-Unify-Logical-Request-Id': logical_id,
+               'X-Ollama-Unify-Resume-Request': 'true'}
+    if certificate is not None:
+        headers[HEADER] = json.dumps(certificate)
+    headers.update(extra or {})
+    return p.http_json(h.proxy_port, 'POST', '/api/chat', None,
+                       timeout=8, extra_headers=headers)
+
+
+class WarmAdmissionHTTPTests(unittest.TestCase):
+    def prepare(self, h, parallel=1):
+        status, result, _ = h.capacity(MODEL, parallel, '/api/chat', GPUS)
+        self.assertEqual(status, 200, result)
+        status, result, _ = proof(h, parallel)
+        self.assertEqual(status, 200, result)
+        return result
+
+    def stale(self, response, retained=False):
+        self.assertEqual(response[0], 503, response)
+        self.assertEqual(response[1]['reason_code'], 'warm_preflight_required')
+        self.assertIs(response[1]['admission_retained'], retained)
+        self.assertIs(response[1]['backend_started'], False)
+
+    def test_proof_only_does_not_load_and_exposes_actual_process_identity(self):
+        with harness() as h:
+            self.stale(proof(h))
+            self.assertEqual(p.managed_lanes(h.status()), [])
+            self.assertEqual(p.events(h.event_log), [])
+            result = self.prepare(h, 2)
+            self.assertEqual(len(result['warm_admission']['lanes']), 2)
+            self.assertEqual(result['warm_admission']['model_digest'], DIGEST)
+            self.assertEqual(result['warm_admission']['context_length'], 262144)
+            starts = [e for e in p.events(h.event_log) if e['kind'] == 'start']
+            for lane in result['warm_admission_lanes']:
+                self.assertIn(lane['server_process']['pid'], [e['pid'] for e in starts])
+                self.assertIn(lane['server_process'], lane['runtime_processes'])
+                self.assertGreater(lane['server_process']['start_time_ticks'], 0)
+                self.assertEqual(lane['native_ps']['size_vram'], lane['native_ps']['size'])
+                self.assertNotIn('expires_at', lane['native_ps'])
+                self.assertNotIn('port', lane)
+            self.assertEqual(proof(h, 2)[1]['warm_admission'], result['warm_admission'])
+            self.assertEqual(len([e for e in p.events(h.event_log) if e['kind'] == 'start']), 2)
+
+    def test_idle_retirement_rejects_before_retention_then_same_id_can_recertify(self):
+        with harness(idle_timeout=1) as h:
+            old = self.prepare(h)['warm_admission']
+            p.wait_until(lambda: not p.managed_lanes(h.status()), 'ordinary idle retirement', timeout=5)
+            before = h.status()['parallel_pool']['queue']['enqueued_total']
+            self.stale(send(h, old, logical_id='warm:never-admitted'))
+            self.assertEqual(h.status()['parallel_pool']['queue']['enqueued_total'], before)
+            self.assertEqual(p.request_events(h.event_log), [])
+            self.stale(proof(h))
+            fresh = self.prepare(h)['warm_admission']
+            self.assertNotEqual(old['lanes'], fresh['lanes'])
+            self.assertEqual(send(h, fresh, logical_id='warm:never-admitted')[0], 200)
+            self.assertEqual(len(p.request_events(h.event_log)), 1)
+
+    def test_partial_retirement_uses_surviving_certified_lane_only(self):
+        with harness() as h:
+            result = self.prepare(h, 2)
+            certificate = result['warm_admission']
+            retired = certificate['lanes'][1]['id']
+            p.control(h.socket_path, {'action': 'stop_lane', 'lane_id': retired})
+            response = send(h, certificate)
+            self.assertEqual(response[0], 200, response)
+            self.assertEqual(response[2]['X-Ollama-Unify-Lane'], certificate['lanes'][0]['id'])
+            self.assertEqual(len(p.managed_lanes(h.status())), 1)
+
+    def test_busy_certified_lane_queues_without_growth_or_new_lane_selection(self):
+        with harness(resume_ttl=3) as h:
+            certificate = self.prepare(h)['warm_admission']
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(send, h, certificate, 'busy-certified', 'warm:busy', 1.1)
+                p.wait_until(lambda: len(p.request_events(h.event_log)) == 1, 'certified active request')
+                queued = send(h, certificate, 'queued-certified', 'warm:queued', extra={
+                    'X-Ollama-Unify-Admission-Wait-Ms': '100'})
+                self.assertEqual(queued[0], 503, queued)
+                self.assertIs(queued[1]['admission_retained'], True)
+                self.assertEqual(len(p.managed_lanes(h.status())), 1)
+                # An unrelated explicit capacity expansion cannot widen the
+                # already-retained conditional job's eligible lane set.
+                self.assertEqual(h.capacity(MODEL, 2, '/api/chat', GPUS)[0], 200)
+                fresh = proof(h, 2)[1]['warm_admission']
+                self.assertNotEqual(fresh, certificate)
+                self.assertEqual(resume(h, 'warm:queued', fresh)[0], 409)
+                self.assertEqual(send(h, None, 'queued-certified', 'warm:queued')[0], 409)
+                self.assertEqual(first.result()[0], 200)
+                done = resume(h, 'warm:queued')
+                self.assertEqual(done[0], 200, done)
+                self.assertEqual(done[2]['X-Ollama-Unify-Lane'], certificate['lanes'][0]['id'])
+                self.assertEqual(len(p.request_events(h.event_log)), 2)
+
+    def test_completed_replay_survives_retirement_but_cannot_change_certificate(self):
+        with harness(completed_ttl=10) as h:
+            certificate = self.prepare(h)['warm_admission']
+            first = send(h, certificate, logical_id='warm:completed')
+            self.assertEqual(first[0], 200, first)
+            p.control(h.socket_path, {'action': 'stop_lane', 'lane_id': certificate['lanes'][0]['id']})
+            replay = send(h, certificate, logical_id='warm:completed')
+            self.assertEqual(replay[0], 200, replay)
+            self.assertEqual(replay[1], first[1])
+            self.assertEqual(replay[2]['X-Ollama-Unify-Response-Replayed'], 'true')
+            self.assertEqual(resume(h, 'warm:completed')[0], 200)
+            self.assertEqual(resume(h, 'warm:completed', extra={
+                'X-Ollama-Unify-GPU-UUIDs': GPUS[0]})[0], 409)
+            changed = copy.deepcopy(certificate)
+            changed['lanes'][0]['generation_id'] = 'f' * 64
+            self.assertEqual(resume(h, 'warm:completed', changed)[0], 409)
+            self.assertEqual(send(h, None, logical_id='warm:completed')[0], 409)
+            self.assertEqual(len(p.request_events(h.event_log)), 1)
+
+    def test_completed_expiry_and_eviction_retain_certificate_in_existing_tombstone(self):
+        for mode in ['expired', 'evicted']:
+            with self.subTest(mode=mode), harness(completed_ttl=1 if mode == 'expired' else 10,
+                                                 completed_max_entries=1) as h:
+                certificate = self.prepare(h)['warm_admission']
+                self.assertEqual(send(h, certificate, logical_id='warm:old-completion')[0], 200)
+                if mode == 'expired':
+                    p.wait_until(lambda: h.status()['parallel_pool']['completed_responses']['entries'] == 0,
+                                 'completed cache expiry', timeout=2)
+                else:
+                    self.assertEqual(send(h, certificate, 'replacement', 'warm:replacement')[0], 200)
+                changed = copy.deepcopy(certificate)
+                changed['lanes'][0]['generation_id'] = 'f' * 64
+                self.assertEqual(send(h, None, logical_id='warm:old-completion')[0], 409)
+                self.assertEqual(send(h, changed, logical_id='warm:old-completion')[0], 409)
+                self.assertEqual(send(h, certificate, logical_id='warm:old-completion')[0], 200)
+
+    def test_full_body_new_certificate_can_start_after_ordinary_tombstone_expiry(self):
+        with harness(completed_ttl=0.3) as h:
+            certificate = self.prepare(h)['warm_admission']
+            self.assertEqual(send(h, certificate, logical_id='warm:post-ttl')[0], 200)
+            p.wait_until(lambda: h.status()['parallel_pool']['completed_responses']['entries'] == 0,
+                         'cache expiry before new certificate')
+            self.assertEqual(h.capacity(MODEL, 2, '/api/chat', GPUS)[0], 200)
+            new_certificate = proof(h, 2)[1]['warm_admission']
+            self.assertNotEqual(certificate, new_certificate)
+            time.sleep(0.35)
+            # No body-free resume has run: full-body admission itself must
+            # honor the ordinary bounded tombstone lifetime.
+            response = send(h, new_certificate, logical_id='warm:post-ttl')
+            self.assertEqual(response[0], 200, response)
+
+    def test_stale_tombstone_does_not_advertise_safe_recertification(self):
+        with harness(completed_ttl=1) as h:
+            certificate = self.prepare(h)['warm_admission']
+            self.assertEqual(send(h, certificate, logical_id='warm:owned-tombstone')[0], 200)
+            p.wait_until(lambda: h.status()['parallel_pool']['completed_responses']['entries'] == 0,
+                         'completed record becomes owned tombstone')
+            p.control(h.socket_path, {'action': 'stop_lane', 'lane_id': certificate['lanes'][0]['id']})
+            self.stale(send(h, certificate, logical_id='warm:owned-tombstone'), retained=True)
+
+    def test_yield_timeout_cannot_remove_original_retained_certificate(self):
+        with harness() as h:
+            certificate = self.prepare(h)['warm_admission']
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(send, h, certificate, 'yield-active', None, 0.8)
+                p.wait_until(lambda: len(p.request_events(h.event_log)) == 1, 'active lane for yield')
+                yielded = send(h, certificate, 'yield-pending', 'warm:yield', extra={
+                    'X-Ollama-Unify-Admission-Wait-Ms': '100', 'X-Ollama-Unify-Queue-Policy': 'yield'})
+                self.assertEqual(yielded[0], 503, yielded)
+                self.assertEqual(send(h, None, 'yield-pending', 'warm:yield')[0], 409)
+                self.assertEqual(first.result()[0], 200)
+
+    def test_prediction_options_remain_unchanged_on_native_wire(self):
+        with harness() as h:
+            certificate = self.prepare(h)['warm_admission']
+            options = {'num_ctx': 262144, 'num_gpu': -1, 'num_predict': 257,
+                       'temperature': 0.15, 'top_p': 0.8, 'seed': 7, 'stop': ['fixture-stop']}
+            response = send(h, certificate, body={
+                'model': MODEL, 'mock_request_id': 'sampling-preserved', 'options': options})
+            self.assertEqual(response[0], 200, response)
+            self.assertEqual(p.request_events(h.event_log)[0]['options'], options)
+
+    def test_boot_generation_context_digest_and_scope_mismatches_never_dispatch(self):
+        with harness() as h:
+            certificate = self.prepare(h)['warm_admission']
+            for key, value in [('broker_instance_id', 'f' * 64), ('model_digest', 'f' * 64),
+                               ('context_length', 8192), ('gpu_uuids', list(reversed(GPUS)))]:
+                changed = copy.deepcopy(certificate)
+                changed[key] = value
+                body = {'model': MODEL, 'options': {'num_ctx': changed['context_length']}}
+                self.stale(send(h, changed, logical_id='warm:mismatch:' + key, body=body))
+            changed = copy.deepcopy(certificate)
+            changed['lanes'][0]['generation_id'] = 'f' * 64
+            self.stale(send(h, changed, logical_id='warm:mismatch:generation'))
+            self.stale(send(h, certificate, gpu_uuids=None))
+            self.assertEqual(p.request_events(h.event_log), [])
+            self.assertEqual(h.status()['parallel_pool']['queue']['enqueued_total'], 0)
+            self.assertEqual(send(h, certificate)[0], 200)
+
+    def test_malformed_and_runtime_reload_options_rejected_before_claim(self):
+        with harness() as h:
+            certificate = self.prepare(h)['warm_admission']
+            for extra in [{HEADER: '{}'}, {HEADER: 'null'}, {HEADER: ''}]:
+                response = send(h, None, extra=extra)
+                self.assertEqual(response[0], 400, response)
+            for changes in [*[{'keep_alive': value} for value in (0, '0s', '0m', '0ms', '0.0s', -1, '30m')],
+                            {'options': {'num_ctx': 8192}}, {'options': {'num_gpu': 0}},
+                            {'options': {'main_gpu': 0}}, {'runner': 'foreign-variant'},
+                            *[{'options': {key: True}} for key in (
+                                'num_batch', 'num_thread', 'low_vram', 'use_mmap', 'use_mlock',
+                                'f16_kv', 'vocab_only', 'logits_all', 'draft_num_predict',
+                                'future_loader_option')]]:
+                body = {'model': MODEL, 'mock_request_id': 'must-not-dispatch', **changes}
+                response = send(h, certificate, logical_id='warm:invalid', body=body)
+                self.assertEqual(response[0], 400, response)
+            self.assertEqual(h.status()['parallel_pool']['queue']['enqueued_total'], 0)
+            self.assertEqual(send(h, certificate, logical_id='warm:invalid')[0], 200)
+
+    def test_partial_gpu_residency_cannot_be_certified_singleton(self):
+        with harness(partial_gpu_residency=True) as h:
+            # Legacy loading policy is unchanged; only issuing the opt-in
+            # full-residency certificate rejects this partial offload.
+            self.assertEqual(h.capacity(MODEL, 1, '/api/chat', GPUS)[0], 200)
+            self.stale(proof(h))
+            self.assertEqual(p.request_events(h.event_log), [])
+
+    def test_broker_restart_and_reused_lane_id_cannot_reuse_old_certificate(self):
+        with harness() as first:
+            original = self.prepare(first)['warm_admission']
+        with harness() as second:
+            current = self.prepare(second)['warm_admission']
+            self.assertEqual(original['lanes'][0]['id'], current['lanes'][0]['id'])
+            self.assertNotEqual(original['broker_instance_id'], current['broker_instance_id'])
+            self.stale(send(second, original, logical_id='warm:restart'))
+            self.assertEqual(send(second, current, logical_id='warm:restart')[0], 200)
+
+
+class WarmNativeIdentityTests(unittest.TestCase):
+    def test_real_process_group_includes_native_children_and_detects_replacement(self):
+        process = subprocess.Popen([sys.executable, '-c',
+            'import subprocess,time; subprocess.Popen(["sleep","30"]); time.sleep(30)'],
+            start_new_session=True)
+        self.addCleanup(lambda: os.killpg(process.pid, 15) if process.poll() is None else None)
+        before = p.wait_until(lambda: (items if len(items := n.process_group_identity(process)) == 2 else None),
+                              'native child identity')
+        self.assertEqual(len(before), 2)
+        self.assertTrue(all(item['start_time_ticks'] > 0 for item in before))
+        child = next(item for item in before if item['pid'] != process.pid)
+        os.kill(child['pid'], 15)
+        after = p.wait_until(lambda: (items if len(items := n.process_group_identity(process)) == 1 else None),
+                             'native child disappearance')
+        self.assertNotEqual(before, after)
+        os.killpg(process.pid, 15)
+        process.wait(timeout=3)
+
+    def test_native_child_replacement_invalidates_certificate_before_backend_start(self):
+        process = subprocess.Popen([sys.executable, '-c',
+            'import subprocess,time; subprocess.Popen(["sleep","30"]); time.sleep(30)'],
+            start_new_session=True)
+        try:
+            before = p.wait_until(lambda: (items if len(items := n.process_group_identity(process)) == 2 else None),
+                                  'native child before certification')
+            profile = {'model_digest': DIGEST, 'context_length': 262144, 'extra_vram_mib': 1}
+            lane = n.Lane('lane-1', 'managed', '127.0.0.1', 1, GPUS[0], MODEL, 1, 1,
+                          time.time(), time.time(), process, gpu_uuids=(GPUS[0],), context_profile=profile)
+            row = {'name': MODEL, 'digest': DIGEST, 'context_length': 262144,
+                   'size': 4096, 'size_vram': 4096, 'expires_at': 'volatile'}
+            broker = n.Broker()
+            broker.lanes['lane-1'] = lane
+            with mock.patch.object(n, 'POOL_ENABLED', True), \
+                 mock.patch.object(n, 'effective_model_context_profile', return_value=profile), \
+                 mock.patch.object(n, 'backend_json_at', return_value={'models': [row]}), \
+                 mock.patch.object(broker, '_ollama_blocked_gpus_locked', return_value=set()), \
+                 mock.patch.object(broker, '_policy_constraint_locked', side_effect=lambda _model, scope: scope):
+                issued = broker.warm_admission_proof(MODEL, 1, tuple(GPUS))
+                certificate = n.parse_warm_admission(json.dumps(issued['warm_admission']))
+                with broker.cv:
+                    broker._register_active_request_locked(lane, 'actual-dispatch', 'warm:native-child')
+                    broker.active_request_records['actual-dispatch'].warm_admission = certificate
+                admission = n.Admission(lane, 'actual-dispatch', 'warm:native-child', 'fingerprint', 0, 1, 1,
+                                        warm_admission=certificate)
+                child = next(item for item in before if item['pid'] != process.pid)
+                os.kill(child['pid'], 15)
+                p.wait_until(lambda: len(n.process_group_identity(process)) == 1, 'native child exit')
+                with self.assertRaises(n.WarmPreflightRequired) as failure:
+                    broker.request_backend_started(admission, object())
+                self.assertIs(failure.exception.admission_retained, True)
+                self.assertIs(broker.active_request_records['actual-dispatch'].backend_started, False)
+                refreshed = broker.warm_admission_proof(MODEL, 1, tuple(GPUS))
+                self.assertNotEqual(issued['warm_admission']['lanes'], refreshed['warm_admission']['lanes'])
+        finally:
+            os.killpg(process.pid, 15)
+            process.wait(timeout=3)
+
+
+if __name__ == '__main__':
+    unittest.main()
