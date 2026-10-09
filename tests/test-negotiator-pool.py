@@ -2780,7 +2780,9 @@ def test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin):
         helper,
         fixture_bin,
         max_servers=1,
-        completed_ttl=0.2,
+        # Eviction must happen before TTL expiry; a 200ms TTL coupled these
+        # independent behaviors to the timing of three real HTTP requests.
+        completed_ttl=30,
         completed_max_entries=2,
     ) as harness:
         for index in range(1, 4):
@@ -2792,6 +2794,7 @@ def test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin):
         bounded = harness.status()["parallel_pool"]["completed_responses"]
         assert bounded["entries"] == 2
         assert bounded["evicted_total"] == 1
+        assert bounded["expired_total"] == 0
 
         regenerated = chat(
             harness.proxy_port, MODEL, "completed-evict-1", 0, 8,
@@ -2805,6 +2808,13 @@ def test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin):
         ]
         assert generated == ["completed-evict-1", "completed-evict-1"]
 
+    # Test the actual short expiry separately, without competing max-entry
+    # eviction removing the item first.
+    with PoolHarness(helper, fixture_bin, max_servers=1, completed_ttl=0.2,
+                     completed_max_entries=2) as harness:
+        seeded = chat(harness.proxy_port, MODEL, "completed-evict-1", 0, 8,
+                      logical_request_id="turn:completed-evict-1")
+        assert seeded[0] == 200, seeded
         time.sleep(0.25)
         after_ttl = chat(
             harness.proxy_port, MODEL, "completed-evict-1", 0, 8,
@@ -2815,6 +2825,10 @@ def test_completed_response_cache_ttl_and_bounded_eviction(helper, fixture_bin):
         completed = harness.status()["parallel_pool"]["completed_responses"]
         assert completed["entries"] == 1
         assert completed["expired_total"] >= 1
+
+        generated = [event["request_id"] for event in request_events(harness.event_log)
+                     if event["request_id"] == "completed-evict-1"]
+        assert generated == ["completed-evict-1", "completed-evict-1"]
 
 
 def test_detached_logical_request_expires_without_inference(helper, fixture_bin):
