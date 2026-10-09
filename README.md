@@ -210,6 +210,90 @@ To preserve a running workload while upgrading a legacy host-wide lease, use `do
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
+### Opt-in lower-priority cache evacuation
+
+An operator can declare broker-owned **idle singleton caches** movable and give
+an ordinary external lease request a higher priority. Undeclared caches are
+protected. This opt-in path copies and verifies each cache at an eligible
+destination before retiring its original process group; it does not merely
+unload lower-priority weights. Without these options, existing acquisition
+behavior is unchanged.
+
+```bash
+# Inspect owners, health, and selected UUIDs before requesting CUDA capacity.
+docker gpu discover
+
+# Declare this exact model movable to these selected GPUs. Hard model GPU
+# policies still apply; the declaration cannot widen them.
+docker gpu set-cache-policy MODEL:TAG --movable --priority 10 \
+  --gpu GPU-DESTINATION-A --gpu GPU-DESTINATION-B
+
+# Reserve a different target for a higher-priority external workload.
+docker gpu acquire --owner voice-service \
+  --justification 'run the scoped voice service' --expected-duration 3600 \
+  --vram-mib 8192 --gpu GPU-TARGET --priority 20 \
+  --evacuation-id voice-start-001
+```
+
+The response has `lease.state: "pending"` and a token. It is **not** a ready
+external workload. Initialize the child with exactly the returned GPU UUIDs,
+then call `ready TOKEN`, heartbeat, and release only after its CUDA allocation
+exits. `docker gpu run` accepts the same `--priority` and `--evacuation-id`
+options and retains its normal readiness/heartbeat/child-exit lifecycle.
+Before growing an active allocation, use
+`docker gpu prepare TOKEN --priority 20 --evacuation-id voice-grow-002`, grow it,
+then call `ready TOKEN` again. A failed evacuation does not revoke the existing
+active lease. Supplying a priority without an evacuation ID is rejected.
+
+Priorities are integers from -1000 to 1000; only strictly lower-priority caches
+may move. The broker drains admitted work to completion, preserves queued and
+retained request identities/bodies, and refuses to move a cache with queued
+demand. No admitted inference is replayed or cancelled for this feature. A
+moved cache has a new lane/runtime generation; an old warm certificate never
+authorizes the replacement. Clients must obtain a fresh proof for future work.
+
+Planning uses live physical memory and reservation accounting. It may first
+move a different eligible cache to consolidate room, with at most eight caches
+and a bounded search. Each destination is rechecked before loading, uses the
+same model digest/context, and must report full GPU allocation and exact
+process-group placement. There must be one spare managed server slot for the
+copy. Existing peer groups are indivisible and cannot be repartitioned or
+packed into a singleton by evacuation. External leases, quarantined GPUs,
+health faults, hard GPU policies, uncertain process exit, insufficient room,
+and protected caches produce a refusal; there is no CPU or alternate-GPU
+fallback. All source/destination promises remain charged until their whole
+process groups exit.
+
+`docker gpu status` exposes token-free `cache_residency.policies` and
+`cache_residency.operations`, including source/destination identities and the
+transaction phase. Policy and operation state is stored in the private,
+fsynced `cache-residency.json` next to the lease state (override with
+`OLLAMA_UNIFY_CACHE_RESIDENCY_STATE`). Evacuation children wait on a private
+startup pipe until their PID/start/process group has been durably recorded;
+parent failure before that acknowledgement exits the wrapper before native
+Ollama can load CUDA. A stable evacuation ID binds the exact request and priority. Repeating a successful request returns its existing
+linked lease; changing its body is rejected. A failed or recovered operation
+requires a new ID for a new request, so a lost response never silently starts
+another move.
+
+Use `docker gpu cancel-evacuation ID` to request rollback before grant. Rollback
+warms the original cache before retiring its destination. If restoration or
+process exit cannot be proven, status remains `restoration_pending` and the
+affected scopes remain blocked. An interrupted broker reloads that obligation
+as `recovery_pending`; it never adopts or kills an old PID or replays a request.
+After **all recorded process generations have exited**, an operator can call
+`docker gpu recover-evacuation ID` to restore the archived cache identities
+under the current hard policies. Recovery grants no new lease. If policy has
+changed, recovery refuses; cancel the obsolete obligation only after its
+recorded processes have exited. Ordinary lease heartbeat/release semantics
+still apply to any already persisted grant.
+
+The journal holds up to 256 operations. After settlement and release of its
+linked lease, `docker gpu archive-evacuation ID` returns the token-free record
+and removes it from the live journal. Save that returned record for audit;
+never reuse an archived operation ID. Remove a movable declaration with
+`docker gpu set-cache-policy MODEL:TAG --priority 10` (without `--movable`).
+
 ### Broker-owned parallel Ollama lanes
 
 Local clients that need concurrent model processes can ask the public broker to create capacity before starting their work:

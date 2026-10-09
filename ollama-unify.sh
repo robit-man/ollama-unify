@@ -1306,6 +1306,19 @@ MODEL_POLICY_PATH = Path(os.environ.get(
     "OLLAMA_UNIFY_MODEL_POLICY_STATE",
     str(LEASE_STATE_PATH.with_name("model-gpu-policy.json")),
 ))
+CACHE_STATE_PATH = Path(os.environ.get(
+    "OLLAMA_UNIFY_CACHE_RESIDENCY_STATE", str(LEASE_STATE_PATH.with_name("cache-residency.json"))
+))
+CACHE_STARTUP_WRAPPER = """import os, sys
+fd = int(sys.argv[1])
+try:
+    permit = os.read(fd, 1)
+finally:
+    os.close(fd)
+if permit != b'\\x01':
+    sys.exit(125)
+os.execve(sys.argv[2], sys.argv[2:], os.environ)
+"""
 POOL_ENABLED = env_bool(
     "OLLAMA_UNIFY_POOL_ENABLED", BACKEND_TYPE == "cuda" and bool(SELECTED_GPUS)
 )
@@ -2464,6 +2477,7 @@ class Lease:
     gpu_uuids: list[str]
     justification: str = ""
     expected_release_at: float = 0.0
+    evacuation_id: str = ""
 
 
 def lease_requires_exclusive_gpus(gpu_uuids: list[str]) -> bool:
@@ -3003,6 +3017,7 @@ class Broker:
         self.leases = self._load_leases()
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
+        self.cache_policies, self.evacuations = self._load_cache_state()
         self.draining = any(
             lease.state in ("pending", "active", "revoking") and not lease.gpu_uuids
             for lease in self.leases.values()
@@ -3103,6 +3118,7 @@ class Broker:
                     expected_release_at=float(
                         raw.get("expected_release_at") or 0
                     ),
+                    evacuation_id=str(raw.get("evacuation_id") or ""),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -3139,6 +3155,496 @@ class Broker:
         temp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, MODEL_POLICY_PATH)
+
+    def _load_cache_state(self) -> tuple[dict, dict]:
+        try:
+            raw = json.loads(CACHE_STATE_PATH.read_text())
+        except FileNotFoundError:
+            return {}, {}
+        if (not isinstance(raw, dict) or raw.get("schema") != "io.ollama-unify.cache-residency.v1"
+                or not isinstance(raw.get("policies"), dict) or not isinstance(raw.get("operations"), dict)):
+            raise ValueError("invalid cache residency journal; refusing to discard recovery ownership")
+        operations = raw["operations"]
+        for operation in operations.values():
+            if not isinstance(operation, dict) or not isinstance(operation.get("moves"), list):
+                raise ValueError("invalid evacuation operation")
+            if operation.get("state") not in ("lease_pending", "rolled_back", "failed", "cancelled"):
+                operation["state"] = "recovery_pending"
+        return raw["policies"], operations
+
+    def _persist_cache_state_locked(self) -> None:
+        CACHE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CACHE_STATE_PATH.with_name(f".{CACHE_STATE_PATH.name}.{os.getpid()}.tmp")
+        data = {"schema": "io.ollama-unify.cache-residency.v1",
+                "policies": self.cache_policies, "operations": self.evacuations}
+        with temporary.open("w", encoding="utf-8") as stream:
+            os.chmod(temporary, 0o600)
+            stream.write(json.dumps(data, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, CACHE_STATE_PATH)
+        directory = os.open(CACHE_STATE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    @staticmethod
+    def _evacuation_public(operation: dict) -> dict:
+        return json.loads(json.dumps({key: value for key, value in operation.items()
+            if key not in ("lease_token", "request")}))
+
+    def _evacuation_recovery_scopes_locked(self, owner: str = "") -> set[str]:
+        protected = set()
+        for operation in self.evacuations.values():
+            if operation["id"] == owner or operation.get("state") not in ("recovery_pending", "restoration_pending"):
+                continue
+            protected.update(operation["gpu_uuids"])
+            for move in operation["moves"]:
+                protected.update(move["source"]["gpu_uuids"])
+                protected.update(move["destination"]["gpu_uuids"])
+            protected.update(operation.get("destination_reservation", {}))
+            for attempt in operation.get("spawn_attempts", []):
+                protected.update(attempt["gpu_uuids"])
+        return protected
+
+    @staticmethod
+    def _recorded_runtime_exited(identity: dict) -> bool:
+        group_id = identity.get("process_group_id")
+        if group_id:
+            try:
+                for entry in Path("/proc").iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                    except FileNotFoundError:
+                        continue
+                    if int(fields[2]) == group_id and fields[0] not in ("Z", "X"):
+                        return False
+            except (OSError, ValueError, IndexError):
+                return False
+        for member in identity.get("runtime_processes", []):
+            try:
+                fields = Path(f"/proc/{member['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[19]) == member["start_time_ticks"] and fields[0] not in ("Z", "X"):
+                    return False
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                return False
+        return True
+
+    def recover_evacuation(self, operation_id: str) -> dict:
+        """Explicit recovery, never adoption or termination of an orphan PID.
+
+        A restart cannot reconstruct old active requests. Until every recorded
+        process generation exits, all affected scopes remain protected. After
+        exit, restore exact archived cache identities under current hard policy;
+        this operation creates no external grant or inference replay.
+        """
+        with self.transition:
+            with self.cv:
+                operation = self.evacuations.get(operation_id)
+                if operation is None or operation.get("state") not in ("recovery_pending", "restoration_pending"):
+                    raise ValueError("evacuation does not require recovery")
+                identities = list(operation.get("source_identities", {}).values())
+                identities += [move["destination"] for move in operation["moves"]]
+                identities += operation.get("spawn_attempts", [])
+                if operation.get("destination_attempt"):
+                    identities.append(operation["destination_attempt"])
+                if any(not self._recorded_runtime_exited(identity) for identity in identities):
+                    raise CapacityError("recorded process groups have not exited; recovery retains scopes",
+                                        reason_code="evacuation_recovery_wait")
+                if self._cache_policy_identity_locked() != operation["policy_sha256"]:
+                    raise CapacityError("cache policy changed; operator must cancel the obsolete recovery",
+                                        reason_code="evacuation_changed")
+            self.begin_drain(f"recover cache evacuation {operation_id}")
+            restored = []
+            try:
+                for source in operation.get("source_identities", {}).values():
+                    completed = next((move for move in operation["moves"]
+                                      if move["source"]["lane_id"] == source["lane_id"] and move["state"] == "moved"), None)
+                    scope = tuple(completed["destination"]["gpu_uuids"] if completed else source["gpu_uuids"])
+                    with self.cv:
+                        if (operation.get("cancel_requested") or self.stopping.is_set()
+                                or self._cache_policy_identity_locked() != operation["policy_sha256"]
+                                or len([lane for lane in self.lanes.values() if lane.kind == "managed"]) >= POOL_MAX_SERVERS):
+                            raise CapacityError("recovery owner, policy or lane capacity changed", reason_code="evacuation_changed")
+                        allowed = self._policy_constraint_locked(source["model"], scope)
+                        if allowed != scope:
+                            raise CapacityError("recovery cannot widen model hard scope", reason_code="evacuation_changed")
+                    self._require_safe_gpu_transition(scope)
+                    required, capabilities = self._model_profile(source["model"])
+                    if effective_model_context_profile(source["model"]) != source["context_profile"]:
+                        raise CapacityError("recovery context identity changed", reason_code="evacuation_changed")
+                    live = {d["uuid"]: d for d in self._placement_devices(self._unregistered_gpus_locked()
+                        | self._lease_blocked_gpus_locked() | self._evacuation_recovery_scopes_locked(operation_id), operation_id)}
+                    if any(live.get(gpu, {}).get("free_mib", 0) < required + POOL_VRAM_RESERVE_MIB for gpu in scope):
+                        raise CapacityError("recovery destination is unavailable", reason_code="evacuation_no_destination")
+                    lane = self._spawn_lane(source["model"], scope, required, capabilities, "",
+                        {"key": "cache-recovery", "label": "cache evacuation recovery"},
+                        expected_profile=source["context_profile"], reservation_operation=operation_id)
+                    restored.append(lane)
+                    if self._cache_lane_identity(lane)["native"] != source["native"]:
+                        raise CapacityError("recovery artifact identity changed", reason_code="evacuation_changed")
+                    with self.cv:
+                        if (operation.get("cancel_requested") or self.stopping.is_set()
+                                or self._cache_policy_identity_locked() != operation["policy_sha256"]):
+                            raise CapacityError("recovery changed across warm-up", reason_code="evacuation_changed")
+                with self.cv:
+                    operation["state"] = "lease_pending" if any(lease.evacuation_id == operation_id for lease in self.leases.values()) else "rolled_back"
+                    operation["recovered_lanes"] = [self._cache_lane_identity(lane) for lane in restored]
+                    operation.pop("destination_reservation", None)
+                    self._persist_cache_state_locked()
+                return {"ok": True, "evacuation": self._evacuation_public(operation)}
+            except Exception:
+                self._stop_lanes(restored, "incomplete cache recovery")
+                raise
+            finally:
+                self.end_drain()
+
+    def set_cache_policy(self, model: str, movable: bool, priority: int,
+                         gpu_uuids: list[str]) -> dict:
+        model = canonical_model_tag(model)
+        if (not model or type(movable) is not bool or type(priority) is not int
+                or not -1000 <= priority <= 1000 or not isinstance(gpu_uuids, list)
+                or len(set(gpu_uuids)) != len(gpu_uuids)
+                or any(gpu not in SELECTED_GPUS for gpu in gpu_uuids)
+                or (movable and not gpu_uuids)):
+            raise ValueError("cache policy needs explicit movable/priority and selected destination UUIDs")
+        with self.cv:
+            previous = self.cache_policies.get(model)
+            policy = {"movable": movable, "priority": priority, "gpu_uuids": list(gpu_uuids)}
+            self.cache_policies[model] = policy
+            try:
+                self._persist_cache_state_locked()
+            except Exception:
+                if previous is None:
+                    self.cache_policies.pop(model, None)
+                else:
+                    self.cache_policies[model] = previous
+                raise
+            self.cv.notify_all()
+        return {"ok": True, "model": model, "cache_policy": policy}
+
+    def cancel_evacuation(self, operation_id: str) -> dict:
+        with self.cv:
+            operation = self.evacuations.get(operation_id)
+            if operation is None:
+                raise KeyError("unknown evacuation")
+            if operation["state"] == "lease_pending":
+                raise ValueError("evacuation already granted a lease; release that lease normally")
+            operation["cancel_requested"] = True
+            if operation["state"] in ("recovery_pending", "restoration_pending"):
+                identities = list(operation.get("source_identities", {}).values())
+                identities += [move["destination"] for move in operation["moves"]]
+                identities += operation.get("spawn_attempts", [])
+                if operation.get("destination_attempt"):
+                    identities.append(operation["destination_attempt"])
+                if all(self._recorded_runtime_exited(identity) for identity in identities):
+                    operation["state"] = "cancelled"
+                    operation.pop("destination_reservation", None)
+            self._persist_cache_state_locked()
+            self.cv.notify_all()
+            return {"ok": True, "evacuation": self._evacuation_public(operation)}
+
+    def archive_evacuation(self, operation_id: str) -> dict:
+        with self.transition, self.cv:
+            operation = self.evacuations.get(operation_id)
+            if operation is None:
+                raise KeyError("unknown evacuation")
+            if (operation["state"] not in ("lease_pending", "rolled_back", "failed", "cancelled")
+                    or any(lease.evacuation_id == operation_id for lease in self.leases.values())):
+                raise ValueError("only settled evacuation without a linked lease can be archived")
+            del self.evacuations[operation_id]
+            try:
+                self._persist_cache_state_locked()
+            except Exception:
+                self.evacuations[operation_id] = operation
+                raise
+            return {"ok": True, "archived_evacuation": self._evacuation_public(operation)}
+
+    def _cache_policy_identity_locked(self) -> str:
+        return hashlib.sha256(json.dumps([self.cache_policies, self.model_gpu_policy],
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _cache_lane_identity(self, lane: Lane) -> dict:
+        before = process_group_identity(lane.process)
+        rows = backend_json_at(lane.host, lane.port, "GET", "/api/ps", timeout=3).get("models")
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or canonical_model_tag(str(rows[0].get("name") or rows[0].get("model") or "")) != lane.model
+                or not re.fullmatch(r"[a-f0-9]{64}", str(rows[0].get("digest") or ""))
+                or type(rows[0].get("size")) is not int or rows[0]["size"] <= 0
+                or rows[0].get("size_vram") != rows[0]["size"]
+                or type(rows[0].get("context_length")) is not int or rows[0]["context_length"] <= 0
+                or not lane.context_profile_matches()
+                or (lane.context_profile and (
+                    rows[0].get("digest") != lane.context_profile["model_digest"]
+                    or rows[0].get("context_length") != lane.context_profile["context_length"]))):
+            raise CapacityError("cache source identity is not fully GPU verified", reason_code="gpu_placement_unverified")
+        usage = process_gpu_usage(lane.process)
+        if (set(usage) != set(lane.scope) or any(value <= 0 for value in usage.values())
+                or any(value > lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib) for gpu, value in usage.items())):
+            raise CapacityError("cache physical placement differs from its exact scope", reason_code="gpu_placement_unverified")
+        if before != process_group_identity(lane.process):
+            raise CapacityError("cache runtime changed during inspection", reason_code="gpu_placement_unverified")
+        installed = [row for row in backend_json("GET", "/api/tags", timeout=3).get("models", [])
+                     if canonical_model_tag(str(row.get("name") or row.get("model") or "")) == lane.model]
+        if len(installed) != 1 or installed[0].get("digest") != rows[0]["digest"]:
+            raise CapacityError("installed cache artifact changed", reason_code="evacuation_changed")
+        native = {key: rows[0].get(key) for key in ("digest", "context_length", "size", "size_vram")}
+        return {"lane_id": lane.lane_id, "model": lane.model, "gpu_uuids": list(lane.scope),
+                "reserved_mib": lane.reserved_mib, "reserved_mib_by_gpu": lane.reserved_mib_by_gpu,
+                "context_profile": lane.context_profile, "native": native,
+                "process_group_id": lane.process.pid, "runtime_processes": before}
+
+    def _assert_evacuation_current(self, operation: dict) -> None:
+        with self.cv:
+            if (self.evacuations.get(operation["id"]) is not operation
+                    or operation.get("cancel_requested") or self.stopping.is_set()
+                    or self._cache_policy_identity_locked() != operation["policy_sha256"]):
+                raise CapacityError("evacuation ownership or policy changed", reason_code="evacuation_changed")
+            if operation["kind"] == "prepare":
+                lease = self.leases.get(operation["request"]["token"])
+                if lease is None or lease.state != "active" or lease.owner != operation["owner"]:
+                    raise CapacityError("external resize owner changed", reason_code="evacuation_changed")
+
+    def _commit_cache_evacuation_locked(self, operation_id: str, lease: Lease) -> None:
+        # The lease link was persisted while this CV lock was held. Publish
+        # the grant phase before a concurrent cancellation can report success.
+        operation = self.evacuations[operation_id]
+        operation["lease_token"] = lease.token
+        operation["state"] = "lease_pending"
+        operation["completed_at"] = time.time()
+        self._persist_cache_state_locked()
+
+    def _plan_cache_evacuation(self, operation: dict) -> list[tuple[Lane, tuple[str, ...]]]:
+        target = set(operation["gpu_uuids"])
+        with self.cv:
+            lanes = [lane for lane in self.lanes.values() if lane.kind == "managed"]
+            victims = [lane for lane in lanes if set(lane.protected_scope).intersection(target)]
+            queued = {waiter.model for waiter in self.waiters}
+            eligible = []
+            for lane in lanes:
+                policy = self.cache_policies.get(lane.model, {})
+                if (policy.get("movable") is True and policy.get("priority", 1001) < operation["priority"]
+                        and not lane.in_flight and not lane.loading and not lane.retiring and lane.model not in queued):
+                    eligible.append(lane)
+            if any(lane not in eligible for lane in victims):
+                raise CapacityError("target has protected cache or queued certified demand", reason_code="evacuation_protected")
+            if not victims:
+                return []
+            if len(lanes) >= POOL_MAX_SERVERS:
+                raise CapacityError("copy-first evacuation needs one spare managed lane", reason_code="evacuation_no_destination")
+            blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked() | target
+        devices = self._placement_devices(blocked)
+        free = {device["uuid"]: max(0, int(device["free_mib"]) - POOL_VRAM_RESERVE_MIB) for device in devices}
+        # At most eight explicitly movable caches, one move per source, and a
+        # fixed search bound. Copy-first ordering can consolidate an off-target
+        # cache before placing a target cache; no unconstrained task planner.
+        eligible.sort(key=lambda lane: (lane not in victims, -lane.reserved_mib, lane.lane_id))
+        eligible = eligible[:8]
+        if any(lane not in eligible for lane in victims):
+            raise CapacityError("evacuation exceeds bounded cache plan", reason_code="evacuation_no_destination")
+        visits = 0
+        def search(remaining: list[Lane], available: dict[str, int], path: list) -> list | None:
+            nonlocal visits
+            visits += 1
+            if visits > 2000:
+                return None
+            if not any(lane in victims for lane in remaining):
+                return path
+            for lane in remaining:
+                # Existing peer groups are indivisible and cannot be packed
+                # into a singleton. No automatic repartition in this feature.
+                if len(lane.scope) != 1:
+                    continue
+                policy = self.cache_policies[lane.model]
+                with self.cv:
+                    allowed = self._policy_constraint_locked(lane.model, tuple(policy["gpu_uuids"])) or ()
+                choices = [gpu for gpu in allowed if gpu in available and gpu not in lane.scope
+                           and available[gpu] >= lane.reserved_mib]
+                choices.sort(key=lambda gpu: (available[gpu] - lane.reserved_mib, gpu))
+                for gpu in choices:
+                    next_free = dict(available)
+                    next_free[gpu] -= lane.reserved_mib
+                    for old in lane.scope:
+                        if old not in blocked:
+                            next_free[old] = next_free.get(old, 0) + lane.reserved_mib_by_gpu.get(old, lane.reserved_mib)
+                    found = search([item for item in remaining if item is not lane], next_free, [*path, (lane, (gpu,))])
+                    if found is not None:
+                        return found
+            return None
+        plan = search(eligible, free, [])
+        if plan is None:
+            raise CapacityError("no safe copy-first destination plan", reason_code="evacuation_no_destination")
+        return plan
+
+    def _rollback_cache_evacuation(self, operation: dict, moves: list[tuple[Lane, Lane]]) -> None:
+        # Restore exact model/profile/source scopes; never stop the verified
+        # destination until its replacement is warm. Failed rollback keeps a
+        # truthful restoration obligation and all surviving process promises.
+        incomplete = False
+        for source, destination in reversed(moves):
+            try:
+                if process_group_alive(source.process) and source.retiring:
+                    incomplete = True
+                    continue
+                if not process_group_alive(source.process):
+                    with self.cv:
+                        allowed = self._policy_constraint_locked(source.model, source.scope)
+                    if not source.allows(allowed) or not source.context_profile_matches():
+                        raise RuntimeError("original cache policy changed")
+                    required, capabilities = self._model_profile(source.model)
+                    live = {d["uuid"]: d for d in self._placement_devices(self._ollama_blocked_gpus_locked())}
+                    if any(live.get(gpu, {}).get("free_mib", 0) < required + POOL_VRAM_RESERVE_MIB for gpu in source.scope):
+                        raise RuntimeError("rollback capacity is unavailable")
+                    restored = self._spawn_lane(source.model, source.scope, required, capabilities, "",
+                        {"key": "cache-rollback", "label": "cache evacuation rollback"},
+                        dict(source.reserved_mib_by_gpu), expected_profile=source.context_profile,
+                        reservation_operation=operation["id"])
+                    if self._cache_lane_identity(restored)["native"] != operation["source_identities"][source.lane_id]["native"]:
+                        self._stop_lanes([restored], "rollback identity changed")
+                        raise RuntimeError("original cache artifact changed")
+                if self._stop_lanes([destination], "cache evacuation rollback"):
+                    incomplete = True
+            except Exception:
+                incomplete = True
+        with self.cv:
+            operation["state"] = "restoration_pending" if incomplete else (
+                "cancelled" if operation.get("cancel_requested") else "rolled_back")
+            if not incomplete:
+                operation.pop("destination_reservation", None)
+            self._persist_cache_state_locked()
+
+    def _lease_evacuation(self, kind: str, request: dict, priority: int, operation_id: str) -> dict:
+        if (type(priority) is not int or not -1000 <= priority <= 1000
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id)):
+            raise ValueError("evacuation requires bounded priority and stable operation ID")
+        fingerprint = hashlib.sha256(json.dumps([kind, request, priority], sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest()
+        with self.transition:
+            with self.cv:
+                old = self.evacuations.get(operation_id)
+                if old:
+                    if old["request_sha256"] != fingerprint:
+                        raise ValueError("evacuation ID already binds a different request")
+                    linked = next((lease for lease in self.leases.values() if lease.evacuation_id == operation_id), None)
+                    if linked:
+                        return {"ok": True, "lease": asdict(linked), "evacuation": self._evacuation_public(old)}
+                    raise CapacityError("evacuation has a durable terminal or recovery state; inspect status", 409,
+                                        "evacuation_requires_recovery", False, None)
+                if len(self.evacuations) >= 256:
+                    raise ValueError("evacuation journal is full; archive completed operations before accepting more")
+                if kind == "prepare":
+                    lease = self.leases.get(request["token"])
+                    if lease is None or lease.state != "active":
+                        raise ValueError("only an active exact lease can prepare evacuation")
+                    scope, owner = list(lease.gpu_uuids), lease.owner
+                else:
+                    scope, owner = list(request["requested_gpu_uuids"]), request["owner"]
+                if not scope or len(set(scope)) != len(scope) or set(scope) - set(SELECTED_GPUS):
+                    raise ValueError("evacuation requires an exact selected GPU scope")
+                if self.pending_lease():
+                    raise CapacityError("another external transition is pending", reason_code="lease_transition")
+                if any((not lease.gpu_uuids or set(scope).intersection(lease.gpu_uuids))
+                       and lease.token != request.get("token") for lease in self.leases.values()):
+                    raise CapacityError("requested scope has another external owner", reason_code="lease_transition")
+                operation = {"id": operation_id, "kind": kind, "owner": owner, "priority": priority,
+                    "gpu_uuids": scope, "request_sha256": fingerprint, "request": request,
+                    "policy_sha256": self._cache_policy_identity_locked(), "state": "draining",
+                    "created_at": time.time(), "moves": [], "source_identities": {}}
+                self.evacuations[operation_id] = operation
+                try:
+                    self._persist_cache_state_locked()
+                except Exception:
+                    # No drain, spawn or grant has started. Remove only this
+                    # uncommitted owner, so its failed journal cannot wedge ID.
+                    if self.evacuations.get(operation_id) is operation:
+                        del self.evacuations[operation_id]
+                    raise
+            moved, plan = [], []
+            try:
+                self.begin_drain(f"cache evacuation {operation_id}")
+                self._assert_evacuation_current(operation)
+                plan = self._plan_cache_evacuation(operation)
+                for source, destination_scope in plan:
+                    identity = self._cache_lane_identity(source)
+                    self._assert_evacuation_current(operation)
+                    with self.cv:
+                        if self.lanes.get(source.lane_id) is not source or source.in_flight or source.retiring:
+                            raise CapacityError("cache source generation changed", reason_code="evacuation_changed")
+                        operation["source_identities"][source.lane_id] = identity
+                        operation["current_source"] = source.lane_id
+                        operation.pop("destination_attempt", None)
+                        operation["state"] = "destination_reserved"
+                        operation["destination_reservation"] = {gpu: source.reserved_mib for gpu in destination_scope}
+                        self._persist_cache_state_locked()
+                    allowed = {d["uuid"]: d for d in self._placement_devices(set(scope), operation_id)}
+                    if any(allowed.get(gpu, {}).get("free_mib", 0) < source.reserved_mib + POOL_VRAM_RESERVE_MIB for gpu in destination_scope):
+                        raise CapacityError("destination live capacity changed", reason_code="evacuation_no_destination")
+                    required, capabilities = self._model_profile(source.model)
+                    if required > source.reserved_mib or not source.context_profile_matches():
+                        raise CapacityError("source memory identity changed", reason_code="evacuation_changed")
+                    destination = self._spawn_lane(source.model, destination_scope, required, capabilities, "",
+                        {"key": "cache-evacuation", "label": f"cache evacuation {operation_id}"},
+                        expected_profile=source.context_profile, reservation_operation=operation_id)
+                    moved.append((source, destination))
+                    destination_identity = self._cache_lane_identity(destination)
+                    self._assert_evacuation_current(operation)
+                    if identity != self._cache_lane_identity(source) or destination_identity["native"] != identity["native"]:
+                        raise CapacityError("cache artifact or runtime changed", reason_code="evacuation_changed")
+                    with self.cv:
+                        if any(waiter.model == source.model for waiter in self.waiters):
+                            raise CapacityError("new queued demand protects original cache", reason_code="evacuation_protected")
+                        operation["moves"].append({"source": identity, "destination": destination_identity, "state": "source_retiring"})
+                        operation.pop("destination_reservation", None)
+                        source.retiring = True
+                        operation["state"] = "source_retiring"
+                        self._persist_cache_state_locked()
+                    if self._stop_lanes([source], "lower priority cache evacuation"):
+                        raise CapacityError("source process group has not exited", reason_code="lane_stop_failed")
+                    with self.cv:
+                        operation["moves"][-1]["state"] = "moved"
+                        self._persist_cache_state_locked()
+                self._assert_evacuation_current(operation)
+                with self.cv:
+                    if any(lane.kind == "managed" and set(lane.protected_scope).intersection(scope)
+                           for lane in self.lanes.values()):
+                        raise CapacityError("requested scope is not yet free", reason_code="evacuation_changed")
+                result = self.acquire(**request, _evacuation_commit_id=operation_id) if kind == "acquire" else self.prepare(request["token"], _evacuation_commit_id=operation_id)
+                with self.cv:
+                    lease = self.leases[result["lease"]["token"]]
+                    lease.evacuation_id = operation_id
+                    self._persist_leases_locked()
+                    operation["lease_token"] = lease.token
+                    operation["state"] = "lease_pending"
+                    operation["completed_at"] = time.time()
+                    self._persist_cache_state_locked()
+                    result["lease"] = asdict(lease)
+                    result["evacuation"] = self._evacuation_public(operation)
+                return result
+            except Exception as exc:
+                with self.cv:
+                    operation["failure_code"] = exc.reason_code if isinstance(exc, CapacityError) else "evacuation_failed"
+                    if any(lease.evacuation_id == operation_id for lease in self.leases.values()):
+                        # A persisted pending grant is irrevocable here. A lost
+                        # journal write must not rollback through its scope.
+                        operation["state"] = "lease_pending"
+                        raise
+                    # A failed warm-up can leave an owned process group whose
+                    # exit is not yet verified. Preserve it in the operation.
+                    attempt = operation.get("destination_attempt", {})
+                    attempt_lane = self.lanes.get(attempt.get("lane_id"))
+                    if attempt_lane is not None and not any(destination is attempt_lane for _, destination in moved):
+                        source = next((lane for lane, _ in plan if lane.lane_id == operation.get("current_source")), None)
+                        if source is not None:
+                            moved.append((source, attempt_lane))
+                self._rollback_cache_evacuation(operation, moved)
+                raise
+            finally:
+                self.end_drain()
 
     def _policy_constraint_locked(
         self, model: str, gpu_uuids: tuple[str, ...] | None,
@@ -3269,7 +3775,8 @@ class Broker:
         `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
         set. Two external owners never share a scoped GPU.
         """
-        return self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
+        return (self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
+                | self._evacuation_recovery_scopes_locked())
 
     def _lease_blocked_gpus_locked(self) -> set[str]:
         if any(not lease.gpu_uuids and lease.state in ("pending", "active", "revoking")
@@ -3312,7 +3819,7 @@ class Broker:
                 f"requested GPU UUIDs are not selected and available: {unknown}"
             )
         with self.cv:
-            reserved = self._reserved_gpus_locked()
+            reserved = self._reserved_gpus_locked() | self._evacuation_recovery_scopes_locked()
         conflicts = [gpu_uuid for gpu_uuid in requested if gpu_uuid in reserved]
         if conflicts:
             with self.cv:
@@ -4016,7 +4523,7 @@ class Broker:
             {str(capability).lower() for capability in capabilities},
         )
 
-    def _placement_devices(self, blocked: set[str]) -> list[dict[str, Any]]:
+    def _placement_devices(self, blocked: set[str], reservation_owner: str = "") -> list[dict[str, Any]]:
         """Return capacity after honoring every live lane's promised VRAM.
 
         Physical free VRAM can rise while a live lane retains its reservation.
@@ -4047,6 +4554,14 @@ class Broker:
                 for gpu in lane.scope:
                     reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + max(
                         0, int(lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib)))
+            for operation in self.evacuations.values():
+                if operation["id"] == reservation_owner:
+                    continue
+                attempt = operation.get("destination_attempt", {})
+                if attempt.get("lane_id") in self.lanes:
+                    continue  # atomic transfer to the published lane promise
+                for gpu, promised in operation.get("destination_reservation", {}).items():
+                    reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + promised
         available = []
         for device in devices:
             gpu_uuid = str(device.get("uuid") or "")
@@ -4160,7 +4675,8 @@ class Broker:
                     capabilities: set[str], request_path: str,
                     triggered_by: dict[str, str] | None = None,
                     reserved_mib_by_gpu: dict[str, int] | None = None,
-                    expected_profile: Any = CONTEXT_PROFILE_UNSET) -> Lane:
+                    expected_profile: Any = CONTEXT_PROFILE_UNSET,
+                    reservation_operation: str = "") -> Lane:
         scope = (gpu_uuid,) if isinstance(gpu_uuid, str) else tuple(gpu_uuid)
         if not scope or len(set(scope)) != len(scope) or any(gpu not in SELECTED_GPUS for gpu in scope):
             raise PermanentCapacityError("invalid managed GPU scope", 422, "invalid_gpu_scope")
@@ -4217,12 +4733,30 @@ class Broker:
             env["OLLAMA_MODELS"] = OLLAMA_MODELS
         LOG.info("managed lane starting id=%s gpu=%s model=%s port=%s",
                  lane_id, gpu_uuid, model, port)
-        process = subprocess.Popen(
-            [OLLAMA_BINARY, "serve"], env=env, stdin=subprocess.DEVNULL,
-            # Inherit systemd's bounded journal instead of discarding CUDA/GSP
-            # load failures. Lifecycle records map child PID to exact UUID.
-            start_new_session=True,
-        )
+        startup_read = startup_write = None
+        command = [OLLAMA_BINARY, "serve"]
+        if reservation_operation:
+            # This wrapper cannot execute CUDA until its exact process
+            # generation is fsynced. Only the parent owns the CLOEXEC write
+            # end: death before publication sends EOF, never an orphan load.
+            startup_read, startup_write = os.pipe2(os.O_CLOEXEC)
+            command = [sys.executable, "-c", CACHE_STARTUP_WRAPPER,
+                       str(startup_read), OLLAMA_BINARY, "serve"]
+        try:
+            process = subprocess.Popen(
+                command, env=env, stdin=subprocess.DEVNULL,
+                pass_fds=() if startup_read is None else (startup_read,),
+                # Inherit systemd's bounded journal instead of discarding
+                # CUDA/GSP failures. The wrapper exec preserves PID/start/PGRP.
+                start_new_session=True,
+            )
+        except Exception:
+            if startup_write is not None:
+                os.close(startup_write)
+            raise
+        finally:
+            if startup_read is not None:
+                os.close(startup_read)
         LOG.info("managed lane spawned id=%s gpu=%s model=%s pid=%s",
                  lane_id, gpu_uuid, model, process.pid)
         now = time.time()
@@ -4238,6 +4772,23 @@ class Broker:
             # Publish the entire reservation before warm-up can start peer
             # traffic. Loading lanes are never eligible for inference.
             self.lanes[lane_id] = lane
+            if reservation_operation:
+                try:
+                    operation = self.evacuations[reservation_operation]
+                    attempt = {"lane_id": lane_id, "gpu_uuids": list(scope),
+                        "process_group_id": process.pid, "runtime_processes": process_group_identity(process),
+                        "startup_protocol": "registered_before_exec.v1"}
+                    operation["destination_attempt"] = attempt
+                    operation.setdefault("spawn_attempts", []).append(attempt)
+                    self._persist_cache_state_locked()
+                    os.write(startup_write, b"\x01")
+                except Exception:
+                    lane.retiring = True
+                    lane.loading = False
+                    self._stop_lanes([lane], "cache journal publication failed")
+                    raise
+                finally:
+                    os.close(startup_write)
             self.cv.notify_all()
         deadline = time.monotonic() + POOL_READY_TIMEOUT
         try:
@@ -6262,6 +6813,8 @@ class Broker:
         requested_gpu_uuids: list[str] | None = None,
         justification: str = "",
         expected_duration_seconds: int = 0,
+        *, priority: int | None = None, evacuation_id: str = "",
+        _evacuation_commit_id: str = "",
     ) -> dict[str, Any]:
         owner = owner.strip()
         justification = justification.strip()
@@ -6279,6 +6832,14 @@ class Broker:
             raise ValueError(
                 "lease acquisition requires expected_duration_seconds greater than zero"
             )
+        if priority is not None and not evacuation_id:
+            raise ValueError("priority requires an explicit evacuation ID")
+        if evacuation_id:
+            return self._lease_evacuation("acquire", {
+                "owner": owner, "requested_mib": requested_mib, "ttl": ttl,
+                "requested_gpu_uuids": requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, []),
+                "justification": justification, "expected_duration_seconds": expected_duration_seconds,
+            }, priority, evacuation_id)
         require_gpu_health(refresh=True)
         requested_scope = requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
         with self.transition:
@@ -6351,14 +6912,19 @@ class Broker:
                     token, owner, "pending", requested_mib, now, now, now, ttl,
                     foreign_gpu_usage(), gpu_uuids, justification,
                     now + expected_duration_seconds,
+                    _evacuation_commit_id,
                 )
                 with self.cv:
+                    if _evacuation_commit_id:
+                        self._assert_evacuation_current(self.evacuations[_evacuation_commit_id])
                     self.leases[token] = lease
                     try:
                         self._persist_leases_locked()
                     except Exception:
                         self.leases.pop(token, None)
                         raise
+                    if _evacuation_commit_id:
+                        self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
                 LOG.info("lease acquired owner=%s requested_mib=%s unloaded=%s", owner, requested_mib, unloaded)
                 if gpu_uuids:
                     self.end_drain()
@@ -6501,7 +7067,12 @@ class Broker:
                 "gpus": [by_uuid[gpu_uuid] for gpu_uuid in requested],
             }
 
-    def prepare(self, token: str) -> dict[str, Any]:
+    def prepare(self, token: str, *, priority: int | None = None,
+                evacuation_id: str = "", _evacuation_commit_id: str = "") -> dict[str, Any]:
+        if priority is not None and not evacuation_id:
+            raise ValueError("priority requires an explicit evacuation ID")
+        if evacuation_id:
+            return self._lease_evacuation("prepare", {"token": token}, priority, evacuation_id)
         require_gpu_health(refresh=True)
         with self.transition:
             with self.cv:
@@ -6519,11 +7090,21 @@ class Broker:
                 )
                 unloaded = self._unload_base_models()
                 with self.cv:
+                    if _evacuation_commit_id:
+                        self._assert_evacuation_current(self.evacuations[_evacuation_commit_id])
                     now = time.time()
+                    previous = (lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id)
                     lease.state = "pending"
                     lease.heartbeat_at = now
                     lease.transition_started_at = now
-                    self._persist_leases_locked()
+                    lease.evacuation_id = _evacuation_commit_id or lease.evacuation_id
+                    try:
+                        self._persist_leases_locked()
+                    except Exception:
+                        lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id = previous
+                        raise
+                    if _evacuation_commit_id:
+                        self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
                 if lease.gpu_uuids:
                     self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
@@ -6901,6 +7482,8 @@ class Broker:
             model_gpu_policy = {
                 model: list(gpus) for model, gpus in self.model_gpu_policy.items()
             }
+            cache_residency = {"policies": json.loads(json.dumps(self.cache_policies)),
+                "operations": [self._evacuation_public(value) for value in self.evacuations.values()]}
             unregistered_gpus = sorted(self._unregistered_gpus_locked())
         backend = probe_backend()
         health = gpu_health_snapshot()
@@ -6941,6 +7524,7 @@ class Broker:
                     "max_clients_per_lane": LANE_CLIENT_LIMIT,
                 },
                 "model_gpu_policy": model_gpu_policy,
+                "cache_residency": cache_residency,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
@@ -7925,6 +8509,8 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         [str(value) for value in requested_gpu_uuids],
                         str(request.get("justification") or ""),
                         max(0, int(request.get("expected_duration_seconds") or 0)),
+                        priority=request.get("priority"),
+                        evacuation_id=str(request.get("evacuation_id") or ""),
                     )
                 elif action == "ready":
                     result = self.broker.ready(str(request.get("token") or ""))
@@ -7937,7 +8523,17 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         [str(value) for value in requested_gpu_uuids],
                     )
                 elif action == "prepare":
-                    result = self.broker.prepare(str(request.get("token") or ""))
+                    result = self.broker.prepare(str(request.get("token") or ""),
+                        priority=request.get("priority"), evacuation_id=str(request.get("evacuation_id") or ""))
+                elif action == "set_cache_policy":
+                    result = self.broker.set_cache_policy(str(request.get("model") or ""),
+                        request.get("movable"), request.get("priority"), request.get("gpu_uuids"))
+                elif action == "cancel_evacuation":
+                    result = self.broker.cancel_evacuation(str(request.get("evacuation_id") or ""))
+                elif action == "recover_evacuation":
+                    result = self.broker.recover_evacuation(str(request.get("evacuation_id") or ""))
+                elif action == "archive_evacuation":
+                    result = self.broker.archive_evacuation(str(request.get("evacuation_id") or ""))
                 elif action == "release":
                     result = self.broker.release(
                         str(request.get("token") or ""),
@@ -8155,7 +8751,8 @@ def lease_run(args: argparse.Namespace) -> int:
                              "requested_mib": args.vram_mib, "ttl": args.ttl,
                              "gpu_uuids": args.gpu,
                              "justification": args.justification,
-                             "expected_duration_seconds": args.expected_duration})
+                             "expected_duration_seconds": args.expected_duration,
+                             "priority": args.priority, "evacuation_id": args.evacuation_id})
     token = acquired["lease"]["token"]
     env = os.environ.copy()
     env["OLLAMA_UNIFY_GPU_LEASE"] = token
@@ -8273,12 +8870,28 @@ def main() -> int:
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     acquire.add_argument("--gpu", action="append", default=[])
     acquire.add_argument("--token-only", action="store_true")
+    acquire.add_argument("--priority", type=int)
+    acquire.add_argument("--evacuation-id", default="", help="stable ID for opt-in copy-first lower-priority cache evacuation")
+    cache = sub.add_parser("set-cache-policy")
+    cache.add_argument("model")
+    cache.add_argument("--movable", action="store_true")
+    cache.add_argument("--priority", type=int, required=True)
+    cache.add_argument("--gpu", action="append", default=[])
+    cancel = sub.add_parser("cancel-evacuation")
+    cancel.add_argument("evacuation_id")
+    recover = sub.add_parser("recover-evacuation")
+    recover.add_argument("evacuation_id")
+    archive = sub.add_parser("archive-evacuation")
+    archive.add_argument("evacuation_id")
     scope = sub.add_parser("scope")
     scope.add_argument("token")
     scope.add_argument("--gpu", action="append", required=True)
     for name in ("ready", "prepare", "release"):
         command = sub.add_parser(name)
         command.add_argument("token")
+        if name == "prepare":
+            command.add_argument("--priority", type=int)
+            command.add_argument("--evacuation-id", default="")
         if name == "release":
             command.add_argument(
                 "--force", action="store_true",
@@ -8297,6 +8910,8 @@ def main() -> int:
     run.add_argument("--vram-mib", type=int, default=0)
     run.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     run.add_argument("--gpu", action="append", default=[])
+    run.add_argument("--priority", type=int)
+    run.add_argument("--evacuation-id", default="")
     run.add_argument("--ready-command", required=True)
     run.add_argument("--ready-timeout", type=float, default=300.0)
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -8351,7 +8966,17 @@ def main() -> int:
                                "requested_mib": args.vram_mib, "ttl": args.ttl,
                                "gpu_uuids": args.gpu,
                                "justification": args.justification,
-                               "expected_duration_seconds": args.expected_duration})
+                               "expected_duration_seconds": args.expected_duration,
+                               "priority": args.priority, "evacuation_id": args.evacuation_id})
+    elif args.command_name == "set-cache-policy":
+        result = send_control({"action": "set_cache_policy", "model": args.model,
+            "movable": args.movable, "priority": args.priority, "gpu_uuids": args.gpu})
+    elif args.command_name == "cancel-evacuation":
+        result = send_control({"action": "cancel_evacuation", "evacuation_id": args.evacuation_id})
+    elif args.command_name == "recover-evacuation":
+        result = send_control({"action": "recover_evacuation", "evacuation_id": args.evacuation_id})
+    elif args.command_name == "archive-evacuation":
+        result = send_control({"action": "archive_evacuation", "evacuation_id": args.evacuation_id})
     elif args.command_name == "heartbeat" and args.watch:
         if args.interval < 0:
             parser.error("heartbeat --interval must be zero (automatic) or positive")
@@ -8366,6 +8991,8 @@ def main() -> int:
         }
         if args.command_name == "release" and getattr(args, "force", False):
             control["force"] = True
+        if args.command_name == "prepare":
+            control.update(priority=args.priority, evacuation_id=args.evacuation_id)
         result = send_control(control)
     elif args.command_name == "run":
         if not args.command:
