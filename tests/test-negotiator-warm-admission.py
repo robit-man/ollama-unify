@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -80,6 +81,76 @@ def resume(h, logical_id, certificate=None, extra=None):
 
 
 class WarmAdmissionHTTPTests(unittest.TestCase):
+    def prebackend_fault(self, validation_call):
+        # Run the actual public proxy/queue/dispatch code. Only the native PS
+        # observation is faulted once, after the request has an active owner.
+        with tempfile.TemporaryDirectory(prefix='warm-prebackend-fault-') as directory:
+            wrapper = pathlib.Path(directory) / 'fault-helper.py'
+            wrapper.write_text('''#!/usr/bin/env python3
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader('fault_negotiator', %r)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+n = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = n
+loader.exec_module(n)
+validate = n.Broker._validate_warm_admission_locked
+native_json = n.backend_json_at
+calls = 0
+fault = False
+def inspect(*args, **kwargs):
+    if fault and args[2:4] == ('GET', '/api/ps'):
+        return {'models': []}
+    return native_json(*args, **kwargs)
+def validate_once(self, *args, **kwargs):
+    global calls, fault
+    calls += 1
+    fault = calls == %d
+    try:
+        return validate(self, *args, **kwargs)
+    finally:
+        fault = False
+n.backend_json_at = inspect
+n.Broker._validate_warm_admission_locked = validate_once
+raise SystemExit(n.main())
+''' % (str(pathlib.Path(HELPER).resolve()), validation_call))
+            wrapper.chmod(0o755)
+            with p.PoolHarness(str(wrapper), FIXTURE_BIN, auto_model_context=True,
+                               selected_gpus=GPUS, max_servers=3) as h:
+                certificate = self.prepare(h)['warm_admission']
+                logical = 'warm:prebackend-fault'
+                body = {'model': MODEL, 'stream': False,
+                        'mock_request_id': 'original-exact-body', 'options': {'num_ctx': 262144}}
+                failed = send(h, certificate, logical_id=logical, body=body)
+                self.stale(failed, retained=False)
+                self.assertEqual(failed[1]['warm_preflight_phase'],
+                                 'post_admission_validation' if validation_call == 3 else 'backend_dispatch_validation')
+                self.assertEqual(failed[1]['warm_preflight_causes'], ['native_ps_inventory_mismatch'])
+                self.assertEqual(failed[1]['cause_reason_code'], 'native_ps_inventory_mismatch')
+                self.assertNotIn('resume_ttl_ms', failed[1])
+                state = h.status()
+                self.assertEqual(state['active_requests'], 0)
+                self.assertEqual(state['parallel_pool']['request_lifecycle']['tracked'], 0)
+                self.assertEqual(state['parallel_pool']['queue']['retained_request_bytes'], 0)
+                self.assertEqual(p.request_events(h.event_log), [])
+                missing = resume(h, logical, certificate)
+                self.assertEqual(missing[0], 409, missing)
+                self.assertEqual(missing[1]['reason_code'], 'logical_request_not_found')
+                self.assertEqual(h.capacity(MODEL, 2, '/api/chat', GPUS)[0], 200)
+                fresh = proof(h, 2)[1]['warm_admission']
+                self.assertNotEqual(fresh, certificate)
+                retried = send(h, fresh, logical_id=logical, body=body)
+                self.assertEqual(retried[0], 200, retried)
+                replay = resume(h, logical, fresh)
+                self.assertEqual(replay[0], 200, replay)
+                self.assertEqual(len(p.request_events(h.event_log)), 1)
+                self.assertEqual(p.request_events(h.event_log)[0]['request_id'], 'original-exact-body')
+
+    def test_post_prepare_warm_failure_releases_only_proven_unstarted_owner(self):
+        self.prebackend_fault(3)
+
+    def test_pre_dispatch_warm_failure_releases_only_proven_unstarted_owner(self):
+        self.prebackend_fault(4)
+
     def prepare(self, h, parallel=1):
         status, result, _ = h.capacity(MODEL, parallel, '/api/chat', GPUS)
         self.assertEqual(status, 200, result)
@@ -377,12 +448,15 @@ class WarmAdmissionHTTPTests(unittest.TestCase):
             }, extra_headers={HEADER: json.dumps(issued[1]['warm_admission']),
                 'X-Ollama-Unify-GPU-UUIDs': ','.join(GPUS),
                 'X-Ollama-Unify-Logical-Request-Id': 'warm:embedding-after-admission'})
-            self.stale(response, retained=True)
+            self.stale(response, retained=False)
             state = h.status()
             self.assertEqual(state['parallel_pool']['queue']['admitted_total'], 1)
             self.assertEqual(state['active_requests'], 0)
             self.assertEqual(state['parallel_pool']['request_lifecycle']['tracked'], 0)
             self.assertEqual(p.request_events(h.event_log), [])
+            missing = resume(h, 'warm:embedding-after-admission')
+            self.assertEqual(missing[0], 409, missing)
+            self.assertEqual(missing[1]['reason_code'], 'logical_request_not_found')
 
     def test_broker_restart_and_reused_lane_id_cannot_reuse_old_certificate(self):
         with harness() as first:
@@ -483,7 +557,199 @@ class WarmEmbeddingIdentityTests(unittest.TestCase):
             self.broker._validate_warm_admission_locked(certificate, p.EMBED_MODEL, tuple(GPUS))
 
 
+class WarmOwnerLifecycleTests(unittest.TestCase):
+    def owned(self, broker=None, certificate=None):
+        broker = broker or n.Broker()
+        lane = n.Lane('lane-owned', 'managed', '127.0.0.1', 1, GPUS[0], MODEL, 1, 1,
+                      time.time(), time.time(), gpu_uuids=(GPUS[0],))
+        certificate = certificate or json.dumps({'gpu_uuids': GPUS})
+        with broker.cv:
+            active = broker._register_active_request_locked(lane, 'same-request', 'warm:same-logical')
+            active.warm_admission = certificate
+            broker.logical_in_flight['warm:same-logical'] = ('exact-body-fingerprint', 'same-request', 7)
+        admission = n.Admission(lane, 'same-request', 'warm:same-logical', 'exact-body-fingerprint',
+                                0, 1, 7, warm_admission=certificate, active_request=active)
+        return broker, lane, active, admission
+
+    def test_proven_release_fences_late_dispatch_watcher_and_finally_from_replacement(self):
+        broker, old_lane, old, admission = self.owned()
+        failure = n.WarmPreflightRequired(phase='post_admission_validation', causes=('native_ps_unavailable',))
+        released = broker.reject_warm_before_backend(admission, failure)
+        self.assertIs(released, failure)
+        self.assertIs(released.admission_retained, False)
+        self.assertEqual(old_lane.in_flight, 0)
+        self.assertEqual(broker.active_requests, 0)
+        self.assertNotIn(admission.logical_request_id, broker.logical_tombstones)
+        # Reuse even the physical request ID adversarially. Identity must be
+        # the active record object, not an ID that a stale handler can retake.
+        _, new_lane, replacement, new_admission = self.owned(broker)
+        before = vars(replacement).copy()
+        with mock.patch.object(broker, '_validate_warm_admission_locked', return_value={'lane-owned'}) as validate:
+            with self.assertRaises(n.WarmAdmissionOwnershipUncertain):
+                broker.request_backend_started(admission, object())
+            validate.assert_not_called()
+            self.assertFalse(broker.renew_request_activity(admission, 'stale-update'))
+            broker.bind_active_request_client(admission, 'stale-client')
+            broker.request_client_detached(admission)
+            broker.note_backend_failure(admission, 'stale-failure')
+            self.assertFalse(broker.request_backend_complete(admission))
+            self.assertIsNone(broker.active_request_terminal_lock(admission))
+            self.assertEqual(broker.active_request_cancel_reason(admission), '')
+            broker.proxy_exit(admission, MODEL, False)
+            self.assertEqual(vars(replacement), before)
+            self.assertIs(broker.active_request_records['same-request'], replacement)
+            self.assertEqual(new_lane.in_flight, 1)
+            self.assertTrue(broker.request_backend_started(new_admission, object()))
+            broker.proxy_exit(admission, MODEL, False)
+            self.assertIs(broker.active_request_records['same-request'], replacement)
+            self.assertTrue(replacement.backend_started)
+
+    def test_missing_owner_is_uncertain_not_a_safe_recertification_claim(self):
+        broker, lane, active, admission = self.owned()
+        with broker.cv:
+            broker._release_active_request_locked(admission.request_id, MODEL, False)
+        failure = broker.reject_warm_before_backend(admission, n.WarmPreflightRequired())
+        self.assertIsInstance(failure, n.WarmAdmissionOwnershipUncertain)
+        self.assertFalse(failure.retryable)
+        self.assertEqual(lane.in_flight, 0)
+        with self.assertRaises(n.WarmAdmissionOwnershipUncertain):
+            broker.request_backend_started(admission, object())
+
+    def test_cancelled_detached_started_and_conflicting_owners_are_never_released(self):
+        cases = ['cancelled', 'detached', 'started', 'backend-object', 'completed',
+                 'foreign-record', 'changed-certificate', 'changed-fingerprint',
+                 'waiter', 'replay', 'tombstone']
+        for case in cases:
+            with self.subTest(case=case):
+                broker, lane, active, admission = self.owned()
+                if case == 'cancelled': active.cancel_requested_at = time.monotonic()
+                elif case == 'detached': active.detached_at = time.monotonic()
+                elif case == 'started': active.backend_started = True
+                elif case == 'backend-object': active.backend = object()
+                elif case == 'completed': active.backend_completed = True
+                elif case == 'foreign-record':
+                    admission = n.Admission(lane, admission.request_id, admission.logical_request_id,
+                        admission.request_fingerprint, 0, 1, 7, warm_admission=admission.warm_admission)
+                elif case == 'changed-certificate': active.warm_admission = 'foreign-certificate'
+                elif case == 'changed-fingerprint':
+                    broker.logical_in_flight[admission.logical_request_id] = ('foreign-body', admission.request_id, 7)
+                elif case == 'waiter':
+                    broker.waiters.append(types.SimpleNamespace(request_id='other-request',
+                        logical_request_id=admission.logical_request_id))
+                elif case == 'replay': broker.completed_responses[admission.logical_request_id] = object()
+                elif case == 'tombstone': broker.logical_tombstones[admission.logical_request_id] = object()
+                before = vars(active).copy()
+                failure = broker.reject_warm_before_backend(admission, n.WarmPreflightRequired())
+                self.assertIsInstance(failure, n.WarmAdmissionOwnershipUncertain)
+                self.assertFalse(failure.retryable)
+                self.assertEqual(failure.status, 409)
+                self.assertIs(broker.active_request_records[admission.request_id], active)
+                self.assertEqual(vars(active), before)
+                self.assertEqual(lane.in_flight, 1)
+                self.assertEqual(broker.active_requests, 1)
+
+    def test_pre_dispatch_cancel_or_already_started_never_revalidates_or_overwrites_transport(self):
+        for state in ['cancelled', 'detached', 'started', 'backend-object']:
+            with self.subTest(state=state):
+                broker, lane, active, admission = self.owned()
+                if state == 'cancelled': active.cancel_requested_at = time.monotonic()
+                elif state == 'detached': active.detached_at = time.monotonic()
+                elif state == 'started': active.backend_started = True
+                else: active.backend = object()
+                before = vars(active).copy()
+                with mock.patch.object(broker, '_validate_warm_admission_locked') as validate:
+                    with self.assertRaises(n.WarmAdmissionOwnershipUncertain):
+                        broker.request_backend_started(admission, object())
+                    validate.assert_not_called()
+                self.assertEqual(vars(active), before)
+                self.assertEqual(lane.in_flight, 1)
+
+    def test_diagnostics_serialize_only_closed_safe_cause_and_phase_values(self):
+        handler = object.__new__(n.ProxyHandler)
+        responses = []
+        handler._send_json = lambda status, body, headers: responses.append((status, body, headers))
+        failure = n.WarmPreflightRequired(phase='secret-phase-token',
+            causes=('secret-body-token', 'native_ps_unavailable', {'secret': 'token'}))
+        handler._send_capacity_failure(failure)
+        body = responses[0][1]
+        self.assertEqual(body['cause_reason_code'], 'native_ps_unavailable')
+        self.assertEqual(body['warm_preflight_phase'], 'validation')
+        self.assertEqual(body['warm_preflight_causes'], ['native_ps_unavailable'])
+        self.assertNotIn('secret', json.dumps(responses))
+        _, _, _, admission = self.owned()
+        handler._send_capacity_failure(n.WarmAdmissionOwnershipUncertain(admission, failure))
+        status, uncertain, _ = responses[-1]
+        self.assertEqual(status, 409)
+        self.assertFalse(uncertain['retryable'])
+        self.assertEqual(uncertain['reason_code'], 'warm_admission_ownership_uncertain')
+        self.assertNotIn('backend_started', uncertain)
+        self.assertNotIn('admission_retained', uncertain)
+        self.assertNotIn('resume_ttl_ms', uncertain)
+
+
 class WarmNativeIdentityTests(unittest.TestCase):
+    def test_proof_issuer_reports_only_actually_differing_identity_fields(self):
+        for field, value, expected in [('context_length', 4096, 'context_mismatch'),
+                                       ('digest', 'f' * 64, 'model_digest_mismatch')]:
+            with self.subTest(field=field):
+                broker = n.Broker()
+                lanes = [n.Lane('lane-9' + str(i), 'managed', '127.0.0.1', i + 1,
+                    gpu, p.EMBED_MODEL, 1, 1, time.time(), time.time(), gpu_uuids=(gpu,))
+                    for i, gpu in enumerate(GPUS)]
+                broker.lanes.update({lane.lane_id: lane for lane in lanes})
+                base = {'name': p.EMBED_MODEL, 'digest': DIGEST, 'context_length': 2048,
+                        'size': 4096, 'size_vram': 4096}
+                def inspected(lane):
+                    return {'server_process': {'pid': 1, 'start_time_ticks': 1},
+                            'runtime_processes': [{'pid': 1, 'start_time_ticks': 1}],
+                            'native_ps': base if lane is lanes[0] else {**base, field: value}}
+                with mock.patch.object(n, 'POOL_ENABLED', True), \
+                     mock.patch.object(broker, '_ollama_blocked_gpus_locked', return_value=set()), \
+                     mock.patch.object(broker, '_policy_constraint_locked', side_effect=lambda _model, scope: scope), \
+                     mock.patch.object(broker, '_warm_runtime_identity_locked', side_effect=inspected):
+                    with self.assertRaises(n.WarmPreflightRequired) as failure:
+                        broker.warm_admission_proof(p.EMBED_MODEL, 2, tuple(GPUS))
+                    self.assertEqual(failure.exception.warm_preflight_phase, 'proof_issuance')
+                    self.assertEqual(failure.exception.warm_preflight_causes, (expected,))
+
+    def test_strict_native_failures_keep_closed_predicate_and_call_stage_diagnostics(self):
+        profile = {'model_digest': DIGEST, 'context_length': 262144, 'extra_vram_mib': 1}
+        process = types.SimpleNamespace(pid=43210)
+        lane = n.Lane('lane-99', 'managed', '127.0.0.1', 1, GPUS[0], MODEL, 1, 1,
+                      time.time(), time.time(), process, gpu_uuids=(GPUS[0],), context_profile=profile)
+        row = {'name': MODEL, 'digest': DIGEST, 'context_length': 262144,
+               'size': 4096, 'size_vram': 4096}
+        identity = [{'pid': process.pid, 'start_time_ticks': 1234}]
+        broker = n.Broker()
+        broker.lanes[lane.lane_id] = lane
+        with mock.patch.object(n, 'POOL_ENABLED', True), \
+             mock.patch.object(n, 'effective_model_context_profile', return_value=profile), \
+             mock.patch.object(n, 'process_group_alive', return_value=True), \
+             mock.patch.object(n, 'process_group_identity', return_value=identity), \
+             mock.patch.object(n, 'backend_json_at', return_value={'models': [row]}) as native, \
+             mock.patch.object(broker, '_ollama_blocked_gpus_locked', return_value=set()), \
+             mock.patch.object(broker, '_policy_constraint_locked', side_effect=lambda _model, scope: scope):
+            issued = broker.warm_admission_proof(MODEL, 1, tuple(GPUS))
+            certificate = n.parse_warm_admission(json.dumps(issued['warm_admission']))
+            cases = [
+                (TimeoutError('secret native exception'), None, 'native_ps_unavailable'),
+                (None, {'models': []}, 'native_ps_inventory_mismatch'),
+                (None, {'models': [{**row, 'name': 'foreign-model'}]}, 'native_model_mismatch'),
+                (None, {'models': [{**row, 'digest': 'f' * 64}]}, 'native_digest_mismatch'),
+                (None, {'models': [{**row, 'context_length': 8192}]}, 'native_context_mismatch'),
+                (None, {'models': [{**row, 'size_vram': 0}]}, 'native_gpu_residency_mismatch'),
+            ]
+            for error, result, cause in cases:
+                with self.subTest(cause=cause):
+                    native.side_effect = error
+                    native.return_value = result
+                    with self.assertRaises(n.WarmPreflightRequired) as failure:
+                        broker._validate_warm_admission_locked(certificate, MODEL, tuple(GPUS),
+                                                              phase='post_admission_validation')
+                    self.assertEqual(failure.exception.warm_preflight_causes, (cause,))
+                    self.assertEqual(failure.exception.warm_preflight_phase, 'post_admission_validation')
+                    self.assertNotIn('secret', str(failure.exception))
+
     def test_real_process_group_includes_native_children_and_detects_replacement(self):
         process = subprocess.Popen([sys.executable, '-c',
             'import subprocess,time; subprocess.Popen(["sleep","30"]); time.sleep(30)'],
@@ -523,17 +789,22 @@ class WarmNativeIdentityTests(unittest.TestCase):
                 issued = broker.warm_admission_proof(MODEL, 1, tuple(GPUS))
                 certificate = n.parse_warm_admission(json.dumps(issued['warm_admission']))
                 with broker.cv:
-                    broker._register_active_request_locked(lane, 'actual-dispatch', 'warm:native-child')
-                    broker.active_request_records['actual-dispatch'].warm_admission = certificate
+                    active = broker._register_active_request_locked(lane, 'actual-dispatch', 'warm:native-child')
+                    active.warm_admission = certificate
+                    broker.logical_in_flight['warm:native-child'] = ('fingerprint', 'actual-dispatch', 1)
                 admission = n.Admission(lane, 'actual-dispatch', 'warm:native-child', 'fingerprint', 0, 1, 1,
-                                        warm_admission=certificate)
+                                        warm_admission=certificate, active_request=active)
                 child = next(item for item in before if item['pid'] != process.pid)
                 os.kill(child['pid'], 15)
                 p.wait_until(lambda: len(n.process_group_identity(process)) == 1, 'native child exit')
                 with self.assertRaises(n.WarmPreflightRequired) as failure:
                     broker.request_backend_started(admission, object())
-                self.assertIs(failure.exception.admission_retained, True)
-                self.assertIs(broker.active_request_records['actual-dispatch'].backend_started, False)
+                self.assertIs(failure.exception.admission_retained, False)
+                self.assertEqual(failure.exception.warm_preflight_phase, 'backend_dispatch_validation')
+                self.assertEqual(failure.exception.warm_preflight_causes, ('runtime_identity_changed',))
+                self.assertNotIn('actual-dispatch', broker.active_request_records)
+                self.assertNotIn('warm:native-child', broker.logical_in_flight)
+                self.assertNotIn('warm:native-child', broker.logical_tombstones)
                 refreshed = broker.warm_admission_proof(MODEL, 1, tuple(GPUS))
                 self.assertNotEqual(issued['warm_admission']['lanes'], refreshed['warm_admission']['lanes'])
         finally:
