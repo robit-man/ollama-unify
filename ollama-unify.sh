@@ -973,6 +973,7 @@ import pwd
 import re
 import secrets
 import select
+import shlex
 import signal
 import socket
 import socketserver
@@ -1600,6 +1601,135 @@ def backend_json_at(host: str, port: int, method: str, path: str,
 def backend_json(method: str, path: str, payload: dict[str, Any] | None = None,
                  timeout: float = 10.0) -> dict[str, Any]:
     return backend_json_at(BACKEND_HOST, BACKEND_PORT, method, path, payload, timeout)
+
+
+def model_gpu_weight_bytes(model: str, tag: dict, aggregate_bytes: int) -> int:
+    """Subtract a known sidecar only from an exact native/local runtime graph.
+
+    Stock Ollama GetModel loads model/projector/adapter layers and
+    Model.String exposes their blob paths as FROM/ADAPTER. The omni exporter
+    deliberately appends its bundle outside that graph (never a FROM).
+    Unknown, remote, changed or unavailable evidence retains the original
+    aggregate estimate; observed low VRAM is never used to shrink a promise.
+    """
+    if not OLLAMA_MODELS or type(tag.get("size")) is not int:
+        return aggregate_bytes
+    auxiliary_type = "application/vnd.robit.ollama.omni.bundle.v1+gguf"
+    runtime_types = {"application/vnd.ollama.image." + kind
+                     for kind in ("model", "projector", "adapter", "tensor")}
+    metadata_types = {"application/vnd.ollama.image." + kind
+                      for kind in ("template", "license", "params", "system", "messages")}
+    try:
+        name, separator, version = model.rpartition(":")
+        parts = name.split("/")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+            return aggregate_bytes
+        if len(parts) == 1:
+            parts = ["registry.ollama.ai", "library", *parts]
+        elif len(parts) == 2:
+            parts = ["registry.ollama.ai", *parts]
+        if (len(parts) != 3
+                or not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", parts[0])
+                or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part) for part in parts[1:])):
+            return aggregate_bytes
+        root_alias = Path(OLLAMA_MODELS)
+        root = root_alias.resolve(strict=True)
+        manifests_alias = root / "manifests"
+        manifests = manifests_alias.resolve(strict=True)
+        path = manifests.joinpath(*parts, version)
+        if path.resolve(strict=True) != path:
+            return aggregate_bytes
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if (len(raw) > 1024 * 1024 or not re.fullmatch(r"[a-f0-9]{64}", str(tag.get("digest") or ""))
+                or hashlib.sha256(raw).hexdigest() != tag["digest"]):
+            return aggregate_bytes
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("ambiguous manifest")
+                result[key] = value
+            return result
+        manifest = json.loads(raw, object_pairs_hook=unique_object)
+        if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 2:
+            return aggregate_bytes
+        config, layers = manifest.get("config"), manifest.get("layers")
+        if (not isinstance(config, dict) or config.get("mediaType") != "application/vnd.docker.container.image.v1+json"
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", str(config.get("digest") or ""))
+                or type(config.get("size")) is not int or not 0 < config["size"] <= 1024 * 1024
+                or not isinstance(layers, list) or not 1 <= len(layers) <= 256):
+            return aggregate_bytes
+        if not any(isinstance(layer, dict) and layer.get("mediaType") == auxiliary_type for layer in layers):
+            return aggregate_bytes
+        blobs_alias = root / "blobs"
+        blobs = blobs_alias.resolve(strict=True)
+        runtime, identities, seen = set(), {}, set()
+        excluded = total = 0
+        for layer in layers:
+            if (not isinstance(layer, dict) or layer.get("mediaType") not in runtime_types | metadata_types | {auxiliary_type}
+                    or not re.fullmatch(r"sha256:[a-f0-9]{64}", str(layer.get("digest") or ""))
+                    or type(layer.get("size")) is not int or not 0 < layer["size"] <= 2 ** 63 - 1
+                    or layer["digest"] in seen):
+                return aggregate_bytes
+            seen.add(layer["digest"])
+            total += layer["size"]
+            blob = blobs / layer["digest"].replace(":", "-")
+            if blob.resolve(strict=True) != blob or not blob.is_file() or blob.stat().st_size != layer["size"]:
+                return aggregate_bytes
+            stat = blob.stat()
+            identities[blob] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            if layer["mediaType"] in runtime_types:
+                runtime.add(blob)
+            elif layer["mediaType"] == auxiliary_type:
+                excluded += layer["size"]
+        if (aggregate_bytes not in (total, total + config["size"])
+                or not any(layer["mediaType"] == "application/vnd.ollama.image.model" for layer in layers)):
+            return aggregate_bytes
+        show = backend_json("POST", "/api/show", {"model": model}, timeout=10.0)
+        if not isinstance(show, dict):
+            return aggregate_bytes
+        modelfile = show.get("modelfile")
+        if not isinstance(modelfile, str) or len(modelfile) > 1024 * 1024:
+            return aggregate_bytes
+        native = set()
+        for line in modelfile.splitlines():
+            if re.match(r"^\s*DRAFT\s", line):
+                return aggregate_bytes
+            if not re.match(r"^\s*(?:FROM|ADAPTER)\s", line):
+                continue
+            fields = shlex.split(line)
+            if len(fields) != 2 or not Path(fields[1]).is_absolute():
+                return aggregate_bytes
+            blob = Path(fields[1]).resolve(strict=True)
+            if blob.parent != blobs or blob in native:
+                return aggregate_bytes
+            native.add(blob)
+        if native != runtime or not native:
+            return aggregate_bytes
+        current_tags = backend_json("GET", "/api/tags", timeout=10.0)
+        if not isinstance(current_tags, dict):
+            return aggregate_bytes
+        current = current_tags.get("models")
+        matches = [item for item in current if isinstance(item, dict)
+                   and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model] if isinstance(current, list) else []
+        with path.open("rb") as stream:
+            current_raw = stream.read(1024 * 1024 + 1)
+        if (len(matches) != 1 or matches[0].get("digest") != tag["digest"]
+                or matches[0].get("size") != tag.get("size") or current_raw != raw
+                or path.resolve(strict=True) != path
+                or root_alias.resolve(strict=True) != root
+                or manifests_alias.resolve(strict=True) != manifests
+                or blobs_alias.resolve(strict=True) != blobs):
+            return aggregate_bytes
+        for blob, identity in identities.items():
+            stat = blob.stat()
+            if (blob.resolve(strict=True) != blob
+                    or identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)):
+                return aggregate_bytes
+        return aggregate_bytes - excluded
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, http.client.HTTPException):
+        return aggregate_bytes
 
 
 @dataclass(frozen=True)
@@ -4595,7 +4725,7 @@ class Broker:
                 422,
                 "model_metadata_invalid",
             )
-        model_mib = math.ceil(size_bytes / (1024 * 1024))
+        model_mib = math.ceil(model_gpu_weight_bytes(model, match, size_bytes) / (1024 * 1024))
         profile = resolve_model_context_profile(model, match)
         extra_context_mib = 0
         if profile is not None:
