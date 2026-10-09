@@ -2625,6 +2625,44 @@ def process_group_identity(process: Any) -> list[dict[str, int]]:
     return sorted(members, key=lambda item: item["pid"])
 
 
+def managed_server_identity(process: Any) -> tuple[int, int, int]:
+    """Read the actual spawned server generation without exposing its env."""
+    try:
+        if process is None or process.poll() is not None:
+            raise ValueError("server exited")
+        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stream:
+            fields = stream.read().rsplit(")", 1)[1].split()
+        identity = (process.pid, int(fields[19]), int(fields[2]))
+        if fields[0] in {"Z", "X"} or identity[1] <= 0 or identity[2] != process.pid:
+            raise ValueError("server generation unavailable")
+        return identity
+    except (OSError, ValueError, IndexError, TypeError) as exc:
+        raise CapacityError("managed server identity is unverified before model loading",
+                            503, "gpu_placement_unverified", False, None) from exc
+
+
+def assert_managed_server_scope(process: Any, scope: tuple[str, ...],
+                                expected: tuple[int, int, int]) -> None:
+    """Attest actual CVD before even a zero-token model load is permitted."""
+    try:
+        if managed_server_identity(process) != expected:
+            raise ValueError("server generation changed")
+        with open(f"/proc/{process.pid}/environ", "rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("environment exceeds inspection bound")
+        values = [entry[len(b"CUDA_VISIBLE_DEVICES="):]
+                  for entry in raw.split(b"\0") if entry.startswith(b"CUDA_VISIBLE_DEVICES=")]
+        if len(values) != 1 or tuple(values[0].decode("ascii").split(",")) != scope:
+            raise ValueError("actual CUDA scope differs")
+        if managed_server_identity(process) != expected:
+            raise ValueError("server generation changed during inspection")
+    except (OSError, ValueError, IndexError, TypeError) as exc:
+        # Never include raw values, full environment, or private exceptions.
+        raise CapacityError("managed server CUDA scope is unverified before model loading",
+                            503, "gpu_placement_unverified", False, None) from exc
+
+
 def parse_warm_admission(raw: str) -> str:
     """Canonicalize a bounded, closed certificate; it grants no GPU authority."""
     try:
@@ -4845,6 +4883,7 @@ class Broker:
             self.cv.notify_all()
         deadline = time.monotonic() + POOL_READY_TIMEOUT
         try:
+            server_identity = managed_server_identity(process)
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise CapacityError(
@@ -4874,6 +4913,7 @@ class Broker:
             self._require_safe_gpu_transition(scope, lane_id)
             LOG.info("managed lane loading id=%s gpu=%s model=%s pid=%s",
                      lane_id, gpu_uuid, model, process.pid)
+            assert_managed_server_scope(process, scope, server_identity)
             backend_json_at(
                 "127.0.0.1", port, "POST", warm_path, warm_payload,
                 timeout=POOL_LOAD_TIMEOUT,
