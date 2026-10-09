@@ -304,7 +304,7 @@ curl -fsS http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator/capacit
   -d '{"model":"qwen3.5:35b","parallel":3,"gpu_uuids":["GPU-uuid"]}'
 ```
 
-An embedding client can state its endpoint explicitly when it prewarms a lane by adding `"endpoint":"/api/embed"`. The broker validates this field. It also infers embedding-only and reranking-only warm-up contracts from local model capabilities when the field is absent. Lazy capacity for an ordinary inference request always uses that request's endpoint family. Discovery metadata publishes the reserved private port range so cooperating clients never start a competing Ollama process on a broker lane.
+An embedding client can state its endpoint explicitly when it prewarms a lane by adding `"endpoint":"/api/embed"`. The broker validates this field. Embedding warm loads use `/api/embed` with `input:[]`, which loads the native runner without computing a vector; native residency and physical placement still must pass before readiness. This needs a native version that schedules a runner before returning empty embeddings (verified in stock 0.4.0 and 0.35.0). Stock 0.3.0 returns before loading, so the broker refuses missing residency instead of falling back to embedding computation. It also infers embedding-only and reranking-only warm-up contracts from local model capabilities when the field is absent. Lazy capacity for an ordinary inference request always uses that request's endpoint family. Discovery metadata publishes the reserved private port range so cooperating clients never start a competing Ollama process on a broker lane.
 
 `gpu_uuids` is an optional ordered hard allowlist. When present, the broker
 reuses and creates lanes only on the ordered intersection of that list and its

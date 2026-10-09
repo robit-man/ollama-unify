@@ -73,6 +73,8 @@ python3 "$repo_dir/tests/test-negotiator-model-footprint.py" \
   "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-warm-admission.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+python3 "$repo_dir/tests/test-negotiator-embedding-warmup.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-evacuation.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-forced-group.py" \

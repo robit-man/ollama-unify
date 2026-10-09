@@ -367,7 +367,7 @@ raise SystemExit(n.main())
             shutil.copytree(FIXTURE_BIN, fixture_bin)
             backend = fixture_bin / 'ollama'
             original = backend.read_text()
-            marker = 'options=payload.get("options") or {}, keep_alive=payload.get("keep_alive"))'
+            marker = 'input=payload.get("input"))'
             self.assertEqual(original.count(marker), 1)
             backend.write_text(original.replace(marker, marker[:-1] + ', observed_input=payload.get("input"))'))
             tag = {'name': p.EMBED_MODEL, 'model': p.EMBED_MODEL, 'size': 1024 ** 3,

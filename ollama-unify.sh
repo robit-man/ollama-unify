@@ -4811,7 +4811,8 @@ class Broker:
             and "completion" not in capabilities
         ):
             return "/api/embed", {
-                "model": model, "input": "warmup", "keep_alive": keep_alive,
+                # Empty input loads the runner without computing an embedding.
+                "model": model, "input": [], "keep_alive": keep_alive,
             }
         if request_path == "/api/rerank" or (
             not request_path and "reranking" in capabilities
