@@ -1410,15 +1410,18 @@ def canonical_model_tag(model: str) -> str:
     return model if ":" in leaf else f"{model}:latest"
 
 
-def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None:
+def parse_gpu_uuid_constraint(value: Any, source: str, *, exact: bool = False) -> tuple[str, ...] | None:
     """Parse a presence-sensitive, ordered hard GPU allowlist.
 
     An allowlist constrains placement to matching members; it is not a demand
-    that every listed device still exist. Hardware selection can legitimately
+    that every listed device still exist unless exact=True. Hardware selection can legitimately
     shrink while a long-lived client still has the previous superset cached.
     Keep the live intersection in caller order, and fail closed only when no
     allowed GPU remains.
     """
+    if exact and not isinstance(value, list):
+        raise PermanentCapacityError("exclusive_group requires an explicit ordered GPU UUID array",
+                                     400, "invalid_gpu_constraint")
     if value is None:
         return None
     if isinstance(value, str):
@@ -1449,6 +1452,9 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
                 400,
                 "invalid_gpu_constraint",
             )
+        if exact and gpu_uuid in seen:
+            raise PermanentCapacityError("exclusive_group GPU UUIDs must be distinct",
+                                         400, "invalid_gpu_constraint")
         if gpu_uuid not in seen:
             seen.add(gpu_uuid)
             normalized.append(gpu_uuid)
@@ -1467,6 +1473,9 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
         }
     available = [gpu_uuid for gpu_uuid in normalized if gpu_uuid in selected]
     unavailable = [gpu_uuid for gpu_uuid in normalized if gpu_uuid not in selected]
+    if exact and unavailable:
+        raise PermanentCapacityError("exclusive_group contains unselected GPU UUIDs: "
+                                     + ", ".join(unavailable), 422, "gpu_constraint_unavailable")
     if not available:
         raise PermanentCapacityError(
             "GPU constraint has no UUIDs in the broker-selected set; requested: "
@@ -1482,6 +1491,13 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
             available,
         )
     return tuple(available)
+
+
+def parse_capacity_placement(value: Any) -> str:
+    if not isinstance(value, str) or value not in ("auto", "exclusive_group"):
+        raise PermanentCapacityError("placement must be auto or exclusive_group",
+                                     400, "invalid_capacity_request")
+    return value
 
 
 class BackendHTTPError(RuntimeError):
@@ -2022,6 +2038,11 @@ def discovery_document() -> dict[str, Any]:
                 "warm_admission_header": WARM_ADMISSION_HEADER,
                 "warm_admission_schema": WARM_ADMISSION_SCHEMA,
                 "warm_admission_proof_only_capacity_field": "warm_admission_proof",
+                "capacity_placements": ["auto", "exclusive_group"],
+                "exclusive_group_semantics": (
+                    "explicit ordered group of at least two selected GPUs; every member "
+                    "must satisfy model policy; exact group reuse and proof only; no pruning"
+                ),
                 "gpu_constraint_semantics": (
                     "ordered hard allowlist intersected with broker-selected GPUs; "
                     "rejected only when the intersection is empty"
@@ -2792,7 +2813,7 @@ WARM_PREFLIGHT_CAUSES = frozenset({
     "native_ps_unavailable", "native_ps_inventory_mismatch", "native_model_mismatch",
     "native_digest_mismatch", "native_context_mismatch", "native_gpu_residency_mismatch",
     "runtime_identity_changed", "selected_lane_not_certified", "embedding_metadata_unavailable",
-    "embedding_identity_mismatch", "ownership_uncertain",
+    "embedding_identity_mismatch", "ownership_uncertain", "native_gpu_placement_mismatch",
 })
 
 
@@ -3660,6 +3681,23 @@ class Broker:
             return tuple(allowed)
         return tuple(gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid in allowed)
 
+    def _capacity_scope_locked(self, model: str, gpu_uuids: tuple[str, ...] | None,
+                               placement: str) -> tuple[str, ...] | None:
+        parse_capacity_placement(placement)
+        if placement == "exclusive_group":
+            if (gpu_uuids is None or len(gpu_uuids) < 2
+                    or len(set(gpu_uuids)) != len(gpu_uuids)):
+                raise PermanentCapacityError("exclusive_group requires at least two distinct GPUs",
+                                             422, "invalid_gpu_constraint")
+            if any(gpu not in SELECTED_GPUS for gpu in gpu_uuids):
+                raise PermanentCapacityError("exclusive_group contains an unselected GPU",
+                                             422, "gpu_constraint_unavailable")
+        allowed = self._policy_constraint_locked(model, gpu_uuids)
+        if placement == "exclusive_group" and allowed != gpu_uuids:
+            raise PermanentCapacityError("model policy excludes a requested group member",
+                                         409, "gpu_policy_conflict")
+        return allowed
+
     def _persist_leases_locked(self) -> None:
         LEASE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         temp_path = LEASE_STATE_PATH.with_name(
@@ -4297,6 +4335,14 @@ class Broker:
                     or type(native["size_vram"]) is not int
                     or native["size_vram"] != native["size"]):
                 raise WarmPreflightRequired(causes=("native_gpu_residency_mismatch",))
+            if len(lane.scope) > 1:
+                try:
+                    observed = process_gpu_usage(lane.process)
+                except CapacityError as exc:
+                    raise WarmPreflightRequired(causes=("native_gpu_placement_mismatch",)) from exc
+                lane.observed_vram_mib_by_gpu = observed
+                if set(observed) != set(lane.scope) or any(used <= 0 for used in observed.values()):
+                    raise WarmPreflightRequired(causes=("native_gpu_placement_mismatch",))
             after = process_group_identity(lane.process)
             if before != after:
                 raise WarmPreflightRequired(causes=("runtime_identity_changed",))
@@ -4335,7 +4381,8 @@ class Broker:
         return digest
 
     def warm_admission_proof(self, model: str, parallel: int,
-                             gpu_uuids: tuple[str, ...] | None) -> dict[str, Any]:
+                             gpu_uuids: tuple[str, ...] | None,
+                             placement: str = "auto") -> dict[str, Any]:
         """Inspect existing warm capacity only. Never load, grow, or refresh idle time."""
         model = canonical_model_tag(model)
         if not POOL_ENABLED or not model or gpu_uuids is None or parallel < 1:
@@ -4343,10 +4390,15 @@ class Broker:
                                          400, "invalid_warm_admission")
         with self.cv:
             blocked = self._ollama_blocked_gpus_locked()
-            allowed = self._policy_constraint_locked(model, gpu_uuids)
+            allowed = self._capacity_scope_locked(model, gpu_uuids, placement)
+            if placement == "exclusive_group" and parallel > POOL_INSTANCE_PARALLEL:
+                raise PermanentCapacityError("one exact exclusive group supports only its configured parallel slots",
+                                             422, "parallel_exceeds_capacity")
             lanes = [lane for lane in self.lanes.values()
                      if lane.kind == "managed" and lane.model == model
-                     and lane.allows(allowed) and not set(lane.scope).intersection(blocked)
+                     and lane.allows(allowed)
+                     and (placement != "exclusive_group" or lane.scope == gpu_uuids)
+                     and not set(lane.scope).intersection(blocked)
                      and not lane.retiring and not lane.loading]
             if self.draining or not lanes or sum(lane.parallel for lane in lanes) < parallel:
                 raise WarmPreflightRequired(phase="proof_issuance",
@@ -4384,6 +4436,7 @@ class Broker:
                 "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
                 "requested_model": model, "canonical_model": model,
                 "requested_parallel": parallel, "requested_gpu_uuids": list(gpu_uuids),
+                "requested_placement": placement,
                 "admitted_parallel": sum(lane.parallel for lane in lanes),
                 "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
                 "lanes": [lane.public_summary() for lane in lanes],
@@ -4992,7 +5045,7 @@ class Broker:
         gpu_uuids: tuple[str, ...] | None,
         triggered_by: dict[str, str] | None,
         expected_profile: Any = CONTEXT_PROFILE_UNSET,
-        *, allow_reclaim: bool = True,
+        *, allow_reclaim: bool = True, exact_group: bool = False,
     ) -> dict[str, Any]:
         """Create exclusive whole-process peer groups under the transition lock.
 
@@ -5013,9 +5066,13 @@ class Broker:
                             if lane.kind == "managed" and lane.model == model
                             and lane.context_profile_matches()
                             and len(lane.scope) > 1 and lane.allows(gpu_uuids)
+                            and (not exact_group or lane.scope == gpu_uuids)
                             and not lane.retiring and not lane.loading
                             and not set(lane.scope).intersection(blocked)]
                 if len(existing) >= wanted:
+                    if exact_group:
+                        for lane in existing:
+                            self._warm_runtime_identity_locked(lane)
                     break
                 queued_models = {waiter.model for waiter in self.waiters if waiter.model != model}
                 # An idle different-model group may be retired as one whole
@@ -5035,14 +5092,22 @@ class Broker:
                          if device.get("uuid") in SELECTED_GPUS}
             order = list(gpu_uuids) if gpu_uuids is not None else list(dict.fromkeys(
                 MODEL_GPU_PREFERENCES.get(model, []) + list(SELECTED_GPUS)))
+            if (exact_group and all(gpu in inventory for gpu in order)
+                    and required_mib > sum(max(0, int(inventory[gpu]["total_mib"])
+                        - POOL_VRAM_RESERVE_MIB) for gpu in order)):
+                raise PermanentCapacityError("model exceeds the exact GPU group's physical capacity and headroom",
+                                             422, "model_exceeds_gpu_capacity")
             scope: list[str] = []
             capacity = 0
             for gpu in order:
                 if gpu in blocked or gpu not in inventory:
+                    if exact_group:
+                        raise CapacityError("requested exclusive GPU group is not completely available",
+                                            reason_code="gpu_peer_group_wait")
                     continue
                 scope.append(gpu)
                 capacity += max(0, int(inventory[gpu]["total_mib"]) - POOL_VRAM_RESERVE_MIB)
-                if len(scope) > 1 and capacity >= required_mib:
+                if not exact_group and len(scope) > 1 and capacity >= required_mib:
                     break
             if len(scope) < 2 or capacity < required_mib:
                 raise CapacityError("no complete exclusive GPU group is currently available",
@@ -5088,6 +5153,7 @@ class Broker:
             "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
             "requested_model": model, "canonical_model": model,
             "requested_parallel": parallel,
+            "requested_placement": "exclusive_group" if exact_group else "auto",
             "requested_gpu_uuids": list(gpu_uuids) if gpu_uuids is not None else None,
             "admitted_parallel": sum(lane["parallel"] for lane in lanes),
             "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}", "lanes": lanes,
@@ -5100,7 +5166,7 @@ class Broker:
         request_path: str = "",
         gpu_uuids: tuple[str, ...] | None = None,
         triggered_by: dict[str, str] | None = None,
-        *, allow_reclaim: bool = True,
+        *, allow_reclaim: bool = True, placement: str = "auto",
     ) -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
@@ -5110,7 +5176,7 @@ class Broker:
         require_gpu_health(refresh=True)
         with self.cv:
             requested_gpu_uuids = gpu_uuids
-            gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
+            gpu_uuids = self._capacity_scope_locked(model, gpu_uuids, placement)
             cancelling_request = self._model_cancellation_in_progress_locked(
                 model
             )
@@ -5126,6 +5192,9 @@ class Broker:
             raise PermanentCapacityError(
                 "parallel must be at least 1", 400, "invalid_capacity_request"
             )
+        if placement == "exclusive_group" and parallel > POOL_INSTANCE_PARALLEL:
+            raise PermanentCapacityError("one exact exclusive group supports only its configured parallel slots",
+                                         422, "parallel_exceeds_capacity")
         if cancelling_request:
             raise CapacityError(
                 f"model {model!r} is cancelling an expired request; retry "
@@ -5177,6 +5246,17 @@ class Broker:
             if stale and self._stop_lanes(stale, "model context identity changed"):
                 raise CapacityError("previous model context lane has not completely stopped",
                                     reason_code="lane_stop_failed")
+            if placement == "exclusive_group":
+                if profile_data is None:
+                    with MODEL_CONTEXT_LOCK:
+                        profile_data = self._model_profile(model)
+                        expected_profile = effective_model_context_profile(model)
+                        expected_profile = dict(expected_profile) if expected_profile else None
+                required_mib, capabilities = profile_data
+                return self._ensure_group_capacity(
+                    model, parallel, required_mib, capabilities, request_path,
+                    gpu_uuids, triggered_by, expected_profile,
+                    allow_reclaim=allow_reclaim, exact_group=True)
             with self.cv:
                 blocked = self._ollama_blocked_gpus_locked()
                 existing = [lane for lane in self.lanes.values()
@@ -7945,21 +8025,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError(
                         "endpoint must be a supported Ollama inference path"
                     )
+                placement = parse_capacity_placement(payload.get("placement", "auto"))
                 gpu_uuids = parse_gpu_uuid_constraint(
                     payload.get("gpu_uuids")
                     if "gpu_uuids" in payload else None,
-                    "gpu_uuids",
+                    "gpu_uuids", exact=placement == "exclusive_group",
                 )
                 proof_only = payload.get("warm_admission_proof", False)
                 if type(proof_only) is not bool:
                     raise ValueError("warm_admission_proof must be boolean")
                 if proof_only:
                     result = self.broker.warm_admission_proof(
-                        str(payload.get("model") or ""), parallel, gpu_uuids)
+                        str(payload.get("model") or ""), parallel, gpu_uuids, placement)
                 else:
                     result = self.broker.ensure_capacity(
                         str(payload.get("model") or ""), parallel, endpoint, gpu_uuids,
                         triggered_by=self._client_reference(),
+                        placement=placement,
                     )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
