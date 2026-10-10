@@ -77,6 +77,8 @@ python3 "$repo_dir/tests/test-negotiator-embedding-warmup.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-evacuation.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+python3 "$repo_dir/tests/test-negotiator-handoff.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-forced-group.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-preload-scope.py" \

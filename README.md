@@ -415,6 +415,36 @@ unit, or lease name cannot push the tray menu across a screen boundary.
 
 The indicator talks to the control socket, so only members of the broker's access group can use it. That group already has full lease control through the socket. The socket also accepts `revoke` (by token) and `stop_lane` (by lane id, `force` to interrupt in-flight requests). The user unit `ollama-unify-tray.service` is enabled globally for `graphical-session.target`, and the broker unit's `ExecStartPost` starts it in every active desktop session of an access-group member, so the indicator comes up with the broker. Choosing *Quit indicator* stops it until the next login or broker start.
 
+### Cooperative external-service handoff (opt-in)
+
+An independently supervised, single-GPU service can acquire with
+`--yield-on-request`. This does not enable preemption for other owners and is
+not supported for unscoped/multi-GPU leases or cache-evacuation acquisition.
+The opted-in owner must watch `lease_handoff_requests` in live discovery and
+honor waiting, unexpired intent naming its owner and exact GPU scope in
+`incumbents`. The capability is advertised at
+`lease_policy.cooperative_handoff.schema` as
+`io.ollama-unify.cooperative-handoff.v1`.
+
+A valid conflicting `acquire` waits for up to `OLLAMA_UNIFY_HANDOFF_TIMEOUT`
+(default180 seconds; bounded1–600). The incumbent remains active and must keep
+heartbeating while it drains/stops its CUDA workload, then explicitly release.
+The broker grants no overlapping lease and never forcibly revokes the incumbent
+for this request. Another external requester cannot steal the intended scope
+between release and admission. An existing lease owner cannot wait for a
+handoff, preventing hold-and-wait cycles. Invalid metadata, impossible hardware
+capacity, non-opted-in owners and pending/revoking incumbents do not trigger yield.
+
+Intent contains no lease credentials and is cancelled on requester disconnect,
+timeout or daemon restart. Owner opt-in is persisted with the lease. A successful
+handoff still runs ordinary health, memory, transition and readiness gates; it is
+not a guarantee of admission. Services choose their own separately acquired
+replacement scope. There is no zero-downtime CUDA migration guarantee. Update
+both daemon and CLI together. Acquire's client timeout includes the protocol's
+maximum handoff wait even when the CLI does not inherit systemd configuration.
+`docker gpu run` does not opt in: only supervisors that implement the cooperative
+shutdown contract should do so.
+
 ### Client attribution
 
 The broker records which application sends each request and which Ollama lane serves it. Each client connection is identified once, without extra privileges:

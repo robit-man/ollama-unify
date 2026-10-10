@@ -1275,6 +1275,7 @@ UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
 REVOKE_TIMEOUT = env_float("OLLAMA_UNIFY_REVOKE_TIMEOUT", 300.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
 HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
+HANDOFF_TIMEOUT = max(1.0, min(600.0, env_float("OLLAMA_UNIFY_HANDOFF_TIMEOUT", 180.0)))
 HEARTBEAT_RECONNECT_GRACE = env_float(
     "OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE", 90.0
 )
@@ -2096,6 +2097,7 @@ def discovery_document() -> dict[str, Any]:
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
         "lease_policy": lease_policy_document(),
         "active_leases": [],
+        "lease_handoff_requests": [],
         "warnings": gpu_health_warnings(health),
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
@@ -2629,6 +2631,7 @@ class Lease:
     justification: str = ""
     expected_release_at: float = 0.0
     evacuation_id: str = ""
+    yield_on_request: bool = False
 
 
 def lease_requires_exclusive_gpus(gpu_uuids: list[str]) -> bool:
@@ -2652,6 +2655,13 @@ LEASE_COORDINATION_WARNING = (
 
 def lease_policy_document() -> dict[str, Any]:
     return {
+        "cooperative_handoff": {
+            "schema": "io.ollama-unify.cooperative-handoff.v1",
+            "opt_in_acquire_flag": "--yield-on-request",
+            "single_gpu_only": True,
+            "wait_timeout_seconds": HANDOFF_TIMEOUT,
+            "release_required": True,
+        },
         "warning": LEASE_COORDINATION_WARNING,
         "required_acquire_fields": [
             "owner", "justification", "expected_duration_seconds",
@@ -2691,6 +2701,7 @@ def lease_public_summary(
         horizon_status = "legacy_unknown"
     return {
         "owner": str(raw.get("owner") or "unknown"),
+        "yield_on_request": raw.get("yield_on_request") is True,
         "state": str(raw.get("state") or "unknown"),
         "gpu_uuids": [
             str(value) for value in (raw.get("gpu_uuids") or [])
@@ -3204,6 +3215,9 @@ class Broker:
         self.transition = threading.RLock()
         self.instance_id = secrets.token_hex(32)
         self.leases = self._load_leases()
+        # Ephemeral intent, not a CUDA lease. Restart/disconnect/timeout cancels
+        # the request; incumbents keep their persisted lease and heartbeat.
+        self.lease_handoff_requests: dict[str, dict[str, Any]] = {}
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
         self.cache_policies, self.evacuations = self._load_cache_state()
@@ -3308,6 +3322,8 @@ class Broker:
                         raw.get("expected_release_at") or 0
                     ),
                     evacuation_id=str(raw.get("evacuation_id") or ""),
+                    yield_on_request=(raw.get("yield_on_request") is True
+                                      and len(raw.get("gpu_uuids") or []) == 1),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -3737,6 +3753,8 @@ class Broker:
                     raise ValueError("evacuation requires an exact selected GPU scope")
                 if self.pending_lease():
                     raise CapacityError("another external transition is pending", reason_code="lease_transition")
+                if set(scope).intersection(self._handoff_scopes_locked()):
+                    raise CapacityError("scope reserved for cooperative handoff", reason_code="lease_transition")
                 if any((not lease.gpu_uuids or set(scope).intersection(lease.gpu_uuids))
                        and lease.token != request.get("token") for lease in self.leases.values()):
                     raise CapacityError("requested scope has another external owner", reason_code="lease_transition")
@@ -4009,6 +4027,7 @@ class Broker:
 
     def _plan_lease_gpus(
         self, requested_mib: int, requested_gpu_uuids: list[str],
+        handoff_id: str = "",
     ) -> tuple[list[str], list[dict[str, Any]]]:
         """Return a GPU scope reserved against other external leases."""
         inventory = [
@@ -4026,6 +4045,7 @@ class Broker:
             )
         with self.cv:
             reserved = self._reserved_gpus_locked() | self._evacuation_recovery_scopes_locked()
+            reserved |= self._handoff_scopes_locked(handoff_id)
         conflicts = [gpu_uuid for gpu_uuid in requested if gpu_uuid in reserved]
         if conflicts:
             with self.cv:
@@ -7059,6 +7079,74 @@ class Broker:
             return True
         return lease.state == "revoking"
 
+    def _handoff_summaries_locked(self) -> list[dict[str, Any]]:
+        now = time.time()
+        for key, request in list(self.lease_handoff_requests.items()):
+            if request["state"] == "waiting" and request["expires_at"] <= now:
+                self.lease_handoff_requests.pop(key, None)
+        return [dict(request) for request in self.lease_handoff_requests.values()]
+
+    def _handoff_scopes_locked(self, ignore_id: str = "") -> set[str]:
+        return {gpu for request in self._handoff_summaries_locked()
+                if request["id"] != ignore_id for gpu in request["gpu_uuids"]}
+
+    def _wait_for_cooperative_handoff(
+        self, scope: list[str], owner: str, justification: str,
+        expected_duration_seconds: int, requested_mib: int, request_alive: Any = None,
+    ) -> str:
+        with self.cv:
+            scope_set = set(scope)
+            if not scope or any(gpu not in SELECTED_GPUS for gpu in scope):
+                return ""  # Ordinary admission owns invalid/unscoped rejection.
+            if scope_set.intersection(self._handoff_scopes_locked()):
+                raise RuntimeError("another cooperative handoff already targets this GPU scope")
+            live = list(self.leases.values())
+            conflicts = [lease for lease in live
+                         if not lease.gpu_uuids or scope_set.intersection(lease.gpu_uuids)]
+            if self.pending_lease() or not conflicts or any(lease.state != "active" or not lease.yield_on_request
+                                    or len(lease.gpu_uuids) != 1 for lease in conflicts):
+                return ""  # Non-opted-in owners retain their existing contract.
+            if any(lease.owner == owner for lease in live):
+                raise RuntimeError("an existing owner cannot wait for a cooperative handoff")
+            inventory = {device["uuid"]: device for device in gpu_snapshot()}
+            if (any(gpu not in inventory for gpu in scope)
+                    or sum(int(inventory[gpu].get("total_mib") or 0) for gpu in scope) < requested_mib):
+                raise ValueError("handoff request exceeds verified GPU hardware capacity")
+            if len(self.lease_handoff_requests) >= 32:
+                raise RuntimeError("cooperative handoff request capacity reached")
+            request_id = "handoff_" + secrets.token_urlsafe(18)
+            now = time.time()
+            self.lease_handoff_requests[request_id] = {
+                "id": request_id, "state": "waiting", "owner": owner,
+                "justification": justification, "gpu_uuids": list(scope),
+                "requested_mib": requested_mib,
+                "expected_duration_seconds": expected_duration_seconds,
+                "created_at": now, "expires_at": now + HANDOFF_TIMEOUT,
+                "incumbents": [{"owner": lease.owner, "gpu_uuids": list(lease.gpu_uuids)}
+                               for lease in conflicts],
+            }
+            self.cv.notify_all()
+            deadline = time.monotonic() + HANDOFF_TIMEOUT
+            try:
+                # Never hold self.transition here: release needs that lock.
+                while any(not lease.gpu_uuids or scope_set.intersection(lease.gpu_uuids)
+                          for lease in self.leases.values()):
+                    if self.stopping.is_set() or (request_alive is not None and not request_alive()):
+                        raise RuntimeError("cooperative handoff requester disconnected or broker stopping")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or request_id not in self.lease_handoff_requests:
+                        raise TimeoutError("cooperative handoff timed out; incumbent ownership is retained")
+                    self.cv.wait(min(remaining, 0.5))
+                if (self.stopping.is_set() or time.monotonic() >= deadline
+                        or request_id not in self.lease_handoff_requests
+                        or (request_alive is not None and not request_alive())):
+                    raise TimeoutError("cooperative handoff expired before successor admission")
+                return request_id
+            except Exception:
+                self.lease_handoff_requests.pop(request_id, None)
+                self.cv.notify_all()
+                raise
+
     def acquire(
         self, owner: str, requested_mib: int, ttl: int,
         requested_gpu_uuids: list[str] | None = None,
@@ -7066,6 +7154,7 @@ class Broker:
         expected_duration_seconds: int = 0,
         *, priority: int | None = None, evacuation_id: str = "",
         _evacuation_commit_id: str = "",
+        yield_on_request: bool = False, request_alive: Any = None,
     ) -> dict[str, Any]:
         owner = owner.strip()
         justification = justification.strip()
@@ -7083,6 +7172,11 @@ class Broker:
             raise ValueError(
                 "lease acquisition requires expected_duration_seconds greater than zero"
             )
+        if type(yield_on_request) is not bool:
+            raise ValueError("yield_on_request must be a Boolean")
+        requested_scope = list(dict.fromkeys(requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])))
+        if yield_on_request and (len(requested_scope) != 1 or evacuation_id):
+            raise ValueError("cooperative yield requires exactly one GPU and no cache evacuation")
         if priority is not None and not evacuation_id:
             raise ValueError("priority requires an explicit evacuation ID")
         if evacuation_id:
@@ -7092,9 +7186,38 @@ class Broker:
                 "justification": justification, "expected_duration_seconds": expected_duration_seconds,
             }, priority, evacuation_id)
         require_gpu_health(refresh=True)
-        requested_scope = requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
+        handoff_id = self._wait_for_cooperative_handoff(
+            requested_scope, owner, justification, expected_duration_seconds, requested_mib, request_alive,
+        )
+        try:
+            if handoff_id:
+                require_gpu_health(refresh=True)
+                if request_alive is not None and not request_alive():
+                    raise RuntimeError("cooperative requester disconnected before admission")
+            return self._acquire_once(owner, requested_mib, ttl, requested_scope,
+                                      justification, expected_duration_seconds,
+                                      _evacuation_commit_id, yield_on_request, handoff_id, request_alive)
+        finally:
+            if handoff_id:
+                with self.cv:
+                    self.lease_handoff_requests.pop(handoff_id, None)
+                    self.cv.notify_all()
+
+    def _acquire_once(
+        self, owner: str, requested_mib: int, ttl: int, requested_scope: list[str],
+        justification: str, expected_duration_seconds: int,
+        _evacuation_commit_id: str, yield_on_request: bool, handoff_id: str, request_alive: Any,
+    ) -> dict[str, Any]:
         with self.transition:
             with self.cv:
+                reserved = self._handoff_scopes_locked(handoff_id)
+                if reserved and (not requested_scope or reserved.intersection(requested_scope)):
+                    raise RuntimeError("GPU scope is reserved for a cooperative handoff requester")
+                if handoff_id:
+                    request = self.lease_handoff_requests.get(handoff_id)
+                    if request is None or request["expires_at"] <= time.time():
+                        raise TimeoutError("cooperative handoff expired before admission")
+                    request["state"] = "admitting"
                 if self.pending_lease():
                     pending = next(
                         lease for lease in self.leases.values()
@@ -7120,7 +7243,7 @@ class Broker:
                 unloaded = self._unload_base_models()
                 if requested_scope:
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        0, requested_scope,
+                        0, requested_scope, handoff_id,
                     )
                     aggregate_free = sum(
                         int(device["free_mib"]) for device in devices
@@ -7144,7 +7267,7 @@ class Broker:
                     # retirement and enforce the reservation against the
                     # resulting live capacity.
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        requested_mib, requested_scope,
+                        requested_mib, requested_scope, handoff_id,
                     )
                 else:
                     stopped = self.stop_pool_lanes("lease acquire")
@@ -7157,6 +7280,8 @@ class Broker:
                         f"requested {requested_mib} MiB but only {aggregate_free} MiB is free after Ollama unload"
                     )
                 require_gpu_health(refresh=True)
+                if handoff_id and request_alive is not None and not request_alive():
+                    raise RuntimeError("cooperative requester disconnected before lease grant")
                 now = time.time()
                 token = "lease_" + secrets.token_urlsafe(24)
                 lease = Lease(
@@ -7164,6 +7289,7 @@ class Broker:
                     foreign_gpu_usage(), gpu_uuids, justification,
                     now + expected_duration_seconds,
                     _evacuation_commit_id,
+                    yield_on_request,
                 )
                 with self.cv:
                     if _evacuation_commit_id:
@@ -7243,6 +7369,10 @@ class Broker:
                     raise KeyError("unknown lease")
                 if lease.state not in ("pending", "active"):
                     raise RuntimeError("only a pending or active lease can change scope")
+                if lease.yield_on_request and requested != lease.gpu_uuids:
+                    raise RuntimeError("cooperative owners must release before changing GPU scope")
+                if set(requested).intersection(self._handoff_scopes_locked()):
+                    raise RuntimeError("scope reserved for cooperative handoff")
                 conflicts = {
                     gpu_uuid
                     for other_token, other in self.leases.items()
@@ -7720,6 +7850,7 @@ class Broker:
         with self.cv:
             self._prune_client_history_locked()
             leases = [asdict(lease) for lease in self.leases.values()]
+            handoffs = self._handoff_summaries_locked()
             lease_summaries = self._public_lease_summaries_locked()
             draining = self.draining
             active = self.active_requests
@@ -7744,6 +7875,7 @@ class Broker:
                 "selected_gpu_count": len(SELECTED_GPUS),
                 "draining": draining, "active_requests": active,
                 "last_reason": reason, "leases": leases,
+                "lease_handoff_requests": handoffs,
                 "lease_policy": lease_policy_document(),
                 "lease_summaries": lease_summaries,
                 "warnings": lease_visibility_warnings(lease_summaries)
@@ -8158,6 +8290,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             document = discovery_document()
             with self.broker.cv:
                 lease_summaries = self.broker._public_lease_summaries_locked()
+                document["lease_handoff_requests"] = self.broker._handoff_summaries_locked()
                 unregistered_gpus = sorted(self.broker._unregistered_gpus_locked())
                 document["unregistered_gpu_quarantine"] = unregistered_gpus
                 if unregistered_gpus:
@@ -8744,6 +8877,14 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class ControlHandler(socketserver.StreamRequestHandler):
     broker: Broker
 
+    def request_alive(self) -> bool:
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) != b""
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
     def handle(self) -> None:
         while raw_request := self.rfile.readline(1024 * 1024):
             persistent = False
@@ -8764,6 +8905,8 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         max(0, int(request.get("expected_duration_seconds") or 0)),
                         priority=request.get("priority"),
                         evacuation_id=str(request.get("evacuation_id") or ""),
+                        yield_on_request=request.get("yield_on_request", False),
+                        request_alive=self.request_alive,
                     )
                 elif action == "ready":
                     result = self.broker.ready(str(request.get("token") or ""))
@@ -8817,8 +8960,11 @@ class ControlHandler(socketserver.StreamRequestHandler):
                     raise ValueError(f"unknown action: {action}")
             except Exception as exc:
                 result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
-            self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
             if not persistent:
                 return
 
@@ -8840,6 +8986,9 @@ def send_control(
                 HEARTBEAT_TIMEOUT
                 if payload.get("action") == "heartbeat"
                 else DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10
+                # CLI does not inherit systemd's timeout overrides. Include
+                # the protocol maximum, not the CLI's local default.
+                + (600.0 if payload.get("action") == "acquire" else 0)
             )
         )
         client.settimeout(timeout)
@@ -9123,6 +9272,8 @@ def main() -> int:
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     acquire.add_argument("--gpu", action="append", default=[])
     acquire.add_argument("--token-only", action="store_true")
+    acquire.add_argument("--yield-on-request", action="store_true",
+                         help="opt in to cooperative single-GPU handoff; owner must honor discovery intent")
     acquire.add_argument("--priority", type=int)
     acquire.add_argument("--evacuation-id", default="", help="stable ID for opt-in copy-first lower-priority cache evacuation")
     cache = sub.add_parser("set-cache-policy")
@@ -9187,7 +9338,7 @@ def main() -> int:
             # The daemon can have systemd EnvironmentFile overrides that the
             # CLI does not inherit. Publish its effective scope and health.
             for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health",
-                        "unregistered_gpu_quarantine"):
+                        "unregistered_gpu_quarantine", "lease_policy", "lease_handoff_requests"):
                 if key in live_status:
                     document[key] = live_status[key]
             selected = set(document.get("selected_gpu_ids", []))
@@ -9220,6 +9371,7 @@ def main() -> int:
                                "gpu_uuids": args.gpu,
                                "justification": args.justification,
                                "expected_duration_seconds": args.expected_duration,
+                               "yield_on_request": args.yield_on_request,
                                "priority": args.priority, "evacuation_id": args.evacuation_id})
     elif args.command_name == "set-cache-policy":
         result = send_control({"action": "set_cache_policy", "model": args.model,
