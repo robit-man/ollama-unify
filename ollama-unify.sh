@@ -973,6 +973,7 @@ import pwd
 import re
 import secrets
 import select
+import shlex
 import signal
 import socket
 import socketserver
@@ -1274,6 +1275,7 @@ UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
 REVOKE_TIMEOUT = env_float("OLLAMA_UNIFY_REVOKE_TIMEOUT", 300.0)
 DEFAULT_LEASE_TTL = env_int("OLLAMA_UNIFY_LEASE_TTL", 300)
 HEARTBEAT_TIMEOUT = env_float("OLLAMA_UNIFY_HEARTBEAT_TIMEOUT", 10.0)
+HANDOFF_TIMEOUT = max(1.0, min(600.0, env_float("OLLAMA_UNIFY_HANDOFF_TIMEOUT", 180.0)))
 HEARTBEAT_RECONNECT_GRACE = env_float(
     "OLLAMA_UNIFY_HEARTBEAT_RECONNECT_GRACE", 90.0
 )
@@ -1306,6 +1308,19 @@ MODEL_POLICY_PATH = Path(os.environ.get(
     "OLLAMA_UNIFY_MODEL_POLICY_STATE",
     str(LEASE_STATE_PATH.with_name("model-gpu-policy.json")),
 ))
+CACHE_STATE_PATH = Path(os.environ.get(
+    "OLLAMA_UNIFY_CACHE_RESIDENCY_STATE", str(LEASE_STATE_PATH.with_name("cache-residency.json"))
+))
+CACHE_STARTUP_WRAPPER = """import os, sys
+fd = int(sys.argv[1])
+try:
+    permit = os.read(fd, 1)
+finally:
+    os.close(fd)
+if permit != b'\\x01':
+    sys.exit(125)
+os.execve(sys.argv[2], sys.argv[2:], os.environ)
+"""
 POOL_ENABLED = env_bool(
     "OLLAMA_UNIFY_POOL_ENABLED", BACKEND_TYPE == "cuda" and bool(SELECTED_GPUS)
 )
@@ -1384,6 +1399,8 @@ CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
 GPU_UUIDS_HEADER = "X-Ollama-Unify-GPU-UUIDs"
+WARM_ADMISSION_HEADER = "X-Ollama-Unify-Warm-Admission"
+WARM_ADMISSION_SCHEMA = "io.ollama-unify.warm-admission.v1"
 
 
 def canonical_model_tag(model: str) -> str:
@@ -1395,15 +1412,18 @@ def canonical_model_tag(model: str) -> str:
     return model if ":" in leaf else f"{model}:latest"
 
 
-def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None:
+def parse_gpu_uuid_constraint(value: Any, source: str, *, exact: bool = False) -> tuple[str, ...] | None:
     """Parse a presence-sensitive, ordered hard GPU allowlist.
 
     An allowlist constrains placement to matching members; it is not a demand
-    that every listed device still exist. Hardware selection can legitimately
+    that every listed device still exist unless exact=True. Hardware selection can legitimately
     shrink while a long-lived client still has the previous superset cached.
     Keep the live intersection in caller order, and fail closed only when no
     allowed GPU remains.
     """
+    if exact and not isinstance(value, list):
+        raise PermanentCapacityError("exclusive_group requires an explicit ordered GPU UUID array",
+                                     400, "invalid_gpu_constraint")
     if value is None:
         return None
     if isinstance(value, str):
@@ -1434,6 +1454,9 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
                 400,
                 "invalid_gpu_constraint",
             )
+        if exact and gpu_uuid in seen:
+            raise PermanentCapacityError("exclusive_group GPU UUIDs must be distinct",
+                                         400, "invalid_gpu_constraint")
         if gpu_uuid not in seen:
             seen.add(gpu_uuid)
             normalized.append(gpu_uuid)
@@ -1452,6 +1475,9 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
         }
     available = [gpu_uuid for gpu_uuid in normalized if gpu_uuid in selected]
     unavailable = [gpu_uuid for gpu_uuid in normalized if gpu_uuid not in selected]
+    if exact and unavailable:
+        raise PermanentCapacityError("exclusive_group contains unselected GPU UUIDs: "
+                                     + ", ".join(unavailable), 422, "gpu_constraint_unavailable")
     if not available:
         raise PermanentCapacityError(
             "GPU constraint has no UUIDs in the broker-selected set; requested: "
@@ -1467,6 +1493,13 @@ def parse_gpu_uuid_constraint(value: Any, source: str) -> tuple[str, ...] | None
             available,
         )
     return tuple(available)
+
+
+def parse_capacity_placement(value: Any) -> str:
+    if not isinstance(value, str) or value not in ("auto", "exclusive_group"):
+        raise PermanentCapacityError("placement must be auto or exclusive_group",
+                                     400, "invalid_capacity_request")
+    return value
 
 
 class BackendHTTPError(RuntimeError):
@@ -1569,6 +1602,135 @@ def backend_json_at(host: str, port: int, method: str, path: str,
 def backend_json(method: str, path: str, payload: dict[str, Any] | None = None,
                  timeout: float = 10.0) -> dict[str, Any]:
     return backend_json_at(BACKEND_HOST, BACKEND_PORT, method, path, payload, timeout)
+
+
+def model_gpu_weight_bytes(model: str, tag: dict, aggregate_bytes: int) -> int:
+    """Subtract a known sidecar only from an exact native/local runtime graph.
+
+    Stock Ollama GetModel loads model/projector/adapter layers and
+    Model.String exposes their blob paths as FROM/ADAPTER. The omni exporter
+    deliberately appends its bundle outside that graph (never a FROM).
+    Unknown, remote, changed or unavailable evidence retains the original
+    aggregate estimate; observed low VRAM is never used to shrink a promise.
+    """
+    if not OLLAMA_MODELS or type(tag.get("size")) is not int:
+        return aggregate_bytes
+    auxiliary_type = "application/vnd.robit.ollama.omni.bundle.v1+gguf"
+    runtime_types = {"application/vnd.ollama.image." + kind
+                     for kind in ("model", "projector", "adapter", "tensor")}
+    metadata_types = {"application/vnd.ollama.image." + kind
+                      for kind in ("template", "license", "params", "system", "messages")}
+    try:
+        name, separator, version = model.rpartition(":")
+        parts = name.split("/")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+            return aggregate_bytes
+        if len(parts) == 1:
+            parts = ["registry.ollama.ai", "library", *parts]
+        elif len(parts) == 2:
+            parts = ["registry.ollama.ai", *parts]
+        if (len(parts) != 3
+                or not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", parts[0])
+                or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part) for part in parts[1:])):
+            return aggregate_bytes
+        root_alias = Path(OLLAMA_MODELS)
+        root = root_alias.resolve(strict=True)
+        manifests_alias = root / "manifests"
+        manifests = manifests_alias.resolve(strict=True)
+        path = manifests.joinpath(*parts, version)
+        if path.resolve(strict=True) != path:
+            return aggregate_bytes
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if (len(raw) > 1024 * 1024 or not re.fullmatch(r"[a-f0-9]{64}", str(tag.get("digest") or ""))
+                or hashlib.sha256(raw).hexdigest() != tag["digest"]):
+            return aggregate_bytes
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("ambiguous manifest")
+                result[key] = value
+            return result
+        manifest = json.loads(raw, object_pairs_hook=unique_object)
+        if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 2:
+            return aggregate_bytes
+        config, layers = manifest.get("config"), manifest.get("layers")
+        if (not isinstance(config, dict) or config.get("mediaType") != "application/vnd.docker.container.image.v1+json"
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", str(config.get("digest") or ""))
+                or type(config.get("size")) is not int or not 0 < config["size"] <= 1024 * 1024
+                or not isinstance(layers, list) or not 1 <= len(layers) <= 256):
+            return aggregate_bytes
+        if not any(isinstance(layer, dict) and layer.get("mediaType") == auxiliary_type for layer in layers):
+            return aggregate_bytes
+        blobs_alias = root / "blobs"
+        blobs = blobs_alias.resolve(strict=True)
+        runtime, identities, seen = set(), {}, set()
+        excluded = total = 0
+        for layer in layers:
+            if (not isinstance(layer, dict) or layer.get("mediaType") not in runtime_types | metadata_types | {auxiliary_type}
+                    or not re.fullmatch(r"sha256:[a-f0-9]{64}", str(layer.get("digest") or ""))
+                    or type(layer.get("size")) is not int or not 0 < layer["size"] <= 2 ** 63 - 1
+                    or layer["digest"] in seen):
+                return aggregate_bytes
+            seen.add(layer["digest"])
+            total += layer["size"]
+            blob = blobs / layer["digest"].replace(":", "-")
+            if blob.resolve(strict=True) != blob or not blob.is_file() or blob.stat().st_size != layer["size"]:
+                return aggregate_bytes
+            stat = blob.stat()
+            identities[blob] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            if layer["mediaType"] in runtime_types:
+                runtime.add(blob)
+            elif layer["mediaType"] == auxiliary_type:
+                excluded += layer["size"]
+        if (aggregate_bytes not in (total, total + config["size"])
+                or not any(layer["mediaType"] == "application/vnd.ollama.image.model" for layer in layers)):
+            return aggregate_bytes
+        show = backend_json("POST", "/api/show", {"model": model}, timeout=10.0)
+        if not isinstance(show, dict):
+            return aggregate_bytes
+        modelfile = show.get("modelfile")
+        if not isinstance(modelfile, str) or len(modelfile) > 1024 * 1024:
+            return aggregate_bytes
+        native = set()
+        for line in modelfile.splitlines():
+            if re.match(r"^\s*DRAFT\s", line):
+                return aggregate_bytes
+            if not re.match(r"^\s*(?:FROM|ADAPTER)\s", line):
+                continue
+            fields = shlex.split(line)
+            if len(fields) != 2 or not Path(fields[1]).is_absolute():
+                return aggregate_bytes
+            blob = Path(fields[1]).resolve(strict=True)
+            if blob.parent != blobs or blob in native:
+                return aggregate_bytes
+            native.add(blob)
+        if native != runtime or not native:
+            return aggregate_bytes
+        current_tags = backend_json("GET", "/api/tags", timeout=10.0)
+        if not isinstance(current_tags, dict):
+            return aggregate_bytes
+        current = current_tags.get("models")
+        matches = [item for item in current if isinstance(item, dict)
+                   and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model] if isinstance(current, list) else []
+        with path.open("rb") as stream:
+            current_raw = stream.read(1024 * 1024 + 1)
+        if (len(matches) != 1 or matches[0].get("digest") != tag["digest"]
+                or matches[0].get("size") != tag.get("size") or current_raw != raw
+                or path.resolve(strict=True) != path
+                or root_alias.resolve(strict=True) != root
+                or manifests_alias.resolve(strict=True) != manifests
+                or blobs_alias.resolve(strict=True) != blobs):
+            return aggregate_bytes
+        for blob, identity in identities.items():
+            stat = blob.stat()
+            if (blob.resolve(strict=True) != blob
+                    or identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)):
+                return aggregate_bytes
+        return aggregate_bytes - excluded
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, http.client.HTTPException):
+        return aggregate_bytes
 
 
 @dataclass(frozen=True)
@@ -1935,6 +2097,7 @@ def discovery_document() -> dict[str, Any]:
         "capacity_endpoint": f"http://127.0.0.1:{LISTEN_PORT}{CAPACITY_PATH}",
         "lease_policy": lease_policy_document(),
         "active_leases": [],
+        "lease_handoff_requests": [],
         "warnings": gpu_health_warnings(health),
         "pending_transition_timeout_seconds": PENDING_TIMEOUT,
         "heartbeat_reconnect_grace_seconds": HEARTBEAT_RECONNECT_GRACE,
@@ -2004,6 +2167,14 @@ def discovery_document() -> dict[str, Any]:
                     "explicit_headers_override": True,
                 },
                 "gpu_uuids_header": GPU_UUIDS_HEADER,
+                "warm_admission_header": WARM_ADMISSION_HEADER,
+                "warm_admission_schema": WARM_ADMISSION_SCHEMA,
+                "warm_admission_proof_only_capacity_field": "warm_admission_proof",
+                "capacity_placements": ["auto", "exclusive_group"],
+                "exclusive_group_semantics": (
+                    "explicit ordered group of at least two selected GPUs; every member "
+                    "must satisfy model policy; exact group reuse and proof only; no pruning"
+                ),
                 "gpu_constraint_semantics": (
                     "ordered hard allowlist intersected with broker-selected GPUs; "
                     "rejected only when the intersection is empty"
@@ -2016,6 +2187,8 @@ def discovery_document() -> dict[str, Any]:
                     "lane_capacity_wait",
                     "reclaimable_placement_wait",
                     "background_capacity_deferred",
+                    "warm_preflight_required",
+                    "invalid_warm_admission",
                     "host_memory_unavailable",
                     "model_exceeds_gpu_capacity",
                     "model_context_memory_unverified",
@@ -2457,6 +2630,8 @@ class Lease:
     gpu_uuids: list[str]
     justification: str = ""
     expected_release_at: float = 0.0
+    evacuation_id: str = ""
+    yield_on_request: bool = False
 
 
 def lease_requires_exclusive_gpus(gpu_uuids: list[str]) -> bool:
@@ -2480,6 +2655,13 @@ LEASE_COORDINATION_WARNING = (
 
 def lease_policy_document() -> dict[str, Any]:
     return {
+        "cooperative_handoff": {
+            "schema": "io.ollama-unify.cooperative-handoff.v1",
+            "opt_in_acquire_flag": "--yield-on-request",
+            "single_gpu_only": True,
+            "wait_timeout_seconds": HANDOFF_TIMEOUT,
+            "release_required": True,
+        },
         "warning": LEASE_COORDINATION_WARNING,
         "required_acquire_fields": [
             "owner", "justification", "expected_duration_seconds",
@@ -2519,6 +2701,7 @@ def lease_public_summary(
         horizon_status = "legacy_unknown"
     return {
         "owner": str(raw.get("owner") or "unknown"),
+        "yield_on_request": raw.get("yield_on_request") is True,
         "state": str(raw.get("state") or "unknown"),
         "gpu_uuids": [
             str(value) for value in (raw.get("gpu_uuids") or [])
@@ -2563,6 +2746,101 @@ def process_group_alive(process: Any) -> bool:
         return True
 
 
+def process_group_identity(process: Any) -> list[dict[str, int]]:
+    """Include native runner children, not just the long-lived Ollama server."""
+    if process is None or process.poll() is not None:
+        raise RuntimeError("managed server is not alive")
+    members = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat", encoding="utf-8") as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            continue
+        if int(fields[2]) == process.pid and fields[0] not in {"Z", "X"}:
+            members.append({"pid": int(entry.name), "start_time_ticks": int(fields[19])})
+    if not any(item["pid"] == process.pid for item in members):
+        raise RuntimeError("managed server process identity is unavailable")
+    return sorted(members, key=lambda item: item["pid"])
+
+
+def managed_server_identity(process: Any) -> tuple[int, int, int]:
+    """Read the actual spawned server generation without exposing its env."""
+    try:
+        if process is None or process.poll() is not None:
+            raise ValueError("server exited")
+        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stream:
+            fields = stream.read().rsplit(")", 1)[1].split()
+        identity = (process.pid, int(fields[19]), int(fields[2]))
+        if fields[0] in {"Z", "X"} or identity[1] <= 0 or identity[2] != process.pid:
+            raise ValueError("server generation unavailable")
+        return identity
+    except (OSError, ValueError, IndexError, TypeError) as exc:
+        raise CapacityError("managed server identity is unverified before model loading",
+                            503, "gpu_placement_unverified", False, None) from exc
+
+
+def assert_managed_server_scope(process: Any, scope: tuple[str, ...],
+                                expected: tuple[int, int, int]) -> None:
+    """Attest actual CVD before even a zero-token model load is permitted."""
+    try:
+        if managed_server_identity(process) != expected:
+            raise ValueError("server generation changed")
+        with open(f"/proc/{process.pid}/environ", "rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("environment exceeds inspection bound")
+        values = [entry[len(b"CUDA_VISIBLE_DEVICES="):]
+                  for entry in raw.split(b"\0") if entry.startswith(b"CUDA_VISIBLE_DEVICES=")]
+        if len(values) != 1 or tuple(values[0].decode("ascii").split(",")) != scope:
+            raise ValueError("actual CUDA scope differs")
+        if managed_server_identity(process) != expected:
+            raise ValueError("server generation changed during inspection")
+    except (OSError, ValueError, IndexError, TypeError) as exc:
+        # Never include raw values, full environment, or private exceptions.
+        raise CapacityError("managed server CUDA scope is unverified before model loading",
+                            503, "gpu_placement_unverified", False, None) from exc
+
+
+def parse_warm_admission(raw: str) -> str:
+    """Canonicalize a bounded, closed certificate; it grants no GPU authority."""
+    try:
+        if not raw or len(raw) > 16384:
+            raise ValueError("invalid certificate length")
+        proof = json.loads(raw)
+        if not isinstance(proof, dict) or set(proof) != {
+            "schema", "broker_instance_id", "model", "model_digest",
+            "context_length", "gpu_uuids", "lanes",
+        }:
+            raise ValueError("invalid certificate fields")
+        if proof["schema"] != WARM_ADMISSION_SCHEMA:
+            raise ValueError("invalid certificate schema")
+        for key in ("broker_instance_id", "model_digest"):
+            if not isinstance(proof[key], str) or not re.fullmatch(r"[0-9a-f]{64}", proof[key]):
+                raise ValueError("invalid certificate identity")
+        if not isinstance(proof["model"], str) or not proof["model"] or canonical_model_tag(proof["model"]) != proof["model"]:
+            raise ValueError("invalid certificate model")
+        if type(proof["context_length"]) is not int or not 1 <= proof["context_length"] <= 2 ** 31 - 1:
+            raise ValueError("invalid certificate context")
+        scope = proof["gpu_uuids"]
+        if not isinstance(scope, list) or not scope or any(not isinstance(gpu, str) or not gpu for gpu in scope) or len(set(scope)) != len(scope):
+            raise ValueError("invalid certificate scope")
+        lanes = proof["lanes"]
+        if not isinstance(lanes, list) or not 1 <= len(lanes) <= 128:
+            raise ValueError("invalid certificate lanes")
+        for lane in lanes:
+            if not isinstance(lane, dict) or set(lane) != {"id", "generation_id"} or not isinstance(lane["id"], str) or not re.fullmatch(r"lane-\d+", lane["id"]) or not isinstance(lane["generation_id"], str) or not re.fullmatch(r"[0-9a-f]{64}", lane["generation_id"]):
+                raise ValueError("invalid certificate lane identity")
+        if len({lane["id"] for lane in lanes}) != len(lanes):
+            raise ValueError("duplicate certificate lane")
+        return json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    except (ValueError, TypeError) as exc:
+        raise PermanentCapacityError("invalid warm admission certificate", 400,
+                                     "invalid_warm_admission") from exc
+
+
 @dataclass
 class Lane:
     lane_id: str
@@ -2589,6 +2867,8 @@ class Lane:
     loading: bool = False
     context_profile: dict | None = None
     openai_context_compatible: bool = True
+    warm_generation_id: str = ""
+    warm_runtime_identity: dict[str, Any] | None = None
 
     def context_profile_matches(self) -> bool:
         return self.context_profile == effective_model_context_profile(self.model)
@@ -2700,6 +2980,46 @@ class BackgroundCapacityDeferred(CapacityError):
         super().__init__(message, 503, "background_capacity_deferred", True, 2)
 
 
+WARM_PREFLIGHT_PHASES = frozenset({
+    "validation", "proof_issuance", "pre_admission", "queue_validation",
+    "body_preparation", "post_admission_validation", "backend_dispatch_validation",
+})
+WARM_PREFLIGHT_CAUSES = frozenset({
+    "unspecified", "broker_instance_mismatch", "model_mismatch", "gpu_scope_mismatch",
+    "broker_draining", "lane_missing", "generation_mismatch", "lane_model_mismatch",
+    "gpu_policy_mismatch", "gpu_blocked", "model_digest_mismatch", "context_mismatch",
+    "lane_unavailable", "context_profile_mismatch", "runtime_identity_unavailable",
+    "native_ps_unavailable", "native_ps_inventory_mismatch", "native_model_mismatch",
+    "native_digest_mismatch", "native_context_mismatch", "native_gpu_residency_mismatch",
+    "runtime_identity_changed", "selected_lane_not_certified", "embedding_metadata_unavailable",
+    "embedding_identity_mismatch", "ownership_uncertain", "native_gpu_placement_mismatch",
+})
+
+
+class WarmPreflightRequired(CapacityError):
+    def __init__(self, *, admission_retained: bool = False,
+                 phase: str = "validation", causes: tuple[str, ...] = (), **kwargs: Any) -> None:
+        self.warm_preflight_phase = phase if phase in WARM_PREFLIGHT_PHASES else "validation"
+        self.warm_preflight_causes = tuple(sorted({cause for cause in causes
+            if isinstance(cause, str) and cause in WARM_PREFLIGHT_CAUSES})) or ("unspecified",)
+        kwargs["cause_reason_code"] = self.warm_preflight_causes[0]
+        super().__init__("verified warm lanes changed; fresh hardware preflight is required",
+                         503, "warm_preflight_required", True, 2,
+                         admission_retained=admission_retained, **kwargs)
+
+
+class WarmAdmissionOwnershipUncertain(PermanentCapacityError):
+    """A stale or uncertain caller must not release or recertify another owner."""
+    def __init__(self, admission: Any, failure: CapacityError | None = None) -> None:
+        super().__init__("warm admission ownership cannot be safely released", 409,
+                         "warm_admission_ownership_uncertain",
+                         request_id=admission.request_id,
+                         logical_request_id=admission.logical_request_id)
+        self.cause_reason_code = "ownership_uncertain"
+        self.warm_preflight_phase = getattr(failure, "warm_preflight_phase", "backend_dispatch_validation")
+        self.warm_preflight_causes = ("ownership_uncertain",)
+
+
 class AdmissionTimeoutError(CapacityError):
     def __init__(
         self,
@@ -2758,6 +3078,7 @@ class RetainedRequest:
     model: str
     fingerprint: str
     gpu_uuids: tuple[str, ...] | None = None
+    warm_admission: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2766,6 +3087,7 @@ class LogicalRequestTombstone:
     request_id: str
     reason_code: str
     expires_at: float
+    warm_admission: str | None = None
 
 
 @dataclass
@@ -2795,6 +3117,7 @@ class QueuedRequest:
     attached: bool = True
     resume_deadline: float | None = None
     client: dict[str, str] | None = None
+    warm_admission: str | None = None
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
@@ -2835,6 +3158,7 @@ class ActiveRequest:
     cancel_reason: str = ""
     backend: Any = None
     backend_started: bool = False
+    warm_admission: str | None = None
     backend_completed: bool = False
     lane_stop_started: bool = False
     lane_stopped: bool = False
@@ -2855,6 +3179,8 @@ class Admission:
     initial_position: int
     queue_ticket: int
     retained_request: RetainedRequest | None = None
+    warm_admission: str | None = None
+    active_request: ActiveRequest | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -2880,15 +3206,21 @@ class CompletedResponse:
     unavailable_reason: str | None
     completed_at: float
     expires_at: float
+    warm_admission: str | None = None
 
 
 class Broker:
     def __init__(self) -> None:
         self.cv = threading.Condition()
         self.transition = threading.RLock()
+        self.instance_id = secrets.token_hex(32)
         self.leases = self._load_leases()
+        # Ephemeral intent, not a CUDA lease. Restart/disconnect/timeout cancels
+        # the request; incumbents keep their persisted lease and heartbeat.
+        self.lease_handoff_requests: dict[str, dict[str, Any]] = {}
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
+        self.cache_policies, self.evacuations = self._load_cache_state()
         self.draining = any(
             lease.state in ("pending", "active", "revoking") and not lease.gpu_uuids
             for lease in self.leases.values()
@@ -2989,6 +3321,9 @@ class Broker:
                     expected_release_at=float(
                         raw.get("expected_release_at") or 0
                     ),
+                    evacuation_id=str(raw.get("evacuation_id") or ""),
+                    yield_on_request=(raw.get("yield_on_request") is True
+                                      and len(raw.get("gpu_uuids") or []) == 1),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -3026,6 +3361,498 @@ class Broker:
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, MODEL_POLICY_PATH)
 
+    def _load_cache_state(self) -> tuple[dict, dict]:
+        try:
+            raw = json.loads(CACHE_STATE_PATH.read_text())
+        except FileNotFoundError:
+            return {}, {}
+        if (not isinstance(raw, dict) or raw.get("schema") != "io.ollama-unify.cache-residency.v1"
+                or not isinstance(raw.get("policies"), dict) or not isinstance(raw.get("operations"), dict)):
+            raise ValueError("invalid cache residency journal; refusing to discard recovery ownership")
+        operations = raw["operations"]
+        for operation in operations.values():
+            if not isinstance(operation, dict) or not isinstance(operation.get("moves"), list):
+                raise ValueError("invalid evacuation operation")
+            if operation.get("state") not in ("lease_pending", "rolled_back", "failed", "cancelled"):
+                operation["state"] = "recovery_pending"
+        return raw["policies"], operations
+
+    def _persist_cache_state_locked(self) -> None:
+        CACHE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CACHE_STATE_PATH.with_name(f".{CACHE_STATE_PATH.name}.{os.getpid()}.tmp")
+        data = {"schema": "io.ollama-unify.cache-residency.v1",
+                "policies": self.cache_policies, "operations": self.evacuations}
+        with temporary.open("w", encoding="utf-8") as stream:
+            os.chmod(temporary, 0o600)
+            stream.write(json.dumps(data, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, CACHE_STATE_PATH)
+        directory = os.open(CACHE_STATE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    @staticmethod
+    def _evacuation_public(operation: dict) -> dict:
+        return json.loads(json.dumps({key: value for key, value in operation.items()
+            if key not in ("lease_token", "request")}))
+
+    def _evacuation_recovery_scopes_locked(self, owner: str = "") -> set[str]:
+        protected = set()
+        for operation in self.evacuations.values():
+            if operation["id"] == owner or operation.get("state") not in ("recovery_pending", "restoration_pending"):
+                continue
+            protected.update(operation["gpu_uuids"])
+            for move in operation["moves"]:
+                protected.update(move["source"]["gpu_uuids"])
+                protected.update(move["destination"]["gpu_uuids"])
+            protected.update(operation.get("destination_reservation", {}))
+            for attempt in operation.get("spawn_attempts", []):
+                protected.update(attempt["gpu_uuids"])
+        return protected
+
+    @staticmethod
+    def _recorded_runtime_exited(identity: dict) -> bool:
+        group_id = identity.get("process_group_id")
+        if group_id:
+            try:
+                for entry in Path("/proc").iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                    except FileNotFoundError:
+                        continue
+                    if int(fields[2]) == group_id and fields[0] not in ("Z", "X"):
+                        return False
+            except (OSError, ValueError, IndexError):
+                return False
+        for member in identity.get("runtime_processes", []):
+            try:
+                fields = Path(f"/proc/{member['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[19]) == member["start_time_ticks"] and fields[0] not in ("Z", "X"):
+                    return False
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                return False
+        return True
+
+    def recover_evacuation(self, operation_id: str) -> dict:
+        """Explicit recovery, never adoption or termination of an orphan PID.
+
+        A restart cannot reconstruct old active requests. Until every recorded
+        process generation exits, all affected scopes remain protected. After
+        exit, restore exact archived cache identities under current hard policy;
+        this operation creates no external grant or inference replay.
+        """
+        with self.transition:
+            with self.cv:
+                operation = self.evacuations.get(operation_id)
+                if operation is None or operation.get("state") not in ("recovery_pending", "restoration_pending"):
+                    raise ValueError("evacuation does not require recovery")
+                identities = list(operation.get("source_identities", {}).values())
+                identities += [move["destination"] for move in operation["moves"]]
+                identities += operation.get("spawn_attempts", [])
+                if operation.get("destination_attempt"):
+                    identities.append(operation["destination_attempt"])
+                if any(not self._recorded_runtime_exited(identity) for identity in identities):
+                    raise CapacityError("recorded process groups have not exited; recovery retains scopes",
+                                        reason_code="evacuation_recovery_wait")
+                if self._cache_policy_identity_locked() != operation["policy_sha256"]:
+                    raise CapacityError("cache policy changed; operator must cancel the obsolete recovery",
+                                        reason_code="evacuation_changed")
+            self.begin_drain(f"recover cache evacuation {operation_id}")
+            restored = []
+            try:
+                for source in operation.get("source_identities", {}).values():
+                    completed = next((move for move in operation["moves"]
+                                      if move["source"]["lane_id"] == source["lane_id"] and move["state"] == "moved"), None)
+                    scope = tuple(completed["destination"]["gpu_uuids"] if completed else source["gpu_uuids"])
+                    with self.cv:
+                        if (operation.get("cancel_requested") or self.stopping.is_set()
+                                or self._cache_policy_identity_locked() != operation["policy_sha256"]
+                                or len([lane for lane in self.lanes.values() if lane.kind == "managed"]) >= POOL_MAX_SERVERS):
+                            raise CapacityError("recovery owner, policy or lane capacity changed", reason_code="evacuation_changed")
+                        allowed = self._policy_constraint_locked(source["model"], scope)
+                        if allowed != scope:
+                            raise CapacityError("recovery cannot widen model hard scope", reason_code="evacuation_changed")
+                    self._require_safe_gpu_transition(scope)
+                    required, capabilities = self._model_profile(source["model"])
+                    if effective_model_context_profile(source["model"]) != source["context_profile"]:
+                        raise CapacityError("recovery context identity changed", reason_code="evacuation_changed")
+                    live = {d["uuid"]: d for d in self._placement_devices(self._unregistered_gpus_locked()
+                        | self._lease_blocked_gpus_locked() | self._evacuation_recovery_scopes_locked(operation_id), operation_id)}
+                    if any(live.get(gpu, {}).get("free_mib", 0) < required + POOL_VRAM_RESERVE_MIB for gpu in scope):
+                        raise CapacityError("recovery destination is unavailable", reason_code="evacuation_no_destination")
+                    lane = self._spawn_lane(source["model"], scope, required, capabilities, "",
+                        {"key": "cache-recovery", "label": "cache evacuation recovery"},
+                        expected_profile=source["context_profile"], reservation_operation=operation_id)
+                    restored.append(lane)
+                    if self._cache_lane_identity(lane)["native"] != source["native"]:
+                        raise CapacityError("recovery artifact identity changed", reason_code="evacuation_changed")
+                    with self.cv:
+                        if (operation.get("cancel_requested") or self.stopping.is_set()
+                                or self._cache_policy_identity_locked() != operation["policy_sha256"]):
+                            raise CapacityError("recovery changed across warm-up", reason_code="evacuation_changed")
+                with self.cv:
+                    operation["state"] = "lease_pending" if any(lease.evacuation_id == operation_id for lease in self.leases.values()) else "rolled_back"
+                    operation["recovered_lanes"] = [self._cache_lane_identity(lane) for lane in restored]
+                    operation.pop("destination_reservation", None)
+                    self._persist_cache_state_locked()
+                return {"ok": True, "evacuation": self._evacuation_public(operation)}
+            except Exception:
+                self._stop_lanes(restored, "incomplete cache recovery")
+                raise
+            finally:
+                self.end_drain()
+
+    def set_cache_policy(self, model: str, movable: bool, priority: int,
+                         gpu_uuids: list[str]) -> dict:
+        model = canonical_model_tag(model)
+        if (not model or type(movable) is not bool or type(priority) is not int
+                or not -1000 <= priority <= 1000 or not isinstance(gpu_uuids, list)
+                or len(set(gpu_uuids)) != len(gpu_uuids)
+                or any(gpu not in SELECTED_GPUS for gpu in gpu_uuids)
+                or (movable and not gpu_uuids)):
+            raise ValueError("cache policy needs explicit movable/priority and selected destination UUIDs")
+        with self.cv:
+            previous = self.cache_policies.get(model)
+            policy = {"movable": movable, "priority": priority, "gpu_uuids": list(gpu_uuids)}
+            self.cache_policies[model] = policy
+            try:
+                self._persist_cache_state_locked()
+            except Exception:
+                if previous is None:
+                    self.cache_policies.pop(model, None)
+                else:
+                    self.cache_policies[model] = previous
+                raise
+            self.cv.notify_all()
+        return {"ok": True, "model": model, "cache_policy": policy}
+
+    def cancel_evacuation(self, operation_id: str) -> dict:
+        with self.cv:
+            operation = self.evacuations.get(operation_id)
+            if operation is None:
+                raise KeyError("unknown evacuation")
+            if operation["state"] == "lease_pending":
+                raise ValueError("evacuation already granted a lease; release that lease normally")
+            operation["cancel_requested"] = True
+            if operation["state"] in ("recovery_pending", "restoration_pending"):
+                identities = list(operation.get("source_identities", {}).values())
+                identities += [move["destination"] for move in operation["moves"]]
+                identities += operation.get("spawn_attempts", [])
+                if operation.get("destination_attempt"):
+                    identities.append(operation["destination_attempt"])
+                if all(self._recorded_runtime_exited(identity) for identity in identities):
+                    operation["state"] = "cancelled"
+                    operation.pop("destination_reservation", None)
+            self._persist_cache_state_locked()
+            self.cv.notify_all()
+            return {"ok": True, "evacuation": self._evacuation_public(operation)}
+
+    def archive_evacuation(self, operation_id: str) -> dict:
+        with self.transition, self.cv:
+            operation = self.evacuations.get(operation_id)
+            if operation is None:
+                raise KeyError("unknown evacuation")
+            if (operation["state"] not in ("lease_pending", "rolled_back", "failed", "cancelled")
+                    or any(lease.evacuation_id == operation_id for lease in self.leases.values())):
+                raise ValueError("only settled evacuation without a linked lease can be archived")
+            del self.evacuations[operation_id]
+            try:
+                self._persist_cache_state_locked()
+            except Exception:
+                self.evacuations[operation_id] = operation
+                raise
+            return {"ok": True, "archived_evacuation": self._evacuation_public(operation)}
+
+    def _cache_policy_identity_locked(self) -> str:
+        return hashlib.sha256(json.dumps([self.cache_policies, self.model_gpu_policy],
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _cache_lane_identity(self, lane: Lane) -> dict:
+        before = process_group_identity(lane.process)
+        rows = backend_json_at(lane.host, lane.port, "GET", "/api/ps", timeout=3).get("models")
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or canonical_model_tag(str(rows[0].get("name") or rows[0].get("model") or "")) != lane.model
+                or not re.fullmatch(r"[a-f0-9]{64}", str(rows[0].get("digest") or ""))
+                or type(rows[0].get("size")) is not int or rows[0]["size"] <= 0
+                or rows[0].get("size_vram") != rows[0]["size"]
+                or type(rows[0].get("context_length")) is not int or rows[0]["context_length"] <= 0
+                or not lane.context_profile_matches()
+                or (lane.context_profile and (
+                    rows[0].get("digest") != lane.context_profile["model_digest"]
+                    or rows[0].get("context_length") != lane.context_profile["context_length"]))):
+            raise CapacityError("cache source identity is not fully GPU verified", reason_code="gpu_placement_unverified")
+        usage = process_gpu_usage(lane.process)
+        if (set(usage) != set(lane.scope) or any(value <= 0 for value in usage.values())
+                or any(value > lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib) for gpu, value in usage.items())):
+            raise CapacityError("cache physical placement differs from its exact scope", reason_code="gpu_placement_unverified")
+        if before != process_group_identity(lane.process):
+            raise CapacityError("cache runtime changed during inspection", reason_code="gpu_placement_unverified")
+        installed = [row for row in backend_json("GET", "/api/tags", timeout=3).get("models", [])
+                     if canonical_model_tag(str(row.get("name") or row.get("model") or "")) == lane.model]
+        if len(installed) != 1 or installed[0].get("digest") != rows[0]["digest"]:
+            raise CapacityError("installed cache artifact changed", reason_code="evacuation_changed")
+        native = {key: rows[0].get(key) for key in ("digest", "context_length", "size", "size_vram")}
+        return {"lane_id": lane.lane_id, "model": lane.model, "gpu_uuids": list(lane.scope),
+                "reserved_mib": lane.reserved_mib, "reserved_mib_by_gpu": lane.reserved_mib_by_gpu,
+                "context_profile": lane.context_profile, "native": native,
+                "process_group_id": lane.process.pid, "runtime_processes": before}
+
+    def _assert_evacuation_current(self, operation: dict) -> None:
+        with self.cv:
+            if (self.evacuations.get(operation["id"]) is not operation
+                    or operation.get("cancel_requested") or self.stopping.is_set()
+                    or self._cache_policy_identity_locked() != operation["policy_sha256"]):
+                raise CapacityError("evacuation ownership or policy changed", reason_code="evacuation_changed")
+            if operation["kind"] == "prepare":
+                lease = self.leases.get(operation["request"]["token"])
+                if lease is None or lease.state != "active" or lease.owner != operation["owner"]:
+                    raise CapacityError("external resize owner changed", reason_code="evacuation_changed")
+
+    def _commit_cache_evacuation_locked(self, operation_id: str, lease: Lease) -> None:
+        # The lease link was persisted while this CV lock was held. Publish
+        # the grant phase before a concurrent cancellation can report success.
+        operation = self.evacuations[operation_id]
+        operation["lease_token"] = lease.token
+        operation["state"] = "lease_pending"
+        operation["completed_at"] = time.time()
+        self._persist_cache_state_locked()
+
+    def _plan_cache_evacuation(self, operation: dict) -> list[tuple[Lane, tuple[str, ...]]]:
+        target = set(operation["gpu_uuids"])
+        with self.cv:
+            lanes = [lane for lane in self.lanes.values() if lane.kind == "managed"]
+            victims = [lane for lane in lanes if set(lane.protected_scope).intersection(target)]
+            queued = {waiter.model for waiter in self.waiters}
+            eligible = []
+            for lane in lanes:
+                policy = self.cache_policies.get(lane.model, {})
+                if (policy.get("movable") is True and policy.get("priority", 1001) < operation["priority"]
+                        and not lane.in_flight and not lane.loading and not lane.retiring and lane.model not in queued):
+                    eligible.append(lane)
+            if any(lane not in eligible for lane in victims):
+                raise CapacityError("target has protected cache or queued certified demand", reason_code="evacuation_protected")
+            if not victims:
+                return []
+            if len(lanes) >= POOL_MAX_SERVERS:
+                raise CapacityError("copy-first evacuation needs one spare managed lane", reason_code="evacuation_no_destination")
+            blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked() | target
+        devices = self._placement_devices(blocked)
+        free = {device["uuid"]: max(0, int(device["free_mib"]) - POOL_VRAM_RESERVE_MIB) for device in devices}
+        # At most eight explicitly movable caches, one move per source, and a
+        # fixed search bound. Copy-first ordering can consolidate an off-target
+        # cache before placing a target cache; no unconstrained task planner.
+        eligible.sort(key=lambda lane: (lane not in victims, -lane.reserved_mib, lane.lane_id))
+        eligible = eligible[:8]
+        if any(lane not in eligible for lane in victims):
+            raise CapacityError("evacuation exceeds bounded cache plan", reason_code="evacuation_no_destination")
+        visits = 0
+        def search(remaining: list[Lane], available: dict[str, int], path: list) -> list | None:
+            nonlocal visits
+            visits += 1
+            if visits > 2000:
+                return None
+            if not any(lane in victims for lane in remaining):
+                return path
+            for lane in remaining:
+                # Existing peer groups are indivisible and cannot be packed
+                # into a singleton. No automatic repartition in this feature.
+                if len(lane.scope) != 1:
+                    continue
+                policy = self.cache_policies[lane.model]
+                with self.cv:
+                    allowed = self._policy_constraint_locked(lane.model, tuple(policy["gpu_uuids"])) or ()
+                choices = [gpu for gpu in allowed if gpu in available and gpu not in lane.scope
+                           and available[gpu] >= lane.reserved_mib]
+                choices.sort(key=lambda gpu: (available[gpu] - lane.reserved_mib, gpu))
+                for gpu in choices:
+                    next_free = dict(available)
+                    next_free[gpu] -= lane.reserved_mib
+                    for old in lane.scope:
+                        if old not in blocked:
+                            next_free[old] = next_free.get(old, 0) + lane.reserved_mib_by_gpu.get(old, lane.reserved_mib)
+                    found = search([item for item in remaining if item is not lane], next_free, [*path, (lane, (gpu,))])
+                    if found is not None:
+                        return found
+            return None
+        plan = search(eligible, free, [])
+        if plan is None:
+            raise CapacityError("no safe copy-first destination plan", reason_code="evacuation_no_destination")
+        return plan
+
+    def _rollback_cache_evacuation(self, operation: dict, moves: list[tuple[Lane, Lane]]) -> None:
+        # Restore exact model/profile/source scopes; never stop the verified
+        # destination until its replacement is warm. Failed rollback keeps a
+        # truthful restoration obligation and all surviving process promises.
+        incomplete = False
+        for source, destination in reversed(moves):
+            try:
+                if process_group_alive(source.process) and source.retiring:
+                    incomplete = True
+                    continue
+                if not process_group_alive(source.process):
+                    with self.cv:
+                        allowed = self._policy_constraint_locked(source.model, source.scope)
+                    if not source.allows(allowed) or not source.context_profile_matches():
+                        raise RuntimeError("original cache policy changed")
+                    required, capabilities = self._model_profile(source.model)
+                    live = {d["uuid"]: d for d in self._placement_devices(self._ollama_blocked_gpus_locked())}
+                    if any(live.get(gpu, {}).get("free_mib", 0) < required + POOL_VRAM_RESERVE_MIB for gpu in source.scope):
+                        raise RuntimeError("rollback capacity is unavailable")
+                    restored = self._spawn_lane(source.model, source.scope, required, capabilities, "",
+                        {"key": "cache-rollback", "label": "cache evacuation rollback"},
+                        dict(source.reserved_mib_by_gpu), expected_profile=source.context_profile,
+                        reservation_operation=operation["id"])
+                    if self._cache_lane_identity(restored)["native"] != operation["source_identities"][source.lane_id]["native"]:
+                        self._stop_lanes([restored], "rollback identity changed")
+                        raise RuntimeError("original cache artifact changed")
+                if self._stop_lanes([destination], "cache evacuation rollback"):
+                    incomplete = True
+            except Exception:
+                incomplete = True
+        with self.cv:
+            operation["state"] = "restoration_pending" if incomplete else (
+                "cancelled" if operation.get("cancel_requested") else "rolled_back")
+            if not incomplete:
+                operation.pop("destination_reservation", None)
+            self._persist_cache_state_locked()
+
+    def _lease_evacuation(self, kind: str, request: dict, priority: int, operation_id: str) -> dict:
+        if (type(priority) is not int or not -1000 <= priority <= 1000
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id)):
+            raise ValueError("evacuation requires bounded priority and stable operation ID")
+        fingerprint = hashlib.sha256(json.dumps([kind, request, priority], sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest()
+        with self.transition:
+            with self.cv:
+                old = self.evacuations.get(operation_id)
+                if old:
+                    if old["request_sha256"] != fingerprint:
+                        raise ValueError("evacuation ID already binds a different request")
+                    linked = next((lease for lease in self.leases.values() if lease.evacuation_id == operation_id), None)
+                    if linked:
+                        return {"ok": True, "lease": asdict(linked), "evacuation": self._evacuation_public(old)}
+                    raise CapacityError("evacuation has a durable terminal or recovery state; inspect status", 409,
+                                        "evacuation_requires_recovery", False, None)
+                if len(self.evacuations) >= 256:
+                    raise ValueError("evacuation journal is full; archive completed operations before accepting more")
+                if kind == "prepare":
+                    lease = self.leases.get(request["token"])
+                    if lease is None or lease.state != "active":
+                        raise ValueError("only an active exact lease can prepare evacuation")
+                    scope, owner = list(lease.gpu_uuids), lease.owner
+                else:
+                    scope, owner = list(request["requested_gpu_uuids"]), request["owner"]
+                if not scope or len(set(scope)) != len(scope) or set(scope) - set(SELECTED_GPUS):
+                    raise ValueError("evacuation requires an exact selected GPU scope")
+                if self.pending_lease():
+                    raise CapacityError("another external transition is pending", reason_code="lease_transition")
+                if set(scope).intersection(self._handoff_scopes_locked()):
+                    raise CapacityError("scope reserved for cooperative handoff", reason_code="lease_transition")
+                if any((not lease.gpu_uuids or set(scope).intersection(lease.gpu_uuids))
+                       and lease.token != request.get("token") for lease in self.leases.values()):
+                    raise CapacityError("requested scope has another external owner", reason_code="lease_transition")
+                operation = {"id": operation_id, "kind": kind, "owner": owner, "priority": priority,
+                    "gpu_uuids": scope, "request_sha256": fingerprint, "request": request,
+                    "policy_sha256": self._cache_policy_identity_locked(), "state": "draining",
+                    "created_at": time.time(), "moves": [], "source_identities": {}}
+                self.evacuations[operation_id] = operation
+                try:
+                    self._persist_cache_state_locked()
+                except Exception:
+                    # No drain, spawn or grant has started. Remove only this
+                    # uncommitted owner, so its failed journal cannot wedge ID.
+                    if self.evacuations.get(operation_id) is operation:
+                        del self.evacuations[operation_id]
+                    raise
+            moved, plan = [], []
+            try:
+                self.begin_drain(f"cache evacuation {operation_id}")
+                self._assert_evacuation_current(operation)
+                plan = self._plan_cache_evacuation(operation)
+                for source, destination_scope in plan:
+                    identity = self._cache_lane_identity(source)
+                    self._assert_evacuation_current(operation)
+                    with self.cv:
+                        if self.lanes.get(source.lane_id) is not source or source.in_flight or source.retiring:
+                            raise CapacityError("cache source generation changed", reason_code="evacuation_changed")
+                        operation["source_identities"][source.lane_id] = identity
+                        operation["current_source"] = source.lane_id
+                        operation.pop("destination_attempt", None)
+                        operation["state"] = "destination_reserved"
+                        operation["destination_reservation"] = {gpu: source.reserved_mib for gpu in destination_scope}
+                        self._persist_cache_state_locked()
+                    allowed = {d["uuid"]: d for d in self._placement_devices(set(scope), operation_id)}
+                    if any(allowed.get(gpu, {}).get("free_mib", 0) < source.reserved_mib + POOL_VRAM_RESERVE_MIB for gpu in destination_scope):
+                        raise CapacityError("destination live capacity changed", reason_code="evacuation_no_destination")
+                    required, capabilities = self._model_profile(source.model)
+                    if required > source.reserved_mib or not source.context_profile_matches():
+                        raise CapacityError("source memory identity changed", reason_code="evacuation_changed")
+                    destination = self._spawn_lane(source.model, destination_scope, required, capabilities, "",
+                        {"key": "cache-evacuation", "label": f"cache evacuation {operation_id}"},
+                        expected_profile=source.context_profile, reservation_operation=operation_id)
+                    moved.append((source, destination))
+                    destination_identity = self._cache_lane_identity(destination)
+                    self._assert_evacuation_current(operation)
+                    if identity != self._cache_lane_identity(source) or destination_identity["native"] != identity["native"]:
+                        raise CapacityError("cache artifact or runtime changed", reason_code="evacuation_changed")
+                    with self.cv:
+                        if any(waiter.model == source.model for waiter in self.waiters):
+                            raise CapacityError("new queued demand protects original cache", reason_code="evacuation_protected")
+                        operation["moves"].append({"source": identity, "destination": destination_identity, "state": "source_retiring"})
+                        operation.pop("destination_reservation", None)
+                        source.retiring = True
+                        operation["state"] = "source_retiring"
+                        self._persist_cache_state_locked()
+                    if self._stop_lanes([source], "lower priority cache evacuation"):
+                        raise CapacityError("source process group has not exited", reason_code="lane_stop_failed")
+                    with self.cv:
+                        operation["moves"][-1]["state"] = "moved"
+                        self._persist_cache_state_locked()
+                self._assert_evacuation_current(operation)
+                with self.cv:
+                    if any(lane.kind == "managed" and set(lane.protected_scope).intersection(scope)
+                           for lane in self.lanes.values()):
+                        raise CapacityError("requested scope is not yet free", reason_code="evacuation_changed")
+                result = self.acquire(**request, _evacuation_commit_id=operation_id) if kind == "acquire" else self.prepare(request["token"], _evacuation_commit_id=operation_id)
+                with self.cv:
+                    lease = self.leases[result["lease"]["token"]]
+                    lease.evacuation_id = operation_id
+                    self._persist_leases_locked()
+                    operation["lease_token"] = lease.token
+                    operation["state"] = "lease_pending"
+                    operation["completed_at"] = time.time()
+                    self._persist_cache_state_locked()
+                    result["lease"] = asdict(lease)
+                    result["evacuation"] = self._evacuation_public(operation)
+                return result
+            except Exception as exc:
+                with self.cv:
+                    operation["failure_code"] = exc.reason_code if isinstance(exc, CapacityError) else "evacuation_failed"
+                    if any(lease.evacuation_id == operation_id for lease in self.leases.values()):
+                        # A persisted pending grant is irrevocable here. A lost
+                        # journal write must not rollback through its scope.
+                        operation["state"] = "lease_pending"
+                        raise
+                    # A failed warm-up can leave an owned process group whose
+                    # exit is not yet verified. Preserve it in the operation.
+                    attempt = operation.get("destination_attempt", {})
+                    attempt_lane = self.lanes.get(attempt.get("lane_id"))
+                    if attempt_lane is not None and not any(destination is attempt_lane for _, destination in moved):
+                        source = next((lane for lane, _ in plan if lane.lane_id == operation.get("current_source")), None)
+                        if source is not None:
+                            moved.append((source, attempt_lane))
+                self._rollback_cache_evacuation(operation, moved)
+                raise
+            finally:
+                self.end_drain()
+
     def _policy_constraint_locked(
         self, model: str, gpu_uuids: tuple[str, ...] | None,
     ) -> tuple[str, ...] | None:
@@ -3039,6 +3866,23 @@ class Broker:
         if gpu_uuids is None:
             return tuple(allowed)
         return tuple(gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid in allowed)
+
+    def _capacity_scope_locked(self, model: str, gpu_uuids: tuple[str, ...] | None,
+                               placement: str) -> tuple[str, ...] | None:
+        parse_capacity_placement(placement)
+        if placement == "exclusive_group":
+            if (gpu_uuids is None or len(gpu_uuids) < 2
+                    or len(set(gpu_uuids)) != len(gpu_uuids)):
+                raise PermanentCapacityError("exclusive_group requires at least two distinct GPUs",
+                                             422, "invalid_gpu_constraint")
+            if any(gpu not in SELECTED_GPUS for gpu in gpu_uuids):
+                raise PermanentCapacityError("exclusive_group contains an unselected GPU",
+                                             422, "gpu_constraint_unavailable")
+        allowed = self._policy_constraint_locked(model, gpu_uuids)
+        if placement == "exclusive_group" and allowed != gpu_uuids:
+            raise PermanentCapacityError("model policy excludes a requested group member",
+                                         409, "gpu_policy_conflict")
+        return allowed
 
     def _persist_leases_locked(self) -> None:
         LEASE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3160,7 +4004,8 @@ class Broker:
         `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
         set. Two external owners never share a scoped GPU.
         """
-        return self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
+        return (self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
+                | self._evacuation_recovery_scopes_locked())
 
     def _lease_blocked_gpus_locked(self) -> set[str]:
         if any(not lease.gpu_uuids and lease.state in ("pending", "active", "revoking")
@@ -3187,6 +4032,7 @@ class Broker:
 
     def _plan_lease_gpus(
         self, requested_mib: int, requested_gpu_uuids: list[str],
+        handoff_id: str = "",
     ) -> tuple[list[str], list[dict[str, Any]]]:
         """Return a GPU scope reserved against other external leases."""
         inventory = [
@@ -3203,7 +4049,8 @@ class Broker:
                 f"requested GPU UUIDs are not selected and available: {unknown}"
             )
         with self.cv:
-            reserved = self._reserved_gpus_locked()
+            reserved = self._reserved_gpus_locked() | self._evacuation_recovery_scopes_locked()
+            reserved |= self._handoff_scopes_locked(handoff_id)
         conflicts = [gpu_uuid for gpu_uuid in requested if gpu_uuid in reserved]
         if conflicts:
             with self.cv:
@@ -3241,13 +4088,15 @@ class Broker:
             self.completed_response_bytes = max(
                 0, self.completed_response_bytes - len(response.body)
             )
-        if expired:
-            self.completed_response_expired_total += 1
+        if expired or (evicted and response.warm_admission is not None):
             self._record_logical_tombstone_locked(
                 logical_request_id,
                 response.request_id,
-                "logical_request_expired",
+                "logical_request_expired" if expired else "completed_response_evicted",
+                warm_admission=response.warm_admission,
             )
+        if expired:
+            self.completed_response_expired_total += 1
         if evicted:
             self.completed_response_evicted_total += 1
 
@@ -3305,14 +4154,18 @@ class Broker:
 
     def _record_logical_tombstone_locked(
         self, logical_request_id: str, request_id: str, reason_code: str,
+        *, warm_admission: str | None = None,
     ) -> None:
         if not logical_request_id:
             return
+        owner = next((item for item in self.waiters if item.request_id == request_id), None)
+        owner = owner or self.active_request_records.get(request_id)
         self.logical_tombstones[logical_request_id] = LogicalRequestTombstone(
             logical_request_id=logical_request_id,
             request_id=request_id,
             reason_code=reason_code,
             expires_at=time.monotonic() + COMPLETED_RESPONSE_TTL,
+            warm_admission=warm_admission or (owner.warm_admission if owner is not None else None),
         )
 
     def _prune_logical_tombstones_locked(
@@ -3340,6 +4193,8 @@ class Broker:
 
     def resume_request_lookup(
         self, logical_request_id: str, method: str, path: str,
+        warm_admission: str | None = None,
+        gpu_uuids: tuple[str, ...] | None = None,
     ) -> tuple[RetainedRequest | None, CompletedResponse | None]:
         if not logical_request_id:
             raise PermanentCapacityError(
@@ -3354,6 +4209,13 @@ class Broker:
             self._raise_logical_tombstone_locked(logical_request_id)
             response = self.completed_responses.get(logical_request_id)
             if response is not None:
+                if warm_admission is not None and warm_admission != response.warm_admission:
+                    raise PermanentCapacityError("resume warm certificate differs from original request", 409,
+                                                 "logical_request_conflict")
+                if (response.warm_admission is not None and gpu_uuids is not None
+                        and list(gpu_uuids) != json.loads(response.warm_admission)["gpu_uuids"]):
+                    raise PermanentCapacityError("resume GPU constraint differs from original request", 409,
+                                                 "logical_request_conflict")
                 if response.request_method != method or response.request_path != path:
                     raise PermanentCapacityError(
                         "logical request ID was resumed on a different method or path",
@@ -3371,6 +4233,10 @@ class Broker:
             active = self.logical_in_flight.get(logical_request_id)
             if active is not None:
                 _, request_id, queue_ticket = active
+                active_record = self.active_request_records.get(request_id)
+                if warm_admission is not None and (active_record is None or warm_admission != active_record.warm_admission):
+                    raise PermanentCapacityError("resume warm certificate differs from original request", 409,
+                                                 "logical_request_conflict")
                 self.queue_duplicate_total += 1
                 raise CapacityError(
                     "logical request is already admitted and in progress",
@@ -3405,6 +4271,9 @@ class Broker:
                     request_id=waiter.request_id,
                     logical_request_id=logical_request_id,
                 )
+            if warm_admission is not None and warm_admission != retained.warm_admission:
+                raise PermanentCapacityError("resume warm certificate differs from retained request", 409,
+                                             "logical_request_conflict")
             if retained.method != method or retained.path != path:
                 raise PermanentCapacityError(
                     "logical request ID was resumed on a different method or path",
@@ -3430,6 +4299,7 @@ class Broker:
         body_bytes: int,
         body_sha256: str,
         unavailable_reason: str | None = None,
+        warm_admission: str | None = None,
     ) -> None:
         if not logical_request_id:
             return
@@ -3487,6 +4357,7 @@ class Broker:
                 ),
                 completed_at=now,
                 expires_at=now + COMPLETED_RESPONSE_TTL,
+                warm_admission=warm_admission,
             )
             self.completed_responses[logical_request_id] = response
             self.completed_response_bytes += retained_bytes
@@ -3572,6 +4443,7 @@ class Broker:
         model: str,
         routable: bool,
         gpu_uuids: tuple[str, ...] | None = None,
+        certified_lane_ids: set[str] | None = None,
     ) -> Lane | None:
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
@@ -3581,6 +4453,7 @@ class Broker:
         gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
         matching = [lane for lane in self.lanes.values()
                     if lane.kind == "managed" and lane.model == model
+                    and (certified_lane_ids is None or lane.lane_id in certified_lane_ids)
                     and lane.context_profile_matches()
                     and lane.allows(gpu_uuids)
                     and not set(lane.scope).intersection(blocked_gpus)
@@ -3612,6 +4485,241 @@ class Broker:
             return None
         return base if base.in_flight < base.parallel else None
 
+    def _warm_runtime_identity_locked(self, lane: Lane) -> dict[str, Any]:
+        if lane.kind != "managed" or lane.retiring or lane.loading:
+            raise WarmPreflightRequired(causes=("lane_unavailable",))
+        if not lane.context_profile_matches():
+            raise WarmPreflightRequired(causes=("context_profile_mismatch",))
+        if not process_group_alive(lane.process):
+            raise WarmPreflightRequired(causes=("runtime_identity_unavailable",))
+        try:
+            before = process_group_identity(lane.process)
+            try:
+                rows = backend_json_at(lane.host, lane.port, "GET", "/api/ps", timeout=2.0).get("models")
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                raise WarmPreflightRequired(causes=("native_ps_unavailable",)) from exc
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                raise WarmPreflightRequired(causes=("native_ps_inventory_mismatch",))
+            row = rows[0]
+            native = {
+                "name": canonical_model_tag(str(row.get("name") or row.get("model") or "")),
+                "digest": row.get("digest"), "context_length": row.get("context_length"),
+                "size": row.get("size"), "size_vram": row.get("size_vram"),
+            }
+            if lane.context_profile is None:
+                # Embedding runners have no completion/KV context profile.
+                # Certify their observed native context only after verifying
+                # the current installed artifact and embedding-only capability.
+                expected_digest = self._warm_embedding_digest(lane.model)
+                expected_context = native["context_length"]
+            else:
+                expected_digest = lane.context_profile["model_digest"]
+                expected_context = lane.context_profile["context_length"]
+            if native["name"] != lane.model:
+                raise WarmPreflightRequired(causes=("native_model_mismatch",))
+            if native["digest"] != expected_digest:
+                raise WarmPreflightRequired(causes=("native_digest_mismatch",))
+            if (type(native["context_length"]) is not int
+                    or not 1 <= native["context_length"] <= 2 ** 31 - 1
+                    or native["context_length"] != expected_context
+                    or (HARD_MAX_CONTEXT > 0 and native["context_length"] > HARD_MAX_CONTEXT)):
+                raise WarmPreflightRequired(causes=("native_context_mismatch",))
+            if (type(native["size"]) is not int or native["size"] <= 0
+                    or type(native["size_vram"]) is not int
+                    or native["size_vram"] != native["size"]):
+                raise WarmPreflightRequired(causes=("native_gpu_residency_mismatch",))
+            if len(lane.scope) > 1:
+                try:
+                    observed = process_gpu_usage(lane.process)
+                except CapacityError as exc:
+                    raise WarmPreflightRequired(causes=("native_gpu_placement_mismatch",)) from exc
+                lane.observed_vram_mib_by_gpu = observed
+                if set(observed) != set(lane.scope) or any(used <= 0 for used in observed.values()):
+                    raise WarmPreflightRequired(causes=("native_gpu_placement_mismatch",))
+            after = process_group_identity(lane.process)
+            if before != after:
+                raise WarmPreflightRequired(causes=("runtime_identity_changed",))
+            return {
+                "server_process": next(item for item in before if item["pid"] == lane.process.pid),
+                "runtime_processes": before, "native_ps": native,
+            }
+        except WarmPreflightRequired:
+            raise
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise WarmPreflightRequired(causes=("runtime_identity_unavailable",)) from exc
+
+    @staticmethod
+    def _warm_embedding_digest(model: str) -> str:
+        def installed() -> dict[str, Any]:
+            rows = backend_json("GET", "/api/tags", timeout=2.0).get("models", [])
+            matching = [item for item in rows if isinstance(item, dict)
+                        and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model]
+            if len(matching) != 1:
+                raise ValueError("exact embedding artifact is not installed")
+            return matching[0]
+
+        before = installed()
+        digest = before.get("digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("embedding artifact digest is not verified")
+        capabilities = before.get("capabilities")
+        if not isinstance(capabilities, list) or not capabilities:
+            capabilities = backend_json("POST", "/api/show", {"model": model}, timeout=2.0).get("capabilities")
+        after = installed()
+        if (after.get("digest") != digest or not isinstance(capabilities, list)
+                or "embedding" not in capabilities or "completion" in capabilities
+                or (isinstance(after.get("capabilities"), list) and after["capabilities"]
+                    and set(after["capabilities"]) != set(capabilities))):
+            raise ValueError("current artifact is not embedding-only")
+        return digest
+
+    def warm_admission_proof(self, model: str, parallel: int,
+                             gpu_uuids: tuple[str, ...] | None,
+                             placement: str = "auto") -> dict[str, Any]:
+        """Inspect existing warm capacity only. Never load, grow, or refresh idle time."""
+        model = canonical_model_tag(model)
+        if not POOL_ENABLED or not model or gpu_uuids is None or parallel < 1:
+            raise PermanentCapacityError("warm proof requires a model, positive parallel and explicit GPU scope",
+                                         400, "invalid_warm_admission")
+        with self.cv:
+            blocked = self._ollama_blocked_gpus_locked()
+            allowed = self._capacity_scope_locked(model, gpu_uuids, placement)
+            if placement == "exclusive_group" and parallel > POOL_INSTANCE_PARALLEL:
+                raise PermanentCapacityError("one exact exclusive group supports only its configured parallel slots",
+                                             422, "parallel_exceeds_capacity")
+            lanes = [lane for lane in self.lanes.values()
+                     if lane.kind == "managed" and lane.model == model
+                     and lane.allows(allowed)
+                     and (placement != "exclusive_group" or lane.scope == gpu_uuids)
+                     and not set(lane.scope).intersection(blocked)
+                     and not lane.retiring and not lane.loading]
+            if self.draining or not lanes or sum(lane.parallel for lane in lanes) < parallel:
+                raise WarmPreflightRequired(phase="proof_issuance",
+                    causes=("broker_draining" if self.draining else "lane_unavailable",))
+            descriptors = []
+            for lane in lanes:
+                try:
+                    runtime = self._warm_runtime_identity_locked(lane)
+                except WarmPreflightRequired as exc:
+                    raise WarmPreflightRequired(phase="proof_issuance",
+                        causes=exc.warm_preflight_causes) from exc
+                if runtime != lane.warm_runtime_identity:
+                    lane.warm_generation_id = secrets.token_hex(32)
+                    lane.warm_runtime_identity = runtime
+                descriptors.append({
+                    "id": lane.lane_id, "generation_id": lane.warm_generation_id,
+                    "model": model, "model_digest": runtime["native_ps"]["digest"],
+                    "context_length": runtime["native_ps"]["context_length"],
+                    "gpu_uuids": list(lane.scope), **runtime,
+                })
+            identities = {(item["model_digest"], item["context_length"]) for item in descriptors}
+            if len(identities) != 1:
+                causes = tuple(cause for field, cause in (
+                    (0, "model_digest_mismatch"), (1, "context_mismatch"))
+                    if len({identity[field] for identity in identities}) > 1)
+                raise WarmPreflightRequired(phase="proof_issuance",
+                    causes=causes)
+            digest, context = next(iter(identities))
+            proof = {"schema": WARM_ADMISSION_SCHEMA, "broker_instance_id": self.instance_id,
+                     "model": model, "model_digest": digest, "context_length": context,
+                     "gpu_uuids": list(gpu_uuids),
+                     "lanes": [{"id": item["id"], "generation_id": item["generation_id"]}
+                               for item in descriptors]}
+            return {
+                "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
+                "requested_model": model, "canonical_model": model,
+                "requested_parallel": parallel, "requested_gpu_uuids": list(gpu_uuids),
+                "requested_placement": placement,
+                "admitted_parallel": sum(lane.parallel for lane in lanes),
+                "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
+                "lanes": [lane.public_summary() for lane in lanes],
+                "warm_admission": proof, "warm_admission_lanes": descriptors,
+            }
+
+    def _validate_warm_admission_locked(self, certificate: str, model: str,
+                                        gpu_uuids: tuple[str, ...] | None, *,
+                                        phase: str = "validation") -> set[str]:
+        proof = json.loads(certificate)
+        for failed, cause in (
+            (proof["broker_instance_id"] != self.instance_id, "broker_instance_mismatch"),
+            (proof["model"] != model, "model_mismatch"),
+            (gpu_uuids is None or proof["gpu_uuids"] != list(gpu_uuids), "gpu_scope_mismatch"),
+            (self.draining, "broker_draining"),
+        ):
+            if failed:
+                raise WarmPreflightRequired(phase=phase, causes=(cause,))
+        allowed = self._policy_constraint_locked(model, gpu_uuids)
+        blocked = self._ollama_blocked_gpus_locked()
+        valid = set()
+        causes = []
+        for identity in proof["lanes"]:
+            lane = self.lanes.get(identity["id"])
+            # A retired member may disappear normally. Only current certified
+            # generations can be selected; at least one must still be ready.
+            if lane is None:
+                causes.append("lane_missing")
+                continue
+            failed = next((cause for condition, cause in (
+                (lane.warm_generation_id != identity["generation_id"], "generation_mismatch"),
+                (lane.model != model, "lane_model_mismatch"),
+                (not lane.allows(allowed), "gpu_policy_mismatch"),
+                (bool(set(lane.scope).intersection(blocked)), "gpu_blocked"),
+            ) if condition), None)
+            if failed:
+                causes.append(failed)
+                continue
+            expected = lane.context_profile or ((lane.warm_runtime_identity or {}).get("native_ps"))
+            if not expected or expected.get("model_digest", expected.get("digest")) != proof["model_digest"]:
+                causes.append("model_digest_mismatch")
+                continue
+            if expected.get("context_length") != proof["context_length"]:
+                causes.append("context_mismatch")
+                continue
+            try:
+                runtime = self._warm_runtime_identity_locked(lane)
+            except WarmPreflightRequired as exc:
+                causes.extend(exc.warm_preflight_causes)
+                continue
+            if runtime == lane.warm_runtime_identity:
+                valid.add(lane.lane_id)
+            else:
+                causes.append("runtime_identity_changed")
+        if not valid:
+            raise WarmPreflightRequired(phase=phase, causes=tuple(causes))
+        return valid
+
+    @staticmethod
+    def validate_warm_body(certificate: str, model: str, path: str, body: bytes,
+                           *, prepared: bool = False) -> None:
+        proof = json.loads(certificate)
+        if model != proof["model"] or path not in INFERENCE_PATHS:
+            raise PermanentCapacityError("warm certificate does not bind the request model/path", 400,
+                                         "invalid_warm_admission")
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise PermanentCapacityError("warm inference requires a JSON object", 400, "invalid_warm_admission")
+        if path in NATIVE_MODEL_PATHS:
+            options = payload.get("options", {})
+            # Only prediction options are variable in a certified request.
+            # Unknown/new loader options fail closed until explicitly reviewed.
+            prediction_options = {
+                "num_keep", "seed", "num_predict", "top_k", "top_p", "min_p", "typical_p",
+                "repeat_last_n", "temperature", "repeat_penalty", "presence_penalty",
+                "frequency_penalty", "stop", "mirostat", "mirostat_tau", "mirostat_eta",
+                "penalize_newline", "tfs_z", "num_ctx", "num_gpu",
+            }
+            if (not isinstance(options, dict)
+                    or set(options).difference(prediction_options)
+                    or ("num_ctx" in options and (type(options["num_ctx"]) is not int
+                        or options["num_ctx"] != proof["context_length"]))
+                    or ("num_gpu" in options and (type(options["num_gpu"]) is not int or options["num_gpu"] != -1))
+                    or payload.get("runner") not in (None, "")
+                    or (payload.get("keep_alive") is not None
+                        and not (prepared and type(payload["keep_alive"]) is int
+                                 and payload["keep_alive"] == -1))):
+                raise PermanentCapacityError("warm inference cannot change the certified runtime allocation or unload it",
+                                             400, "invalid_warm_admission")
+
     def _model_profile(self, model: str) -> tuple[int, set[str]]:
         model = canonical_model_tag(model)
         tags = backend_json("GET", "/api/tags", timeout=10.0).get("models", [])
@@ -3642,7 +4750,7 @@ class Broker:
                 422,
                 "model_metadata_invalid",
             )
-        model_mib = math.ceil(size_bytes / (1024 * 1024))
+        model_mib = math.ceil(model_gpu_weight_bytes(model, match, size_bytes) / (1024 * 1024))
         profile = resolve_model_context_profile(model, match)
         extra_context_mib = 0
         if profile is not None:
@@ -3662,7 +4770,8 @@ class Broker:
         )
 
     def _placement_devices(
-        self, blocked: set[str], *, reclaiming: set[str] | None = None,
+        self, blocked: set[str], reservation_owner: str = "", *,
+        reclaiming: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return capacity after honoring every live lane's promised VRAM.
 
@@ -3700,6 +4809,14 @@ class Broker:
                 for gpu in lane.scope:
                     reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + max(
                         0, int(lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib)))
+            for operation in self.evacuations.values():
+                if operation["id"] == reservation_owner:
+                    continue
+                attempt = operation.get("destination_attempt", {})
+                if attempt.get("lane_id") in self.lanes:
+                    continue  # atomic transfer to the published lane promise
+                for gpu, promised in operation.get("destination_reservation", {}).items():
+                    reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + promised
         available = []
         for device in devices:
             gpu_uuid = str(device.get("uuid") or "")
@@ -3753,7 +4870,8 @@ class Broker:
             and "completion" not in capabilities
         ):
             return "/api/embed", {
-                "model": model, "input": "warmup", "keep_alive": keep_alive,
+                # Empty input loads the runner without computing an embedding.
+                "model": model, "input": [], "keep_alive": keep_alive,
             }
         if request_path == "/api/rerank" or (
             not request_path and "reranking" in capabilities
@@ -3838,7 +4956,8 @@ class Broker:
                     capabilities: set[str], request_path: str,
                     triggered_by: dict[str, str] | None = None,
                     reserved_mib_by_gpu: dict[str, int] | None = None,
-                    expected_profile: Any = CONTEXT_PROFILE_UNSET) -> Lane:
+                    expected_profile: Any = CONTEXT_PROFILE_UNSET,
+                    reservation_operation: str = "") -> Lane:
         scope = (gpu_uuid,) if isinstance(gpu_uuid, str) else tuple(gpu_uuid)
         if not scope or len(set(scope)) != len(scope) or any(gpu not in SELECTED_GPUS for gpu in scope):
             raise PermanentCapacityError("invalid managed GPU scope", 422, "invalid_gpu_scope")
@@ -3895,12 +5014,30 @@ class Broker:
             env["OLLAMA_MODELS"] = OLLAMA_MODELS
         LOG.info("managed lane starting id=%s gpu=%s model=%s port=%s",
                  lane_id, gpu_uuid, model, port)
-        process = subprocess.Popen(
-            [OLLAMA_BINARY, "serve"], env=env, stdin=subprocess.DEVNULL,
-            # Inherit systemd's bounded journal instead of discarding CUDA/GSP
-            # load failures. Lifecycle records map child PID to exact UUID.
-            start_new_session=True,
-        )
+        startup_read = startup_write = None
+        command = [OLLAMA_BINARY, "serve"]
+        if reservation_operation:
+            # This wrapper cannot execute CUDA until its exact process
+            # generation is fsynced. Only the parent owns the CLOEXEC write
+            # end: death before publication sends EOF, never an orphan load.
+            startup_read, startup_write = os.pipe2(os.O_CLOEXEC)
+            command = [sys.executable, "-c", CACHE_STARTUP_WRAPPER,
+                       str(startup_read), OLLAMA_BINARY, "serve"]
+        try:
+            process = subprocess.Popen(
+                command, env=env, stdin=subprocess.DEVNULL,
+                pass_fds=() if startup_read is None else (startup_read,),
+                # Inherit systemd's bounded journal instead of discarding
+                # CUDA/GSP failures. The wrapper exec preserves PID/start/PGRP.
+                start_new_session=True,
+            )
+        except Exception:
+            if startup_write is not None:
+                os.close(startup_write)
+            raise
+        finally:
+            if startup_read is not None:
+                os.close(startup_read)
         LOG.info("managed lane spawned id=%s gpu=%s model=%s pid=%s",
                  lane_id, gpu_uuid, model, process.pid)
         now = time.time()
@@ -3916,9 +5053,27 @@ class Broker:
             # Publish the entire reservation before warm-up can start peer
             # traffic. Loading lanes are never eligible for inference.
             self.lanes[lane_id] = lane
+            if reservation_operation:
+                try:
+                    operation = self.evacuations[reservation_operation]
+                    attempt = {"lane_id": lane_id, "gpu_uuids": list(scope),
+                        "process_group_id": process.pid, "runtime_processes": process_group_identity(process),
+                        "startup_protocol": "registered_before_exec.v1"}
+                    operation["destination_attempt"] = attempt
+                    operation.setdefault("spawn_attempts", []).append(attempt)
+                    self._persist_cache_state_locked()
+                    os.write(startup_write, b"\x01")
+                except Exception:
+                    lane.retiring = True
+                    lane.loading = False
+                    self._stop_lanes([lane], "cache journal publication failed")
+                    raise
+                finally:
+                    os.close(startup_write)
             self.cv.notify_all()
         deadline = time.monotonic() + POOL_READY_TIMEOUT
         try:
+            server_identity = managed_server_identity(process)
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise CapacityError(
@@ -3948,6 +5103,7 @@ class Broker:
             self._require_safe_gpu_transition(scope, lane_id)
             LOG.info("managed lane loading id=%s gpu=%s model=%s pid=%s",
                      lane_id, gpu_uuid, model, process.pid)
+            assert_managed_server_scope(process, scope, server_identity)
             backend_json_at(
                 "127.0.0.1", port, "POST", warm_path, warm_payload,
                 timeout=POOL_LOAD_TIMEOUT,
@@ -4119,7 +5275,7 @@ class Broker:
         gpu_uuids: tuple[str, ...] | None,
         triggered_by: dict[str, str] | None,
         expected_profile: Any = CONTEXT_PROFILE_UNSET,
-        *, allow_reclaim: bool = True,
+        *, allow_reclaim: bool = True, exact_group: bool = False,
     ) -> dict[str, Any]:
         """Create exclusive whole-process peer groups under the transition lock.
 
@@ -4140,9 +5296,13 @@ class Broker:
                             if lane.kind == "managed" and lane.model == model
                             and lane.context_profile_matches()
                             and len(lane.scope) > 1 and lane.allows(gpu_uuids)
+                            and (not exact_group or lane.scope == gpu_uuids)
                             and not lane.retiring and not lane.loading
                             and not set(lane.scope).intersection(blocked)]
                 if len(existing) >= wanted:
+                    if exact_group:
+                        for lane in existing:
+                            self._warm_runtime_identity_locked(lane)
                     break
                 queued_models = {waiter.model for waiter in self.waiters if waiter.model != model}
                 # An idle different-model group may be retired as one whole
@@ -4162,14 +5322,22 @@ class Broker:
                          if device.get("uuid") in SELECTED_GPUS}
             order = list(gpu_uuids) if gpu_uuids is not None else list(dict.fromkeys(
                 MODEL_GPU_PREFERENCES.get(model, []) + list(SELECTED_GPUS)))
+            if (exact_group and all(gpu in inventory for gpu in order)
+                    and required_mib > sum(max(0, int(inventory[gpu]["total_mib"])
+                        - POOL_VRAM_RESERVE_MIB) for gpu in order)):
+                raise PermanentCapacityError("model exceeds the exact GPU group's physical capacity and headroom",
+                                             422, "model_exceeds_gpu_capacity")
             scope: list[str] = []
             capacity = 0
             for gpu in order:
                 if gpu in blocked or gpu not in inventory:
+                    if exact_group:
+                        raise CapacityError("requested exclusive GPU group is not completely available",
+                                            reason_code="gpu_peer_group_wait")
                     continue
                 scope.append(gpu)
                 capacity += max(0, int(inventory[gpu]["total_mib"]) - POOL_VRAM_RESERVE_MIB)
-                if len(scope) > 1 and capacity >= required_mib:
+                if not exact_group and len(scope) > 1 and capacity >= required_mib:
                     break
             if len(scope) < 2 or capacity < required_mib:
                 raise CapacityError("no complete exclusive GPU group is currently available",
@@ -4215,6 +5383,7 @@ class Broker:
             "ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
             "requested_model": model, "canonical_model": model,
             "requested_parallel": parallel,
+            "requested_placement": "exclusive_group" if exact_group else "auto",
             "requested_gpu_uuids": list(gpu_uuids) if gpu_uuids is not None else None,
             "admitted_parallel": sum(lane["parallel"] for lane in lanes),
             "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}", "lanes": lanes,
@@ -4227,7 +5396,7 @@ class Broker:
         request_path: str = "",
         gpu_uuids: tuple[str, ...] | None = None,
         triggered_by: dict[str, str] | None = None,
-        *, allow_reclaim: bool = True,
+        *, allow_reclaim: bool = True, placement: str = "auto",
     ) -> dict[str, Any]:
         model = canonical_model_tag(model)
         if not model:
@@ -4237,7 +5406,7 @@ class Broker:
         require_gpu_health(refresh=True)
         with self.cv:
             requested_gpu_uuids = gpu_uuids
-            gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
+            gpu_uuids = self._capacity_scope_locked(model, gpu_uuids, placement)
             cancelling_request = self._model_cancellation_in_progress_locked(
                 model
             )
@@ -4253,6 +5422,9 @@ class Broker:
             raise PermanentCapacityError(
                 "parallel must be at least 1", 400, "invalid_capacity_request"
             )
+        if placement == "exclusive_group" and parallel > POOL_INSTANCE_PARALLEL:
+            raise PermanentCapacityError("one exact exclusive group supports only its configured parallel slots",
+                                         422, "parallel_exceeds_capacity")
         if cancelling_request:
             raise CapacityError(
                 f"model {model!r} is cancelling an expired request; retry "
@@ -4304,6 +5476,17 @@ class Broker:
             if stale and self._stop_lanes(stale, "model context identity changed"):
                 raise CapacityError("previous model context lane has not completely stopped",
                                     reason_code="lane_stop_failed")
+            if placement == "exclusive_group":
+                if profile_data is None:
+                    with MODEL_CONTEXT_LOCK:
+                        profile_data = self._model_profile(model)
+                        expected_profile = effective_model_context_profile(model)
+                        expected_profile = dict(expected_profile) if expected_profile else None
+                required_mib, capabilities = profile_data
+                return self._ensure_group_capacity(
+                    model, parallel, required_mib, capabilities, request_path,
+                    gpu_uuids, triggered_by, expected_profile,
+                    allow_reclaim=allow_reclaim, exact_group=True)
             with self.cv:
                 blocked = self._ollama_blocked_gpus_locked()
                 existing = [lane for lane in self.lanes.values()
@@ -4605,7 +5788,7 @@ class Broker:
         lane: Lane,
         request_id: str,
         logical_request_id: str,
-    ) -> None:
+    ) -> ActiveRequest:
         if request_id in self.active_request_records:
             raise RuntimeError(f"request {request_id} is already admitted")
         now = time.monotonic()
@@ -4620,12 +5803,51 @@ class Broker:
         lane.in_flight += 1
         lane.last_used = time.time()
         self.active_requests = len(self.active_request_records)
+        return self.active_request_records[request_id]
+
+    def _owned_active_request_locked(self, admission: Admission) -> ActiveRequest | None:
+        active = self.active_request_records.get(admission.request_id)
+        if admission.warm_admission is not None and (
+                active is not admission.active_request or active is None
+                or active.request_id != admission.request_id
+                or active.lane is not admission.lane
+                or active.logical_request_id != admission.logical_request_id
+                or active.warm_admission != admission.warm_admission
+                or (admission.logical_request_id and self.logical_in_flight.get(
+                    admission.logical_request_id) != (admission.request_fingerprint,
+                        admission.request_id, admission.queue_ticket))):
+            return None
+        return active
+
+    def reject_warm_before_backend(self, admission: Admission, failure: CapacityError) -> CapacityError:
+        """Release only a proven, exact never-dispatched owner, atomically.
+
+        Unknown/cancelled/started state is terminal for this handler and remains
+        owned by its existing lifecycle. It must never authorize fresh inference.
+        """
+        with self.cv:
+            active = self._owned_active_request_locked(admission)
+            logical = admission.logical_request_id
+            if (admission.warm_admission is None or active is None
+                    or active.backend_started or active.backend is not None
+                    or active.backend_completed or active.cancel_requested_at is not None
+                    or active.detached_at is not None
+                    or (logical and self.logical_in_flight.get(logical) != (
+                        admission.request_fingerprint, admission.request_id, admission.queue_ticket))
+                    or any(item.request_id == admission.request_id
+                           or (logical and item.logical_request_id == logical) for item in self.waiters)
+                    or (logical and (logical in self.completed_responses or logical in self.logical_tombstones))):
+                return WarmAdmissionOwnershipUncertain(admission, failure)
+            self.proxy_exit(admission, active.lane.model, False)
+            if isinstance(failure, WarmPreflightRequired):
+                failure.admission_retained = False
+            return failure
 
     def bind_active_request_client(
         self, admission: Admission, client_key: str,
     ) -> None:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             if active is not None:
                 active.client_key = client_key
 
@@ -4633,9 +5855,27 @@ class Broker:
         self, admission: Admission, backend: Any,
     ) -> bool:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
+            if admission.warm_admission is not None and (active is None
+                    or active.cancel_requested_at is not None or active.detached_at is not None
+                    or active.backend_started or active.backend is not None or active.backend_completed):
+                raise WarmAdmissionOwnershipUncertain(admission)
             if active is None or active.cancel_requested_at is not None:
                 return False
+            if admission.warm_admission is not None:
+                proof = json.loads(admission.warm_admission)
+                try:
+                    eligible = self._validate_warm_admission_locked(
+                        admission.warm_admission, active.lane.model,
+                        tuple(proof["gpu_uuids"]), phase="backend_dispatch_validation")
+                    if active.lane.lane_id not in eligible:
+                        raise WarmPreflightRequired(phase="backend_dispatch_validation",
+                                                   causes=("selected_lane_not_certified",))
+                except WarmPreflightRequired as exc:
+                    failure = self.reject_warm_before_backend(admission, exc)
+                    if failure is exc:
+                        raise
+                    raise failure from exc
             active.backend = backend
             active.backend_started = True
             active.phase = "backend_connecting"
@@ -4658,7 +5898,7 @@ class Broker:
         self, admission: Admission, phase: str,
     ) -> bool:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             if active is None or active.cancel_requested_at is not None:
                 return False
             now = time.monotonic()
@@ -4706,7 +5946,7 @@ class Broker:
     def request_client_detached(self, admission: Admission) -> None:
         cancel = None
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
         if active is None:
             return
         with active.terminal_lock:
@@ -4739,12 +5979,12 @@ class Broker:
         self, admission: Admission,
     ) -> Any | None:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             return active.terminal_lock if active is not None else None
 
     def request_backend_complete(self, admission: Admission) -> bool:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             if active is None:
                 return False
             if active.cancel_requested_at is not None:
@@ -4772,14 +6012,14 @@ class Broker:
 
     def active_request_cancel_reason(self, admission: Admission) -> str:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             return active.cancel_reason if active is not None else ""
 
     def note_backend_failure(
         self, admission: Admission, reason: str,
     ) -> None:
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
             if active is None or active.backend_completed:
                 return
             self._mark_active_cancelling_locked(
@@ -5112,9 +6352,12 @@ class Broker:
                     workload_class: str = "unspecified",
                     queue_policy: str = "wait",
                     gpu_uuids: tuple[str, ...] | None = None,
+                    warm_admission: str | None = None,
                     client: dict[str, str] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
+        if warm_admission is not None and (not routable or not model or not POOL_ENABLED):
+            raise PermanentCapacityError("warm admission requires managed inference", 400, "invalid_warm_admission")
         if routable and model and not allow_during_drain:
             require_gpu_health(request_id=request_id,
                                logical_request_id=logical_request_id)
@@ -5176,14 +6419,14 @@ class Broker:
                         self.cv.wait(min(remaining, 0.25))
                     lane = self._select_lane_locked(model, routable, gpu_uuids)
                     if lane is not None:
-                        self._register_active_request_locked(
+                        active = self._register_active_request_locked(
                             lane, request_id, logical_request_id
                         )
                         return Admission(
                             lane, request_id, logical_request_id,
                             request_fingerprint,
                             max(0, int((time.monotonic() - enqueued_at) * 1000)),
-                            1, 0, retained_request,
+                            1, 0, retained_request, active_request=active,
                         )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -5296,6 +6539,23 @@ class Broker:
                     logical_request_id=logical_request_id,
                 )
             if waiter is None:
+                # This precedes logical ownership and body retention. A caller
+                # can recertify and reuse this ID only when no work was admitted.
+                self._prune_logical_tombstones_locked()
+                tombstone = self.logical_tombstones.get(logical_request_id)
+                if tombstone is not None and tombstone.warm_admission != warm_admission:
+                    raise PermanentCapacityError("logical request warm certificate changed", 409,
+                                                 "logical_request_conflict")
+                if warm_admission is not None:
+                    try:
+                        self._validate_warm_admission_locked(warm_admission, model, gpu_uuids, phase="pre_admission")
+                    except WarmPreflightRequired as exc:
+                        if tombstone is not None:
+                            raise WarmPreflightRequired(admission_retained=True,
+                                request_id=tombstone.request_id,
+                                logical_request_id=logical_request_id,
+                                phase=exc.warm_preflight_phase, causes=exc.warm_preflight_causes) from exc
+                        raise
                 if resume_request:
                     raise PermanentCapacityError(
                         "logical request is not retained by this broker",
@@ -5349,6 +6609,7 @@ class Broker:
                     queue_policy=queue_policy,
                     initial_position=len(self.waiters) + 1,
                     client=client,
+                    warm_admission=warm_admission,
                 )
                 self.waiters.append(waiter)
                 if retained_request is not None:
@@ -5378,6 +6639,9 @@ class Broker:
             except CapacityError:
                 with self.cv:
                     if waiter in self.waiters:
+                        if waiter.warm_admission is not None:
+                            self._record_logical_tombstone_locked(waiter.logical_request_id,
+                                waiter.request_id, "gpu_health_unavailable")
                         self._remove_waiter_locked(waiter)
                 raise
             with self.cv:
@@ -5407,6 +6671,9 @@ class Broker:
                     waiter.phase = "timed-out"
                     queue_position = self.waiters.index(waiter) + 1
                     self.queue_timed_out_total += 1
+                    if waiter.warm_admission is not None:
+                        self._record_logical_tombstone_locked(waiter.logical_request_id,
+                            waiter.request_id, "queue_admission_timeout")
                     self._remove_waiter_locked(waiter)
                     raise AdmissionTimeoutError(
                         f"broker queue admission deadline expired{detail}",
@@ -5416,6 +6683,24 @@ class Broker:
                         queue_ticket=waiter.queue_ticket,
                     )
                 self._prune_dead_lanes_locked()
+                certified_ids = None
+                if waiter.warm_admission is not None:
+                    try:
+                        certified_ids = self._validate_warm_admission_locked(
+                            waiter.warm_admission, model, waiter.gpu_uuids, phase="queue_validation")
+                    except WarmPreflightRequired as exc:
+                        # Keep exact retained ownership until its ordinary TTL.
+                        # A different certificate cannot widen an admitted job.
+                        if waiter.logical_request_id:
+                            waiter.attached = False
+                            waiter.phase = "detached"
+                            waiter.resume_deadline = time.monotonic() + POOL_RESUME_TTL
+                            raise WarmPreflightRequired(admission_retained=True,
+                                request_id=waiter.request_id,
+                                logical_request_id=waiter.logical_request_id,
+                                phase=exc.warm_preflight_phase, causes=exc.warm_preflight_causes) from exc
+                        self._remove_waiter_locked(waiter)
+                        raise
                 waiter_index = next(
                     (index for index, item in enumerate(self.waiters)
                      if item is waiter),
@@ -5425,7 +6710,7 @@ class Broker:
                     item.model == model for item in self.waiters[:waiter_index]
                 )
                 if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids)
+                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids, certified_ids)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
@@ -5439,11 +6724,12 @@ class Broker:
                         self.queue_wait_ms_max = max(
                             self.queue_wait_ms_max, queue_ms
                         )
-                        self._register_active_request_locked(
+                        active = self._register_active_request_locked(
                             lane,
                             waiter.request_id,
                             waiter.logical_request_id,
                         )
+                        self.active_request_records[waiter.request_id].warm_admission = waiter.warm_admission
                         if waiter.logical_request_id:
                             self.logical_in_flight[waiter.logical_request_id] = (
                                 waiter.request_fingerprint,
@@ -5459,6 +6745,7 @@ class Broker:
                             waiter.initial_position,
                             waiter.queue_ticket,
                             retained_for_admission,
+                            waiter.warm_admission, active_request=active,
                         )
                 self.cv.wait(min(remaining, 0.25))
 
@@ -5471,7 +6758,12 @@ class Broker:
                         or not self.waiters):
                     self.cv.wait(0.5)
                     continue
-                waiter = self.waiters[0]
+                # Conditional warm requests never authorize capacity creation.
+                # Unbound requests still use the ordinary scheduler unchanged.
+                waiter = next((item for item in self.waiters if item.warm_admission is None), None)
+                if waiter is None:
+                    self.cv.wait(0.25)
+                    continue
                 blocked_gpus = self._ollama_blocked_gpus_locked()
                 selected_gpus = set(waiter.gpu_uuids or SELECTED_GPUS)
                 if selected_gpus and selected_gpus.issubset(blocked_gpus):
@@ -5595,7 +6887,8 @@ class Broker:
                 if changed:
                     LOG.warning("managed capacity queued model=%s: %s", model, message)
 
-    def prepare_managed_body(self, lane: Lane, path: str, body: bytes) -> bytes:
+    def prepare_managed_body(self, lane: Lane, path: str, body: bytes,
+                             warm_admission: str | None = None) -> bytes:
         if lane.kind != "managed" or not body:
             return body
         if not lane.context_profile_matches():
@@ -5615,7 +6908,26 @@ class Broker:
             return body
         if not isinstance(payload, dict):
             return body
-        if lane.context_profile:
+        prepared_context = lane.context_profile["context_length"] if lane.context_profile else None
+        if warm_admission is not None and lane.context_profile is None:
+            # The original body was checked before clamping/registration.
+            # Replace only the legacy unprofiled MAX_CONTEXT projection with
+            # this verified embedding runner's exact native allocation.
+            proof = json.loads(warm_admission)
+            native = (lane.warm_runtime_identity or {}).get("native_ps", {})
+            try:
+                installed_digest = self._warm_embedding_digest(lane.model)
+            except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
+                raise WarmPreflightRequired(admission_retained=True, phase="body_preparation",
+                                           causes=("embedding_metadata_unavailable",)) from exc
+            if (native.get("digest") != proof["model_digest"]
+                    or native.get("context_length") != proof["context_length"]
+                    or installed_digest != proof["model_digest"]
+                    or (HARD_MAX_CONTEXT > 0 and proof["context_length"] > HARD_MAX_CONTEXT)):
+                raise WarmPreflightRequired(admission_retained=True, phase="body_preparation",
+                                           causes=("embedding_identity_mismatch",))
+            prepared_context = proof["context_length"]
+        if prepared_context is not None:
             # A queued/retained request may have been prepared before a tag's
             # context identity changed. The selected lane owns the final
             # allocation contract; never reload it from a stale request cap.
@@ -5623,7 +6935,7 @@ class Broker:
             if not isinstance(options, dict):
                 raise PermanentCapacityError("model options must be a JSON object", 400,
                                              "invalid_model_options")
-            options["num_ctx"] = lane.context_profile["context_length"]
+            options["num_ctx"] = prepared_context
         if payload.get("keep_alive") == 0:
             self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
             # Do not leave an empty backend that can reload implicitly on its
@@ -5647,7 +6959,9 @@ class Broker:
         retired = None
         expired_lane = None
         with self.cv:
-            active = self.active_request_records.get(admission.request_id)
+            active = self._owned_active_request_locked(admission)
+            if admission.warm_admission is not None and active is None:
+                return
             lane = active.lane if active is not None else admission.lane
             if (
                 active is not None
@@ -5810,11 +7124,82 @@ class Broker:
             return True
         return lease.state == "revoking"
 
+    def _handoff_summaries_locked(self) -> list[dict[str, Any]]:
+        now = time.time()
+        for key, request in list(self.lease_handoff_requests.items()):
+            if request["state"] == "waiting" and request["expires_at"] <= now:
+                self.lease_handoff_requests.pop(key, None)
+        return [dict(request) for request in self.lease_handoff_requests.values()]
+
+    def _handoff_scopes_locked(self, ignore_id: str = "") -> set[str]:
+        return {gpu for request in self._handoff_summaries_locked()
+                if request["id"] != ignore_id for gpu in request["gpu_uuids"]}
+
+    def _wait_for_cooperative_handoff(
+        self, scope: list[str], owner: str, justification: str,
+        expected_duration_seconds: int, requested_mib: int, request_alive: Any = None,
+    ) -> str:
+        with self.cv:
+            scope_set = set(scope)
+            if not scope or any(gpu not in SELECTED_GPUS for gpu in scope):
+                return ""  # Ordinary admission owns invalid/unscoped rejection.
+            if scope_set.intersection(self._handoff_scopes_locked()):
+                raise RuntimeError("another cooperative handoff already targets this GPU scope")
+            live = list(self.leases.values())
+            conflicts = [lease for lease in live
+                         if not lease.gpu_uuids or scope_set.intersection(lease.gpu_uuids)]
+            if self.pending_lease() or not conflicts or any(lease.state != "active" or not lease.yield_on_request
+                                    or len(lease.gpu_uuids) != 1 for lease in conflicts):
+                return ""  # Non-opted-in owners retain their existing contract.
+            if any(lease.owner == owner for lease in live):
+                raise RuntimeError("an existing owner cannot wait for a cooperative handoff")
+            inventory = {device["uuid"]: device for device in gpu_snapshot()}
+            if (any(gpu not in inventory for gpu in scope)
+                    or sum(int(inventory[gpu].get("total_mib") or 0) for gpu in scope) < requested_mib):
+                raise ValueError("handoff request exceeds verified GPU hardware capacity")
+            if len(self.lease_handoff_requests) >= 32:
+                raise RuntimeError("cooperative handoff request capacity reached")
+            request_id = "handoff_" + secrets.token_urlsafe(18)
+            now = time.time()
+            self.lease_handoff_requests[request_id] = {
+                "id": request_id, "state": "waiting", "owner": owner,
+                "justification": justification, "gpu_uuids": list(scope),
+                "requested_mib": requested_mib,
+                "expected_duration_seconds": expected_duration_seconds,
+                "created_at": now, "expires_at": now + HANDOFF_TIMEOUT,
+                "incumbents": [{"owner": lease.owner, "gpu_uuids": list(lease.gpu_uuids)}
+                               for lease in conflicts],
+            }
+            self.cv.notify_all()
+            deadline = time.monotonic() + HANDOFF_TIMEOUT
+            try:
+                # Never hold self.transition here: release needs that lock.
+                while any(not lease.gpu_uuids or scope_set.intersection(lease.gpu_uuids)
+                          for lease in self.leases.values()):
+                    if self.stopping.is_set() or (request_alive is not None and not request_alive()):
+                        raise RuntimeError("cooperative handoff requester disconnected or broker stopping")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or request_id not in self.lease_handoff_requests:
+                        raise TimeoutError("cooperative handoff timed out; incumbent ownership is retained")
+                    self.cv.wait(min(remaining, 0.5))
+                if (self.stopping.is_set() or time.monotonic() >= deadline
+                        or request_id not in self.lease_handoff_requests
+                        or (request_alive is not None and not request_alive())):
+                    raise TimeoutError("cooperative handoff expired before successor admission")
+                return request_id
+            except Exception:
+                self.lease_handoff_requests.pop(request_id, None)
+                self.cv.notify_all()
+                raise
+
     def acquire(
         self, owner: str, requested_mib: int, ttl: int,
         requested_gpu_uuids: list[str] | None = None,
         justification: str = "",
         expected_duration_seconds: int = 0,
+        *, priority: int | None = None, evacuation_id: str = "",
+        _evacuation_commit_id: str = "",
+        yield_on_request: bool = False, request_alive: Any = None,
     ) -> dict[str, Any]:
         owner = owner.strip()
         justification = justification.strip()
@@ -5832,10 +7217,52 @@ class Broker:
             raise ValueError(
                 "lease acquisition requires expected_duration_seconds greater than zero"
             )
+        if type(yield_on_request) is not bool:
+            raise ValueError("yield_on_request must be a Boolean")
+        requested_scope = list(dict.fromkeys(requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])))
+        if yield_on_request and (len(requested_scope) != 1 or evacuation_id):
+            raise ValueError("cooperative yield requires exactly one GPU and no cache evacuation")
+        if priority is not None and not evacuation_id:
+            raise ValueError("priority requires an explicit evacuation ID")
+        if evacuation_id:
+            return self._lease_evacuation("acquire", {
+                "owner": owner, "requested_mib": requested_mib, "ttl": ttl,
+                "requested_gpu_uuids": requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, []),
+                "justification": justification, "expected_duration_seconds": expected_duration_seconds,
+            }, priority, evacuation_id)
         require_gpu_health(refresh=True)
-        requested_scope = requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])
+        handoff_id = self._wait_for_cooperative_handoff(
+            requested_scope, owner, justification, expected_duration_seconds, requested_mib, request_alive,
+        )
+        try:
+            if handoff_id:
+                require_gpu_health(refresh=True)
+                if request_alive is not None and not request_alive():
+                    raise RuntimeError("cooperative requester disconnected before admission")
+            return self._acquire_once(owner, requested_mib, ttl, requested_scope,
+                                      justification, expected_duration_seconds,
+                                      _evacuation_commit_id, yield_on_request, handoff_id, request_alive)
+        finally:
+            if handoff_id:
+                with self.cv:
+                    self.lease_handoff_requests.pop(handoff_id, None)
+                    self.cv.notify_all()
+
+    def _acquire_once(
+        self, owner: str, requested_mib: int, ttl: int, requested_scope: list[str],
+        justification: str, expected_duration_seconds: int,
+        _evacuation_commit_id: str, yield_on_request: bool, handoff_id: str, request_alive: Any,
+    ) -> dict[str, Any]:
         with self.transition:
             with self.cv:
+                reserved = self._handoff_scopes_locked(handoff_id)
+                if reserved and (not requested_scope or reserved.intersection(requested_scope)):
+                    raise RuntimeError("GPU scope is reserved for a cooperative handoff requester")
+                if handoff_id:
+                    request = self.lease_handoff_requests.get(handoff_id)
+                    if request is None or request["expires_at"] <= time.time():
+                        raise TimeoutError("cooperative handoff expired before admission")
+                    request["state"] = "admitting"
                 if self.pending_lease():
                     pending = next(
                         lease for lease in self.leases.values()
@@ -5861,7 +7288,7 @@ class Broker:
                 unloaded = self._unload_base_models()
                 if requested_scope:
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        0, requested_scope,
+                        0, requested_scope, handoff_id,
                     )
                     aggregate_free = sum(
                         int(device["free_mib"]) for device in devices
@@ -5885,7 +7312,7 @@ class Broker:
                     # retirement and enforce the reservation against the
                     # resulting live capacity.
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        requested_mib, requested_scope,
+                        requested_mib, requested_scope, handoff_id,
                     )
                 else:
                     stopped = self.stop_pool_lanes("lease acquire")
@@ -5898,20 +7325,28 @@ class Broker:
                         f"requested {requested_mib} MiB but only {aggregate_free} MiB is free after Ollama unload"
                     )
                 require_gpu_health(refresh=True)
+                if handoff_id and request_alive is not None and not request_alive():
+                    raise RuntimeError("cooperative requester disconnected before lease grant")
                 now = time.time()
                 token = "lease_" + secrets.token_urlsafe(24)
                 lease = Lease(
                     token, owner, "pending", requested_mib, now, now, now, ttl,
                     foreign_gpu_usage(), gpu_uuids, justification,
                     now + expected_duration_seconds,
+                    _evacuation_commit_id,
+                    yield_on_request,
                 )
                 with self.cv:
+                    if _evacuation_commit_id:
+                        self._assert_evacuation_current(self.evacuations[_evacuation_commit_id])
                     self.leases[token] = lease
                     try:
                         self._persist_leases_locked()
                     except Exception:
                         self.leases.pop(token, None)
                         raise
+                    if _evacuation_commit_id:
+                        self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
                 LOG.info("lease acquired owner=%s requested_mib=%s unloaded=%s", owner, requested_mib, unloaded)
                 if gpu_uuids:
                     self.end_drain()
@@ -5979,6 +7414,10 @@ class Broker:
                     raise KeyError("unknown lease")
                 if lease.state not in ("pending", "active"):
                     raise RuntimeError("only a pending or active lease can change scope")
+                if lease.yield_on_request and requested != lease.gpu_uuids:
+                    raise RuntimeError("cooperative owners must release before changing GPU scope")
+                if set(requested).intersection(self._handoff_scopes_locked()):
+                    raise RuntimeError("scope reserved for cooperative handoff")
                 conflicts = {
                     gpu_uuid
                     for other_token, other in self.leases.items()
@@ -6054,7 +7493,12 @@ class Broker:
                 "gpus": [by_uuid[gpu_uuid] for gpu_uuid in requested],
             }
 
-    def prepare(self, token: str) -> dict[str, Any]:
+    def prepare(self, token: str, *, priority: int | None = None,
+                evacuation_id: str = "", _evacuation_commit_id: str = "") -> dict[str, Any]:
+        if priority is not None and not evacuation_id:
+            raise ValueError("priority requires an explicit evacuation ID")
+        if evacuation_id:
+            return self._lease_evacuation("prepare", {"token": token}, priority, evacuation_id)
         require_gpu_health(refresh=True)
         with self.transition:
             with self.cv:
@@ -6072,11 +7516,21 @@ class Broker:
                 )
                 unloaded = self._unload_base_models()
                 with self.cv:
+                    if _evacuation_commit_id:
+                        self._assert_evacuation_current(self.evacuations[_evacuation_commit_id])
                     now = time.time()
+                    previous = (lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id)
                     lease.state = "pending"
                     lease.heartbeat_at = now
                     lease.transition_started_at = now
-                    self._persist_leases_locked()
+                    lease.evacuation_id = _evacuation_commit_id or lease.evacuation_id
+                    try:
+                        self._persist_leases_locked()
+                    except Exception:
+                        lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id = previous
+                        raise
+                    if _evacuation_commit_id:
+                        self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
                 if lease.gpu_uuids:
                     self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
@@ -6441,6 +7895,7 @@ class Broker:
         with self.cv:
             self._prune_client_history_locked()
             leases = [asdict(lease) for lease in self.leases.values()]
+            handoffs = self._handoff_summaries_locked()
             lease_summaries = self._public_lease_summaries_locked()
             draining = self.draining
             active = self.active_requests
@@ -6454,6 +7909,8 @@ class Broker:
             model_gpu_policy = {
                 model: list(gpus) for model, gpus in self.model_gpu_policy.items()
             }
+            cache_residency = {"policies": json.loads(json.dumps(self.cache_policies)),
+                "operations": [self._evacuation_public(value) for value in self.evacuations.values()]}
             unregistered_gpus = sorted(self._unregistered_gpus_locked())
         backend = probe_backend()
         health = gpu_health_snapshot()
@@ -6463,6 +7920,7 @@ class Broker:
                 "selected_gpu_count": len(SELECTED_GPUS),
                 "draining": draining, "active_requests": active,
                 "last_reason": reason, "leases": leases,
+                "lease_handoff_requests": handoffs,
                 "lease_policy": lease_policy_document(),
                 "lease_summaries": lease_summaries,
                 "warnings": lease_visibility_warnings(lease_summaries)
@@ -6494,6 +7952,7 @@ class Broker:
                     "max_clients_per_lane": LANE_CLIENT_LIMIT,
                 },
                 "model_gpu_policy": model_gpu_policy,
+                "cache_residency": cache_residency,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
 
@@ -6753,6 +8212,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             GPU_UUIDS_HEADER,
         )
 
+    def _requested_warm_admission(self) -> str | None:
+        if WARM_ADMISSION_HEADER not in self.headers:
+            return None
+        if len(self.headers.get_all(WARM_ADMISSION_HEADER, [])) != 1:
+            raise PermanentCapacityError("duplicate warm admission header", 400, "invalid_warm_admission")
+        return parse_warm_admission(self.headers.get(WARM_ADMISSION_HEADER, ""))
+
     def _send_capacity_failure(
         self,
         failure: CapacityError,
@@ -6781,9 +8247,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             payload["retry_after_ms"] = failure.retry_after * 1000
         if failure.cause_reason_code:
             payload["cause_reason_code"] = failure.cause_reason_code
+        phase = getattr(failure, "warm_preflight_phase", None)
+        causes = getattr(failure, "warm_preflight_causes", ())
+        if phase in WARM_PREFLIGHT_PHASES:
+            payload["warm_preflight_phase"] = phase
+            payload["warm_preflight_causes"] = sorted(set(causes).intersection(WARM_PREFLIGHT_CAUSES))
         if failure.admission_retained:
             payload["admission_retained"] = True
             payload["resume_ttl_ms"] = int(POOL_RESUME_TTL * 1000)
+        if isinstance(failure, WarmPreflightRequired):
+            payload["admission_retained"] = failure.admission_retained
+            payload["backend_started"] = False
         if failure.queue_position is not None:
             payload["queue_position"] = failure.queue_position
         if failure.queue_ticket is not None:
@@ -6861,6 +8335,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             document = discovery_document()
             with self.broker.cv:
                 lease_summaries = self.broker._public_lease_summaries_locked()
+                document["lease_handoff_requests"] = self.broker._handoff_summaries_locked()
                 unregistered_gpus = sorted(self.broker._unregistered_gpus_locked())
                 document["unregistered_gpu_quarantine"] = unregistered_gpus
                 if unregistered_gpus:
@@ -6899,18 +8374,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError(
                         "endpoint must be a supported Ollama inference path"
                     )
+                placement = parse_capacity_placement(payload.get("placement", "auto"))
                 gpu_uuids = parse_gpu_uuid_constraint(
                     payload.get("gpu_uuids")
                     if "gpu_uuids" in payload else None,
-                    "gpu_uuids",
+                    "gpu_uuids", exact=placement == "exclusive_group",
                 )
-                result = self.broker.ensure_capacity(
-                    str(payload.get("model") or ""),
-                    parallel,
-                    endpoint,
-                    gpu_uuids,
-                    triggered_by=self._client_reference(),
-                )
+                proof_only = payload.get("warm_admission_proof", False)
+                if type(proof_only) is not bool:
+                    raise ValueError("warm_admission_proof must be boolean")
+                if proof_only:
+                    result = self.broker.warm_admission_proof(
+                        str(payload.get("model") or ""), parallel, gpu_uuids, placement)
+                else:
+                    result = self.broker.ensure_capacity(
+                        str(payload.get("model") or ""), parallel, endpoint, gpu_uuids,
+                        triggered_by=self._client_reference(),
+                        placement=placement,
+                    )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
                 self._send_capacity_failure(exc)
@@ -6948,6 +8429,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         queue_policy = "wait"
         retained_request = None
         gpu_uuids = None
+        warm_admission = None
         is_resume = False
         client_key = ""
         try:
@@ -6957,6 +8439,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 queue_policy,
             ) = self._requested_admission_controls(path)
             gpu_uuids = self._requested_gpu_uuids()
+            warm_admission = self._requested_warm_admission()
             resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
             if resume_header and resume_header.lower() != "true":
                 raise PermanentCapacityError(
@@ -6981,7 +8464,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 retained_request, completed = self.broker.resume_request_lookup(
-                    logical_request_id, self.command, path
+                    logical_request_id, self.command, path, warm_admission, gpu_uuids
                 )
                 if completed is not None:
                     self._send_completed_response(completed)
@@ -7008,7 +8491,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 gpu_uuids = retained_request.gpu_uuids
+                warm_admission = retained_request.warm_admission
             else:
+                if warm_admission is not None:
+                    try:
+                        original_payload = json.loads(body)
+                        original_model = canonical_model_tag(str(original_payload.get("model") or "")) if isinstance(original_payload, dict) else ""
+                        self.broker.validate_warm_body(warm_admission, original_model, path, body)
+                    except (ValueError, TypeError) as exc:
+                        raise PermanentCapacityError("warm inference requires valid JSON", 400,
+                                                     "invalid_warm_admission") from exc
                 body = clamp_request(self.path, content_type, body)
                 # The routed model is read from the body on path alone, for the
                 # same reason the clamp above is. Keying this on the declared
@@ -7035,6 +8527,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     + b"\0"
                     + ",".join(gpu_uuids or ()).encode()
                     + b"\0"
+                    + ((b"warm-admission\0" + warm_admission.encode() + b"\0")
+                       if warm_admission is not None else b"")
                     + body
                 ).hexdigest()
                 if logical_request_id and path in INFERENCE_PATHS:
@@ -7052,6 +8546,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         model=model,
                         fingerprint=fingerprint,
                         gpu_uuids=gpu_uuids,
+                        warm_admission=warm_admission,
                     )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
@@ -7065,6 +8560,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 workload_class=workload_class,
                 queue_policy=queue_policy,
                 gpu_uuids=gpu_uuids,
+                warm_admission=warm_admission,
                 client=self._client_reference(),
             )
         except ClientDisconnected:
@@ -7095,9 +8591,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         lane = admission.lane
         try:
-            body = self.broker.prepare_managed_body(lane, path, body)
+            body = self.broker.prepare_managed_body(lane, path, body, admission.warm_admission)
+            if admission.warm_admission is not None:
+                self.broker.validate_warm_body(admission.warm_admission, model, path, body, prepared=True)
+                with self.broker.cv:
+                    eligible = self.broker._validate_warm_admission_locked(
+                        admission.warm_admission, model, gpu_uuids, phase="post_admission_validation")
+                    if lane.lane_id not in eligible:
+                        raise WarmPreflightRequired(phase="post_admission_validation",
+                                                   causes=("selected_lane_not_certified",))
         except CapacityError as exc:
-            self.broker.proxy_exit(admission, model, False)
+            if admission.warm_admission is not None:
+                exc = self.broker.reject_warm_before_backend(admission, exc)
+            else:
+                self.broker.proxy_exit(admission, model, False)
             with self.broker.cv:
                 queue = self.broker._queue_summary_locked()
             self._send_capacity_failure(
@@ -7139,6 +8646,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "x-ollama-unify-workload-class",
                 "x-ollama-unify-queue-policy",
                 "x-ollama-unify-gpu-uuids",
+                "x-ollama-unify-warm-admission",
             }
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS
@@ -7329,7 +8837,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body_bytes=response_body_bytes,
                     body_sha256=response_digest.hexdigest(),
                     unavailable_reason=unavailable_reason,
+                    warm_admission=admission.warm_admission,
                 )
+        except CapacityError as exc:
+            self._send_capacity_failure(exc, request_id=admission.request_id,
+                                        logical_request_id=admission.logical_request_id)
+            if isinstance(exc, WarmAdmissionOwnershipUncertain):
+                # Its owner (possibly a replacement) must keep its lifecycle.
+                admission = None
         except ClientDisconnected:
             pass
         except Exception as exc:
@@ -7407,6 +8922,14 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class ControlHandler(socketserver.StreamRequestHandler):
     broker: Broker
 
+    def request_alive(self) -> bool:
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) != b""
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
     def handle(self) -> None:
         while raw_request := self.rfile.readline(1024 * 1024):
             persistent = False
@@ -7425,6 +8948,10 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         [str(value) for value in requested_gpu_uuids],
                         str(request.get("justification") or ""),
                         max(0, int(request.get("expected_duration_seconds") or 0)),
+                        priority=request.get("priority"),
+                        evacuation_id=str(request.get("evacuation_id") or ""),
+                        yield_on_request=request.get("yield_on_request", False),
+                        request_alive=self.request_alive,
                     )
                 elif action == "ready":
                     result = self.broker.ready(str(request.get("token") or ""))
@@ -7437,7 +8964,17 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         [str(value) for value in requested_gpu_uuids],
                     )
                 elif action == "prepare":
-                    result = self.broker.prepare(str(request.get("token") or ""))
+                    result = self.broker.prepare(str(request.get("token") or ""),
+                        priority=request.get("priority"), evacuation_id=str(request.get("evacuation_id") or ""))
+                elif action == "set_cache_policy":
+                    result = self.broker.set_cache_policy(str(request.get("model") or ""),
+                        request.get("movable"), request.get("priority"), request.get("gpu_uuids"))
+                elif action == "cancel_evacuation":
+                    result = self.broker.cancel_evacuation(str(request.get("evacuation_id") or ""))
+                elif action == "recover_evacuation":
+                    result = self.broker.recover_evacuation(str(request.get("evacuation_id") or ""))
+                elif action == "archive_evacuation":
+                    result = self.broker.archive_evacuation(str(request.get("evacuation_id") or ""))
                 elif action == "release":
                     result = self.broker.release(
                         str(request.get("token") or ""),
@@ -7468,8 +9005,11 @@ class ControlHandler(socketserver.StreamRequestHandler):
                     raise ValueError(f"unknown action: {action}")
             except Exception as exc:
                 result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
-            self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
             if not persistent:
                 return
 
@@ -7491,6 +9031,9 @@ def send_control(
                 HEARTBEAT_TIMEOUT
                 if payload.get("action") == "heartbeat"
                 else DRAIN_TIMEOUT + UNLOAD_TIMEOUT + ANON_MAX_DRAIN + 10
+                # CLI does not inherit systemd's timeout overrides. Include
+                # the protocol maximum, not the CLI's local default.
+                + (600.0 if payload.get("action") == "acquire" else 0)
             )
         )
         client.settimeout(timeout)
@@ -7655,7 +9198,8 @@ def lease_run(args: argparse.Namespace) -> int:
                              "requested_mib": args.vram_mib, "ttl": args.ttl,
                              "gpu_uuids": args.gpu,
                              "justification": args.justification,
-                             "expected_duration_seconds": args.expected_duration})
+                             "expected_duration_seconds": args.expected_duration,
+                             "priority": args.priority, "evacuation_id": args.evacuation_id})
     token = acquired["lease"]["token"]
     env = os.environ.copy()
     env["OLLAMA_UNIFY_GPU_LEASE"] = token
@@ -7773,12 +9317,30 @@ def main() -> int:
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     acquire.add_argument("--gpu", action="append", default=[])
     acquire.add_argument("--token-only", action="store_true")
+    acquire.add_argument("--yield-on-request", action="store_true",
+                         help="opt in to cooperative single-GPU handoff; owner must honor discovery intent")
+    acquire.add_argument("--priority", type=int)
+    acquire.add_argument("--evacuation-id", default="", help="stable ID for opt-in copy-first lower-priority cache evacuation")
+    cache = sub.add_parser("set-cache-policy")
+    cache.add_argument("model")
+    cache.add_argument("--movable", action="store_true")
+    cache.add_argument("--priority", type=int, required=True)
+    cache.add_argument("--gpu", action="append", default=[])
+    cancel = sub.add_parser("cancel-evacuation")
+    cancel.add_argument("evacuation_id")
+    recover = sub.add_parser("recover-evacuation")
+    recover.add_argument("evacuation_id")
+    archive = sub.add_parser("archive-evacuation")
+    archive.add_argument("evacuation_id")
     scope = sub.add_parser("scope")
     scope.add_argument("token")
     scope.add_argument("--gpu", action="append", required=True)
     for name in ("ready", "prepare", "release"):
         command = sub.add_parser(name)
         command.add_argument("token")
+        if name == "prepare":
+            command.add_argument("--priority", type=int)
+            command.add_argument("--evacuation-id", default="")
         if name == "release":
             command.add_argument(
                 "--force", action="store_true",
@@ -7797,6 +9359,8 @@ def main() -> int:
     run.add_argument("--vram-mib", type=int, default=0)
     run.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     run.add_argument("--gpu", action="append", default=[])
+    run.add_argument("--priority", type=int)
+    run.add_argument("--evacuation-id", default="")
     run.add_argument("--ready-command", required=True)
     run.add_argument("--ready-timeout", type=float, default=300.0)
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -7819,7 +9383,7 @@ def main() -> int:
             # The daemon can have systemd EnvironmentFile overrides that the
             # CLI does not inherit. Publish its effective scope and health.
             for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health",
-                        "unregistered_gpu_quarantine"):
+                        "unregistered_gpu_quarantine", "lease_policy", "lease_handoff_requests"):
                 if key in live_status:
                     document[key] = live_status[key]
             selected = set(document.get("selected_gpu_ids", []))
@@ -7851,7 +9415,18 @@ def main() -> int:
                                "requested_mib": args.vram_mib, "ttl": args.ttl,
                                "gpu_uuids": args.gpu,
                                "justification": args.justification,
-                               "expected_duration_seconds": args.expected_duration})
+                               "expected_duration_seconds": args.expected_duration,
+                               "yield_on_request": args.yield_on_request,
+                               "priority": args.priority, "evacuation_id": args.evacuation_id})
+    elif args.command_name == "set-cache-policy":
+        result = send_control({"action": "set_cache_policy", "model": args.model,
+            "movable": args.movable, "priority": args.priority, "gpu_uuids": args.gpu})
+    elif args.command_name == "cancel-evacuation":
+        result = send_control({"action": "cancel_evacuation", "evacuation_id": args.evacuation_id})
+    elif args.command_name == "recover-evacuation":
+        result = send_control({"action": "recover_evacuation", "evacuation_id": args.evacuation_id})
+    elif args.command_name == "archive-evacuation":
+        result = send_control({"action": "archive_evacuation", "evacuation_id": args.evacuation_id})
     elif args.command_name == "heartbeat" and args.watch:
         if args.interval < 0:
             parser.error("heartbeat --interval must be zero (automatic) or positive")
@@ -7866,6 +9441,8 @@ def main() -> int:
         }
         if args.command_name == "release" and getattr(args, "force", False):
             control["force"] = True
+        if args.command_name == "prepare":
+            control.update(priority=args.priority, evacuation_id=args.evacuation_id)
         result = send_control(control)
     elif args.command_name == "run":
         if not args.command:

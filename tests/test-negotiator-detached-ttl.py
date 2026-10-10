@@ -138,19 +138,16 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(lease.heartbeat_at,990.0)
         self.assertEqual(lease.expected_release_at,100.0)
     def test_scoped_stop_targets_only_named_managed_lane(self):
-        target=SimpleNamespace(kind='managed',lane_id='own-lane',in_flight=1,retiring=False)
+        target=SimpleNamespace(kind='managed',lane_id='own-lane',in_flight=1,retiring=False,process=object())
         foreign=SimpleNamespace(kind='managed',lane_id='foreign-lane',in_flight=0,retiring=False)
         self.b.lanes={'own-lane':target,'foreign-lane':foreign}
         self.b._prune_dead_lanes_locked=lambda:None
-        stopped=[]
-        def stop(lanes,reason):
-            stopped.extend(lanes)
-            return []
-        self.b._stop_lanes=stop
-        with patch.object(m,'gpu_snapshot',return_value=[]):
+        self.b.transition=threading.RLock()
+        with patch.object(m,'gpu_snapshot',return_value=[]), \
+                patch.object(m,'process_group_alive',return_value=False) as alive:
             result=self.b.stop_lane('own-lane',force=True)
         self.assertEqual(result['stopped_lanes'],['own-lane'])
-        self.assertEqual(stopped,[target])
+        alive.assert_called_once_with(target.process)
         self.assertEqual(self.b.lanes,{'foreign-lane':foreign})
         self.assertFalse(foreign.retiring)
     def test_shutdown_preserves_external_lease_table_but_stops_managed_pool(self):

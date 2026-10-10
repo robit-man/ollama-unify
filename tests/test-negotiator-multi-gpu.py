@@ -871,6 +871,23 @@ class ReclamationFeasibilityTests(unittest.TestCase):
         self.broker.leases['pending'] = mock.Mock(gpu_uuids=(PAIR[1],), state='pending')
         self.assert_preserved()
 
+    def test_pending_evacuation_destination_promise_is_not_reclaimable(self):
+        self.required = self.busy.reserved_mib = 30000
+        self.idle.reserved_mib = 20000
+        self.devices[0]['free_mib'] = 31920
+        self.broker.evacuations['pending-move'] = {
+            'id': 'pending-move', 'destination_reservation': {PAIR[0]: 30000},
+        }
+        self.assert_preserved(scope=(PAIR[0],))
+
+    def test_evacuation_promise_transferred_to_live_lane_is_counted_once(self):
+        self.broker.evacuations['published-move'] = {
+            'id': 'published-move',
+            'destination_attempt': {'lane_id': self.busy.lane_id},
+            'destination_reservation': {PAIR[0]: 30000},
+        }
+        self.test_feasible_reclamation_still_creates_requested_lane()
+
     def test_host_memory_shortage_preserves_lane_before_slot_replacement(self):
         with mock.patch.object(n, 'POOL_MAX_SERVERS', 2), mock.patch.object(
             n, 'host_memory_snapshot', return_value={'memavailable_mib': 1}

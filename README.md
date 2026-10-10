@@ -210,6 +210,90 @@ To preserve a running workload while upgrading a legacy host-wide lease, use `do
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
+### Opt-in lower-priority cache evacuation
+
+An operator can declare broker-owned **idle singleton caches** movable and give
+an ordinary external lease request a higher priority. Undeclared caches are
+protected. This opt-in path copies and verifies each cache at an eligible
+destination before retiring its original process group; it does not merely
+unload lower-priority weights. Without these options, existing acquisition
+behavior is unchanged.
+
+```bash
+# Inspect owners, health, and selected UUIDs before requesting CUDA capacity.
+docker gpu discover
+
+# Declare this exact model movable to these selected GPUs. Hard model GPU
+# policies still apply; the declaration cannot widen them.
+docker gpu set-cache-policy MODEL:TAG --movable --priority 10 \
+  --gpu GPU-DESTINATION-A --gpu GPU-DESTINATION-B
+
+# Reserve a different target for a higher-priority external workload.
+docker gpu acquire --owner voice-service \
+  --justification 'run the scoped voice service' --expected-duration 3600 \
+  --vram-mib 8192 --gpu GPU-TARGET --priority 20 \
+  --evacuation-id voice-start-001
+```
+
+The response has `lease.state: "pending"` and a token. It is **not** a ready
+external workload. Initialize the child with exactly the returned GPU UUIDs,
+then call `ready TOKEN`, heartbeat, and release only after its CUDA allocation
+exits. `docker gpu run` accepts the same `--priority` and `--evacuation-id`
+options and retains its normal readiness/heartbeat/child-exit lifecycle.
+Before growing an active allocation, use
+`docker gpu prepare TOKEN --priority 20 --evacuation-id voice-grow-002`, grow it,
+then call `ready TOKEN` again. A failed evacuation does not revoke the existing
+active lease. Supplying a priority without an evacuation ID is rejected.
+
+Priorities are integers from -1000 to 1000; only strictly lower-priority caches
+may move. The broker drains admitted work to completion, preserves queued and
+retained request identities/bodies, and refuses to move a cache with queued
+demand. No admitted inference is replayed or cancelled for this feature. A
+moved cache has a new lane/runtime generation; an old warm certificate never
+authorizes the replacement. Clients must obtain a fresh proof for future work.
+
+Planning uses live physical memory and reservation accounting. It may first
+move a different eligible cache to consolidate room, with at most eight caches
+and a bounded search. Each destination is rechecked before loading, uses the
+same model digest/context, and must report full GPU allocation and exact
+process-group placement. There must be one spare managed server slot for the
+copy. Existing peer groups are indivisible and cannot be repartitioned or
+packed into a singleton by evacuation. External leases, quarantined GPUs,
+health faults, hard GPU policies, uncertain process exit, insufficient room,
+and protected caches produce a refusal; there is no CPU or alternate-GPU
+fallback. All source/destination promises remain charged until their whole
+process groups exit.
+
+`docker gpu status` exposes token-free `cache_residency.policies` and
+`cache_residency.operations`, including source/destination identities and the
+transaction phase. Policy and operation state is stored in the private,
+fsynced `cache-residency.json` next to the lease state (override with
+`OLLAMA_UNIFY_CACHE_RESIDENCY_STATE`). Evacuation children wait on a private
+startup pipe until their PID/start/process group has been durably recorded;
+parent failure before that acknowledgement exits the wrapper before native
+Ollama can load CUDA. A stable evacuation ID binds the exact request and priority. Repeating a successful request returns its existing
+linked lease; changing its body is rejected. A failed or recovered operation
+requires a new ID for a new request, so a lost response never silently starts
+another move.
+
+Use `docker gpu cancel-evacuation ID` to request rollback before grant. Rollback
+warms the original cache before retiring its destination. If restoration or
+process exit cannot be proven, status remains `restoration_pending` and the
+affected scopes remain blocked. An interrupted broker reloads that obligation
+as `recovery_pending`; it never adopts or kills an old PID or replays a request.
+After **all recorded process generations have exited**, an operator can call
+`docker gpu recover-evacuation ID` to restore the archived cache identities
+under the current hard policies. Recovery grants no new lease. If policy has
+changed, recovery refuses; cancel the obsolete obligation only after its
+recorded processes have exited. Ordinary lease heartbeat/release semantics
+still apply to any already persisted grant.
+
+The journal holds up to 256 operations. After settlement and release of its
+linked lease, `docker gpu archive-evacuation ID` returns the token-free record
+and removes it from the live journal. Save that returned record for audit;
+never reuse an archived operation ID. Remove a movable declaration with
+`docker gpu set-cache-policy MODEL:TAG --priority 10` (without `--movable`).
+
 ### Broker-owned parallel Ollama lanes
 
 Local clients that need concurrent model processes can ask the public broker to create capacity before starting their work:
@@ -220,7 +304,7 @@ curl -fsS http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator/capacit
   -d '{"model":"qwen3.5:35b","parallel":3,"gpu_uuids":["GPU-uuid"]}'
 ```
 
-An embedding client can state its endpoint explicitly when it prewarms a lane by adding `"endpoint":"/api/embed"`. The broker validates this field. It also infers embedding-only and reranking-only warm-up contracts from local model capabilities when the field is absent. Lazy capacity for an ordinary inference request always uses that request's endpoint family. Discovery metadata publishes the reserved private port range so cooperating clients never start a competing Ollama process on a broker lane.
+An embedding client can state its endpoint explicitly when it prewarms a lane by adding `"endpoint":"/api/embed"`. The broker validates this field. Embedding warm loads use `/api/embed` with `input:[]`, which loads the native runner without computing a vector; native residency and physical placement still must pass before readiness. This needs a native version that schedules a runner before returning empty embeddings (verified in stock 0.4.0 and 0.35.0). Stock 0.3.0 returns before loading, so the broker refuses missing residency instead of falling back to embedding computation. It also infers embedding-only and reranking-only warm-up contracts from local model capabilities when the field is absent. Lazy capacity for an ordinary inference request always uses that request's endpoint family. Discovery metadata publishes the reserved private port range so cooperating clients never start a competing Ollama process on a broker lane.
 
 `gpu_uuids` is an optional ordered hard allowlist. When present, the broker
 reuses and creates lanes only on the ordered intersection of that list and its
@@ -233,9 +317,26 @@ member is rejected. Omitting the field/header retains automatic placement.
 
 The broker looks up the installed model size and capabilities through `/api/tags`, adds configurable model and VRAM margins, checks live free memory, reserves host headroom, and admits the request only if every missing lane fits. Models that fit one allowed GPU retain a single-GPU `ollama serve` process and private loopback port. Placement spreads these lanes across available GPUs first, then co-locates additional processes only while the conservative live-VRAM budget still fits. A lane's VRAM promise remains committed until its complete process group exits, including surviving runner descendants. The broker loads the requested model through its native completion, embedding, or reranking endpoint and verifies residency before it marks the lane ready. Clients continue sending inference to public port `11434`; private lanes cannot be selected or bypassed. An ordinary inference request lazily creates capacity when needed. Model tags that omit `:latest` share the same lane identity; separately named aliases remain distinct.
 
+Aggregate artifact size remains the default weight estimate. A known omni sidecar bundle can be excluded only when the local manifest digest, every layer's size and identity, and native `/api/show` model/projector/adapter blob paths agree exactly. This follows the stock [Ollama loader and Modelfile serialization](https://github.com/ollama/ollama/blob/v0.35.0/server/images.go): the custom bundle is not a runtime model, projector or adapter layer. Unknown or draft layers, missing local files, unavailable metadata, symlinked layer or manifest files, or changed file/directory identities retain the full aggregate estimate. Model overhead, operator context floors, parallel context reserves and GPU headroom remain unchanged. This changes estimates for new admissions; it does not shrink a resident lane's committed reservation.
+
 When the model estimate exceeds every allowed GPU's physical capacity but fits their combined capacity, the broker can create one lane spanning an ordered GPU group. The entire capacity of every member is reserved exclusively before model loading. Every intersecting idle singleton lane is drained first; active lanes, external leases, unregistered CUDA contexts, or unavailable telemetry defer placement with a retryable error. A model larger than the allowed aggregate physical capacity receives a permanent capacity error. The child receives exactly the group's UUIDs through `CUDA_VISIBLE_DEVICES`, with `OLLAMA_SCHED_SPREAD=1`; Ollama chooses layer distribution from device memory. The broker does not assume equally sized weight shards. `num_gpu=-1` still controls offloaded layers, not the number of physical devices.
 
+To request a group even when the real model and context fit one GPU, explicitly set `placement:"exclusive_group"` on the capacity API. `gpu_uuids` must then be an ordered array of at least two distinct broker-selected GPUs, and every member must satisfy the model's hard GPU policy. No unavailable or excluded member is removed, substituted, or treated as an optional preference. The whole ordered group is used; a singleton, subgroup, or differently ordered group cannot satisfy this request. One exact group supports at most the configured `instance_parallel` slots. Missing or `"auto"` placement retains the ordinary fitting-singleton/oversized-group behavior; unsupported placement values fail explicitly.
+
+```sh
+# After discovery and authorized hardware setup, request only the designated UUIDs.
+curl -fsS http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"robit/qwen3.8-27b-obliterated-e03:27b","parallel":1,"endpoint":"/api/chat","placement":"exclusive_group","gpu_uuids":["GPU-FIRST-DESIGNATED-UUID","GPU-SECOND-DESIGNATED-UUID"]}'
+```
+
+This preserves the exact installed model digest, genuine memory estimate, and verified context. It reserves every member's full physical capacity and uses the existing whole-process stop and peer-safety rules. Readiness requires native full GPU residency plus observed positive process-group VRAM on every requested GPU and no other GPU. If Ollama does not actually distribute the model across the complete group, capacity fails; this API never manufactures a tensor split from model-size hints or CPU fallback. It does not prove that a previously faulting GPU or interconnect is healthy. Actual designated-GPU inspection remains mandatory before token generation.
+
+Use the same `placement:"exclusive_group"` and exact `gpu_uuids` with `warm_admission_proof:true` to inspect this group without creating capacity or refreshing idle lifetime. Proof issuance and certified inference recheck current actual per-member residency. The existing warm admission certificate selects only the original certified lane generation; a later singleton or replacement group never joins it. Ordinary inference without a warm certificate still follows the existing allowlist contract, so clients requiring the verified group must use that certificate and its unchanged ordered GPU header.
+
 A grouped lane becomes ready only after native model residency reports full GPU allocation and NVIDIA process telemetry confirms nonzero allocations by its process group on every reserved GPU, with none outside the scope. Capacity and status expose `gpu_uuids`, full-card `reserved_mib_by_gpu`, and measured `observed_vram_mib_by_gpu`; the legacy `gpu_uuid` remains the first member. A request or operator policy must allow every group member to reuse it. An idle group with no queued demand may be retired as a whole to make room for a different model, including a small embedding model. No member becomes available until the complete process group exits; active, loading, externally leased, or quarantined groups remain protected. A scoped external lease touching even one member drains the whole group before acquisition. Cancellation, explicit unload, policy changes, and retirement retain every reservation until the whole process group is confirmed gone.
+
+Before the first native model-load request, including a zero-token load, the broker reopens the spawned server's actual PID/start/process-group identity and `/proc` CUDA scope. Its `CUDA_VISIBLE_DEVICES` must exactly match the ordered reserved UUIDs, and the process generation must remain unchanged across that read. Missing, duplicate, unreadable, changed, or foreign scope fails before any model POST; the existing whole-process cleanup and reservation rules still apply. Full environment values are never included in this failure diagnostic. Actual GPU residency is independently checked after loading and before certified inference.
 
 Managed process teardown holds the lease transition lock through its final safety check and process exit. Pending and revoking scopes, active external multi-GPU scopes, and all live unscoped leases defer teardown. Unscoped leases retain the host-wide drain while active and exclude other external owners. Releasing a lease verifies that external CUDA allocations have settled before removing coordination state; it does not evict models alongside the releasing owner. A cancellation worker that finds a transition in progress keeps its exact active request and reservations and retries without blocking on the transition lock.
 
@@ -275,6 +376,16 @@ live discovery document reports the active preference map.
 
 Clients can label admission with `X-Ollama-Unify-Logical-Request-Id`, `X-Ollama-Unify-Workload-Class` (`foreground`, `interactive-control`, or `background`), and `X-Ollama-Unify-Queue-Policy` (`wait` or `yield`). `X-Ollama-Unify-Admission-Wait-Ms` bounds one HTTP admission attempt; it does not limit model loading or generation after admission. With the default `wait` policy and a logical request ID, an expired bounded attempt leaves one detached waiter and its accepted, clamped body in the original FIFO position for `OLLAMA_UNIFY_POOL_RESUME_TTL` seconds (default 30). Resume with the same logical ID, the same HTTP method/path, `X-Ollama-Unify-Resume-Request: true`, and no request body. The broker forwards its retained body, so a reconnect does not resend or duplicate a large prompt. Retained request memory is bounded by `OLLAMA_UNIFY_RETAINED_REQUEST_MAX_BODY_BYTES` (default 16 MiB) and `OLLAMA_UNIFY_RETAINED_REQUEST_MAX_TOTAL_BYTES` (default 128 MiB). A changed full-body request under an active ID returns `logical_request_conflict`; an overlapping attempt returns `logical_request_in_progress`; body-free resume after cancellation or expiry returns a typed non-retryable tombstone. An explicit full-body request can start a new attempt after that tombstone. The `yield` policy removes the waiter at the admission deadline.
 
+Clients that independently verify native runner hardware can opt into **warm-only admission**. First use ordinary capacity setup when authorized, inspect actual native runner PIDs/start times, model blobs, GPU placement, full residency and context, then POST the capacity endpoint with `warm_admission_proof:true`, the same `model`, `parallel`, `endpoint`, and explicit ordered `gpu_uuids`. This proof-only call inspects existing resident lanes; it never loads a model, creates capacity, or renews idle lifetime. It returns `503 warm_preflight_required` when the requested warm capacity cannot be certified.
+
+A successful response adds `warm_admission` (schema `io.ollama-unify.warm-admission.v1`) containing the broker boot identity, canonical model/digest/context, ordered GPU allowlist, and opaque `{id,generation_id}` lane identities. `warm_admission_lanes` separately exposes each lane's `server_process` and `runtime_processes` as `{pid,start_time_ticks}`, stable `native_ps` fields (`name`, `digest`, `context_length`, `size`, `size_vram`), and its exact scope. Clients must join these descriptors to their independently observed hardware proof; the certificate alone does not prove physical GPU placement. No private port is a routing input.
+
+Embedding-only artifacts can also be certified without a completion context profile. The broker reopens the current installed digest and capabilities and binds the positive native resident context, subject to the operator hard limit. Warm embedding requests use that certified context when legacy default context preparation would differ; an explicitly conflicting context is refused before retention. Completion-capable artifacts still require their exact completion profile.
+
+Send JSON-encoded `warm_admission` in `X-Ollama-Unify-Warm-Admission`, together with the matching `X-Ollama-Unify-GPU-UUIDs`. Under the pool lock, admission checks current process/native residency identities and claims only matching ready certified lanes. Retired members may disappear; at least one certified member must remain eligible. Busy certified lanes queue normally. This request cannot create, reload, reclaim, migrate to, or select an uncertified lane, including a lane another client adds concurrently. Native prediction/sampling options remain variable; load-affecting or unknown options, runner-variant changes, context changes, and explicit unload are refused. The fixed certified context and automatic `num_gpu:-1` are allowed. Unlabelled clients keep their existing behavior.
+
+An initial stale certificate returns `503 warm_preflight_required` with explicit `admission_retained:false` and `backend_started:false` **before logical registration or body retention**. Only this disposition permits fresh zero-token setup/physical recertification and retry of the same pending logical ID. After retention or admission the exact certificate is part of the request fingerprint; changing or removing it conflicts. Body-free resume may omit it and inherits the original proof. A stale retained request reports `admission_retained:true` and never widens its lane set. Completed responses replay the original bound response without requiring current residency; expired/cancelled bound requests retain their certificate restriction for the ordinary tombstone lifetime. Normal idle reaping remains enabled.
+
 Embedding endpoints (`/api/embed`, `/api/embeddings`, and `/v1/embeddings`) default to `background` and `yield` when the workload-class header is absent or blank. These requests may reuse a warm embedding lane or load into free capacity, but receive an immediate retryable `503 background_capacity_deferred` if placement would require reclaiming resident lanes. Explicit workload-class and queue-policy headers retain their existing meaning: an embedding caller can request `foreground` admission, and an explicit `wait` still permits reclamation. Chat and generation defaults remain unchanged. Discovery publishes these embedding defaults under `parallel_pool.admission_protocol.unlabelled_embedding_defaults`.
 
 After a logical inference request completes, the broker retains a bounded byte-for-byte response replay for `OLLAMA_UNIFY_COMPLETED_RESPONSE_TTL` seconds (default 120). The cache is limited by `OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_ENTRIES` (default 64), `OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_BODY_BYTES` (default 8 MiB), and `OLLAMA_UNIFY_COMPLETED_RESPONSE_MAX_TOTAL_BYTES` (default 64 MiB). An identical logical ID and request fingerprint replays the original HTTP status, end-to-end headers, and body without backend admission or generation and adds `X-Ollama-Unify-Response-Replayed: true`. A changed request under the same retained ID fails with `logical_request_conflict`. If a completed body exceeds a retention bound, the broker keeps a content-free tombstone and returns non-retryable `completed_response_unavailable` on replay instead of generating again. Discovery and status expose only limits and aggregate counters. They never expose request bodies, response bodies, logical IDs, or fingerprints from the completed-response cache.
@@ -303,6 +414,36 @@ menu, with the complete value retained as a tooltip, so a long client, model,
 unit, or lease name cannot push the tray menu across a screen boundary.
 
 The indicator talks to the control socket, so only members of the broker's access group can use it. That group already has full lease control through the socket. The socket also accepts `revoke` (by token) and `stop_lane` (by lane id, `force` to interrupt in-flight requests). The user unit `ollama-unify-tray.service` is enabled globally for `graphical-session.target`, and the broker unit's `ExecStartPost` starts it in every active desktop session of an access-group member, so the indicator comes up with the broker. Choosing *Quit indicator* stops it until the next login or broker start.
+
+### Cooperative external-service handoff (opt-in)
+
+An independently supervised, single-GPU service can acquire with
+`--yield-on-request`. This does not enable preemption for other owners and is
+not supported for unscoped/multi-GPU leases or cache-evacuation acquisition.
+The opted-in owner must watch `lease_handoff_requests` in live discovery and
+honor waiting, unexpired intent naming its owner and exact GPU scope in
+`incumbents`. The capability is advertised at
+`lease_policy.cooperative_handoff.schema` as
+`io.ollama-unify.cooperative-handoff.v1`.
+
+A valid conflicting `acquire` waits for up to `OLLAMA_UNIFY_HANDOFF_TIMEOUT`
+(default180 seconds; bounded1–600). The incumbent remains active and must keep
+heartbeating while it drains/stops its CUDA workload, then explicitly release.
+The broker grants no overlapping lease and never forcibly revokes the incumbent
+for this request. Another external requester cannot steal the intended scope
+between release and admission. An existing lease owner cannot wait for a
+handoff, preventing hold-and-wait cycles. Invalid metadata, impossible hardware
+capacity, non-opted-in owners and pending/revoking incumbents do not trigger yield.
+
+Intent contains no lease credentials and is cancelled on requester disconnect,
+timeout or daemon restart. Owner opt-in is persisted with the lease. A successful
+handoff still runs ordinary health, memory, transition and readiness gates; it is
+not a guarantee of admission. Services choose their own separately acquired
+replacement scope. There is no zero-downtime CUDA migration guarantee. Update
+both daemon and CLI together. Acquire's client timeout includes the protocol's
+maximum handoff wait even when the CLI does not inherit systemd configuration.
+`docker gpu run` does not opt in: only supervisors that implement the cooperative
+shutdown contract should do so.
 
 ### Client attribution
 
