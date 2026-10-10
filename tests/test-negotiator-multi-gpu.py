@@ -773,5 +773,124 @@ class MultiGpuLifecycleTests(unittest.TestCase):
                          {gpu: 0 for gpu in PAIR})
 
 
+class ReclamationFeasibilityTests(unittest.TestCase):
+    """Exercise real capacity admission without CUDA or backend subprocesses."""
+
+    def setUp(self):
+        self.devices = [
+            {'uuid': gpu, 'total_mib': 81920, 'free_mib': free}
+            for gpu, free in zip([*PAIR, 'GPU-large-2'], [54180, 42600, 81134])
+        ]
+        self.foreign = {f'999@{PAIR[1]}': 38514}
+        patches = [
+            mock.patch.object(n, 'BACKEND_TYPE', 'cuda'),
+            mock.patch.object(n, 'SELECTED_GPUS', [*PAIR, 'GPU-large-2']),
+            mock.patch.object(n, 'POOL_ENABLED', True),
+            mock.patch.object(n, 'POOL_MAX_SERVERS', 6),
+            mock.patch.object(n, 'POOL_INSTANCE_PARALLEL', 1),
+            mock.patch.object(n, 'AUTO_MODEL_CONTEXT', False),
+            mock.patch.object(n, 'effective_model_context_profile', return_value=None),
+            mock.patch.object(n, 'require_gpu_health'),
+            mock.patch.object(n, 'process_group_alive', return_value=True),
+            mock.patch.object(n, 'gpu_snapshot', side_effect=lambda: self.devices),
+            mock.patch.object(n, 'foreign_gpu_usage', side_effect=lambda **kw: self.foreign),
+            mock.patch.object(n, 'host_memory_snapshot', return_value={'memavailable_mib': 1000000}),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.broker = n.Broker()
+        self.required = 42912
+        self.busy = self.add_lane('busy-qwen', p.MODEL, 42912, in_flight=1)
+        self.idle = self.add_lane('idle-embedding', 'fixture-embedding:latest', 8481)
+        self.stops = []
+        self.spawns = []
+        for name, effect in [('_stop_lanes', self.stop), ('_spawn_lane', self.spawn),
+                             ('_model_profile', lambda model: (self.required, {'completion'}))]:
+            patch = mock.patch.object(self.broker, name, side_effect=effect)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def add_lane(self, lane_id, model, reservation, in_flight=0):
+        lane = n.Lane(lane_id, 'managed', '127.0.0.1', 1, PAIR[0], model,
+                      1, reservation, 0, 0, mock.Mock(), in_flight=in_flight)
+        self.broker.lanes[lane_id] = lane
+        return lane
+
+    def stop(self, lanes, reason):
+        self.stops.extend((lane.lane_id, reason) for lane in lanes)
+        for lane in lanes:
+            self.broker.lanes.pop(lane.lane_id)
+            self.devices[0]['free_mib'] += lane.reserved_mib
+        return []
+
+    def spawn(self, model, gpu_uuid, required_mib, *args, **kwargs):
+        self.spawns.append(gpu_uuid)
+        lane = self.add_lane('new-qwen', model, required_mib)
+        lane.gpu_uuid = gpu_uuid
+        self.devices[[item['uuid'] for item in self.devices].index(gpu_uuid)]['free_mib'] -= required_mib
+        return lane
+
+    def assert_preserved(self, *, parallel=2, scope=tuple(PAIR)):
+        with self.assertRaises(n.CapacityError) as raised:
+            self.broker.ensure_capacity(p.MODEL, parallel, gpu_uuids=scope)
+        self.assertTrue(raised.exception.retryable)
+        self.assertIs(self.broker.lanes.get(self.idle.lane_id), self.idle)
+        self.assertFalse(self.idle.retiring)
+        self.assertIs(self.broker.lanes.get(self.busy.lane_id), self.busy)
+        self.assertFalse(self.busy.retiring)
+        self.assertEqual(self.stops, [])
+        self.assertEqual(self.spawns, [])
+
+    def test_preserves_embedding_when_hard_scope_cannot_fit_another_qwen(self):
+        # 81920 - 42912 = 39008 on GPU 0; GPU 1 has only 42600 physical
+        # free MiB. GPU 2 would fit but is outside the exact request scope.
+        self.assert_preserved()
+
+    def test_lane_limit_does_not_retire_embedding_before_impossible_placement(self):
+        with mock.patch.object(n, 'POOL_MAX_SERVERS', 2):
+            self.assert_preserved()
+
+    def test_all_missing_placements_must_fit_before_any_reclamation(self):
+        self.required = self.busy.reserved_mib = 30000
+        self.idle.reserved_mib = 20000
+        self.devices[0]['free_mib'] = 31920
+        self.assert_preserved(parallel=3, scope=(PAIR[0],))
+
+    def test_foreign_vram_remains_committed_in_reclamation_projection(self):
+        self.required = self.busy.reserved_mib = 30000
+        self.idle.reserved_mib = 20000
+        self.foreign[f'998@{PAIR[0]}'] = 30000
+        self.broker.leases['active'] = mock.Mock(gpu_uuids=(PAIR[0],), state='active')
+        self.devices[0]['free_mib'] = 1920
+        self.assert_preserved(scope=(PAIR[0],))
+
+    def test_pending_lease_gpu_cannot_make_reclamation_look_feasible(self):
+        self.devices[1]['free_mib'] = 70000
+        self.foreign.clear()
+        self.broker.leases['pending'] = mock.Mock(gpu_uuids=(PAIR[1],), state='pending')
+        self.assert_preserved()
+
+    def test_host_memory_shortage_preserves_lane_before_slot_replacement(self):
+        with mock.patch.object(n, 'POOL_MAX_SERVERS', 2), mock.patch.object(
+            n, 'host_memory_snapshot', return_value={'memavailable_mib': 1}
+        ):
+            self.assert_preserved()
+
+    def test_feasible_reclamation_still_creates_requested_lane(self):
+        self.required = self.busy.reserved_mib = 30000
+        self.idle.reserved_mib = 30000
+        self.devices[0]['free_mib'] = 21920
+        result = self.broker.ensure_capacity(p.MODEL, 2, gpu_uuids=(PAIR[0],))
+        self.assertEqual(result['admitted_parallel'], 2)
+        self.assertEqual(self.spawns, [PAIR[0]])
+        self.assertEqual([item[0] for item in self.stops], [self.idle.lane_id])
+        self.assertIs(self.broker.lanes[self.busy.lane_id], self.busy)
+
+    def test_feasible_lane_limit_replacement_still_creates_requested_lane(self):
+        with mock.patch.object(n, 'POOL_MAX_SERVERS', 2):
+            self.test_feasible_reclamation_still_creates_requested_lane()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -3098,10 +3098,15 @@ class Broker:
             return set()
         return {key.rsplit("@", 1)[-1] for key in usage} - self._reserved_gpus_locked()
 
-    def _peer_reserved_gpus_locked(self, ignore_lane_id: str | None = None) -> set[str]:
+    def _peer_reserved_gpus_locked(
+        self, ignore_lane_id: str | None = None, *,
+        ignore_lane_ids: set[str] | None = None,
+    ) -> set[str]:
         return {gpu for lane in self.lanes.values()
                 if lane.kind == "managed" and len(lane.scope) > 1
-                and lane.lane_id != ignore_lane_id for gpu in lane.protected_scope}
+                and lane.lane_id != ignore_lane_id
+                and lane.lane_id not in (ignore_lane_ids or ())
+                for gpu in lane.protected_scope}
 
     def _require_safe_gpu_transition(
         self, gpu_uuids: str | tuple[str, ...], ignore_lane_id: str | None = None,
@@ -3656,15 +3661,22 @@ class Broker:
             {str(capability).lower() for capability in capabilities},
         )
 
-    def _placement_devices(self, blocked: set[str]) -> list[dict[str, Any]]:
+    def _placement_devices(
+        self, blocked: set[str], *, reclaiming: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return capacity after honoring every live lane's promised VRAM.
 
         Physical free VRAM can rise while a live lane retains its reservation.
         Treat that promise as committed until the complete process group exits
-        so another lane cannot consume the same capacity.
+        so another lane cannot consume the same capacity. With `reclaiming`,
+        return an optimistic post-reclamation bound, never an admission grant:
+        only those lanes' promises and physical footprint may be released.
         """
         with self.cv:
-            peer_reserved = self._peer_reserved_gpus_locked()
+            peer_reserved = self._peer_reserved_gpus_locked(ignore_lane_ids=reclaiming)
+            reclaimable_gpus = {gpu for lane in self.lanes.values()
+                                if lane.lane_id in (reclaiming or ())
+                                for gpu in lane.protected_scope}
         devices = [
             device for device in gpu_snapshot()
             if device.get("uuid") in SELECTED_GPUS
@@ -3682,7 +3694,8 @@ class Broker:
             self._prune_dead_lanes_locked()
             reserved_by_gpu: dict[str, int] = {}
             for lane in self.lanes.values():
-                if lane.kind != "managed" or not lane.scope:
+                if (lane.kind != "managed" or not lane.scope
+                        or lane.lane_id in (reclaiming or ())):
                     continue
                 for gpu in lane.scope:
                     reserved_by_gpu[gpu] = reserved_by_gpu.get(gpu, 0) + max(
@@ -3691,6 +3704,10 @@ class Broker:
         for device in devices:
             gpu_uuid = str(device.get("uuid") or "")
             physical_free = max(0, int(device.get("free_mib") or 0))
+            if gpu_uuid in reclaimable_gpus:
+                # Its exact physical release is unknown until exit. An upper
+                # bound avoids rejecting feasible reclaim on stale telemetry.
+                physical_free = max(0, int(device.get("total_mib") or 0))
             promised_free = max(
                 0,
                 int(device.get("total_mib") or 0)
@@ -3704,6 +3721,27 @@ class Broker:
                 "free_mib": min(physical_free, promised_free),
             })
         return available
+
+    def _require_reclamation_feasible(
+        self, gpu_uuids: tuple[str, ...] | None, required_mib: int,
+        missing: int, replaceable: list[Lane],
+    ) -> None:
+        # Called under cv, before marking or stopping any victim. Even freeing
+        # every eligible lane must allow all requested single-GPU placements.
+        devices = self._placement_devices(
+            self._ollama_blocked_gpus_locked(),
+            reclaiming={lane.lane_id for lane in replaceable},
+        )
+        capacity = sum(int(device.get("free_mib") or 0) // required_mib
+                       for device in devices
+                       if gpu_uuids is None or device.get("uuid") in gpu_uuids)
+        if capacity < missing:
+            raise CapacityError(
+                f"reclaiming all eligible idle lanes cannot fit {missing} "
+                f"new lane(s) requiring {required_mib} MiB within the GPU scope "
+                f"and live reservations (at most {capacity} fit)",
+                reason_code="lane_capacity_wait",
+            )
 
     @staticmethod
     def _warm_request(model: str, capabilities: set[str], request_path: str
@@ -4301,11 +4339,20 @@ class Broker:
                         model, parallel, required_mib, capabilities, request_path,
                         gpu_uuids, triggered_by, expected_profile,
                         allow_reclaim=allow_reclaim)
+                missing = desired_servers - len(existing)
+                host = host_memory_snapshot()
+                available_host = int(host.get("memavailable_mib") or 0)
+                required_host = missing * POOL_HOST_RESERVE_MIB
+                if available_host and available_host < required_host:
+                    raise CapacityError(
+                        f"{missing} new lane(s) reserve {required_host} MiB host memory, "
+                        f"but only {available_host} MiB is available",
+                        reason_code="host_memory_unavailable",
+                    )
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     managed = [lane for lane in self.lanes.values()
                                if lane.kind == "managed"]
-                    missing = desired_servers - len(existing)
                     overflow = max(
                         0, len(managed) + missing - POOL_MAX_SERVERS,
                     )
@@ -4335,6 +4382,9 @@ class Broker:
                             "managed Ollama lane capacity reached; no idle lane can be replaced",
                             reason_code="reclaimable_placement_wait",
                         )
+                    if overflow:
+                        self._require_reclamation_feasible(
+                            gpu_uuids, required_mib, missing, replaceable)
                     retired = replaceable[:overflow]
                     for lane in retired:
                         lane.retiring = True
@@ -4352,15 +4402,6 @@ class Broker:
                 with self.cv:
                     self._prune_dead_lanes_locked()
                     blocked = self._ollama_blocked_gpus_locked()
-                host = host_memory_snapshot()
-                available_host = int(host.get("memavailable_mib") or 0)
-                required_host = missing * POOL_HOST_RESERVE_MIB
-                if available_host and available_host < required_host:
-                    raise CapacityError(
-                        f"{missing} new lane(s) reserve {required_host} MiB host memory, "
-                        f"but only {available_host} MiB is available",
-                        reason_code="host_memory_unavailable",
-                    )
                 placements: list[str] = []
                 devices: list[dict[str, Any]] = []
                 preferred_gpus = (
@@ -4447,6 +4488,9 @@ class Broker:
                             ),
                             key=lambda lane: (lane.last_used, lane.created_at),
                         )
+                        if replaceable:
+                            self._require_reclamation_feasible(
+                                gpu_uuids, required_mib, missing, replaceable)
                         victim = replaceable[0] if replaceable else None
                         if victim is not None:
                             victim.retiring = True
