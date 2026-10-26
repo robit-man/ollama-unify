@@ -826,6 +826,8 @@ def test_default_context_is_pinned_on_warmup_and_inference(helper, fixture_bin):
     ) as harness:
         status, capacity, _ = harness.capacity(MODEL)
         assert status == 200, capacity
+        started = next(event for event in events(harness.event_log) if event["kind"] == "start")
+        assert started["no_prune"] == "1", "managed workers must not prune the read-only model store"
         warm = next(
             event for event in events(harness.event_log)
             if event["kind"] == "request"

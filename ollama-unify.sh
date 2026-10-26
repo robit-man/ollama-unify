@@ -5485,6 +5485,8 @@ class Broker:
             "OLLAMA_NUM_PARALLEL": str(POOL_INSTANCE_PARALLEL),
             "OLLAMA_SCHED_SPREAD": "1" if len(scope) > 1 else "0",
             "OLLAMA_KEEP_ALIVE": "-1",
+            # Only the main daemon maintains the shared, read-only model store.
+            "OLLAMA_NOPRUNE": "1",
             "OLLAMA_MAX_QUEUE": "64",
             "OLLAMA_GPU_OVERHEAD": str(POOL_VRAM_RESERVE_MIB * 1024 * 1024),
             "OLLAMA_FLASH_ATTENTION": "1",
@@ -13046,11 +13048,6 @@ check_ollama_update() {
 
 reconcile_after_update() {
   banner
-  if [ -x /usr/local/sbin/ollama-version-guard ]; then
-    err "Ollama release reconciliation is managed by the host version guard. Run sudo ollama-version-guard ensure."
-    err "The broker and running Ollama have been left untouched."
-    return 2
-  fi
   [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
     || { err "--reconcile requires a systemd host"; exit 2; }
   systemctl cat ollama.service >/dev/null 2>&1 \
@@ -13093,11 +13090,6 @@ reconcile_after_update() {
 
 update_ollama() {
   banner
-  if [ -x /usr/local/sbin/ollama-version-guard ]; then
-    err "Ollama upgrades are permission-gated on this host. Use ollama-version-guard approve/stage/activate with explicit operator permission."
-    err "The broker and running Ollama have been left untouched."
-    return 2
-  fi
   [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
     || { err "--update-ollama requires a systemd host"; exit 2; }
   [ "$HAS_CURL" = 1 ] || { err "curl is required to download an Ollama update"; exit 2; }
@@ -13166,12 +13158,6 @@ render_reconcile_helper() {
 # the negotiator already owns. This helper re-asserts the pin and restarts the
 # pair in the only safe order: proxy down, backend up, proxy up.
 set -euo pipefail
-
-# A host version guard owns release admission and rollback. Never accept an
-# out-of-band executable as a new baseline or restart GPU services around it.
-if [ -x /usr/local/sbin/ollama-version-guard ]; then
-  exec /usr/local/sbin/ollama-version-guard ensure
-fi
 
 STATE="/usr/local/share/ollama-unify/state.env"
 DROPIN="/etc/systemd/system/ollama.service.d/zzz-ollama-unify-safety.conf"

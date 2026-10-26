@@ -5,7 +5,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
-python3 "$repo_dir/tests/test-version-guard-integration.py" "$repo_dir"
+python3 "$repo_dir/tests/test-update-reconciliation.py" "$repo_dir"
 
 listen=$(
   # shellcheck disable=SC1091

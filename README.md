@@ -608,19 +608,16 @@ admits waiting/background clients immediately, so release it deliberately.
 
 ### Surviving Ollama upgrades
 
-Hosts with an executable `/usr/local/sbin/ollama-version-guard` delegate release
-admission to that host-owned manager. On those hosts, `--update-ollama` refuses
-before downloading or stopping either service, including in noninteractive
-and assume-yes modes. The generated reconciliation helper executes the
-manager's `ensure` operation and propagates failure; it never accepts a changed
-binary as a new approved version or falls through to the legacy restart path.
-Manual `--reconcile` also refuses its legacy service cycle and directs the
-operator to `sudo ollama-version-guard ensure`.
-Install and authorize updates through that manager's documented workflow.
-The manager itself is supplied by the host; this integration does not install
-it, grant upgrade permission or certify a new release's CUDA behavior.
-
-The following legacy upgrade behavior applies to hosts without that manager.
+Ollama releases can be updated through `--update-ollama`. The broker does not
+pin a release or consult a host version-admission helper. GPU leases, device
+scoping, recovery checks, memory accounting, and the loopback backend topology
+continue to apply across updates. Hosts that previously installed an external
+version manager must retire its launcher, service overrides, and rollback
+timer separately; updating this repository does not change host-owned files.
+Managed workers set `OLLAMA_NOPRUNE=1`: their sandbox keeps the shared model
+store read-only, and startup pruning in newer Ollama releases would otherwise
+fail while removing empty manifest directories. The main daemon retains model
+store maintenance.
 
 The official Ollama installer rewrites `/etc/systemd/system/ollama.service` and restarts the daemon. The unit it writes carries no `OLLAMA_HOST`, so the pinned loopback backend exists only in the late-priority ollama-unify drop-in. If that drop-in is cleared or drifts, Ollama falls back to its built-in `0.0.0.0:11434` and collides head-on with the negotiator that already owns that address — whichever process loses the bind race dies.
 

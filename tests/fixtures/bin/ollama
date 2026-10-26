@@ -250,6 +250,7 @@ signal.signal(signal.SIGINT, stop)
 emit("start", host=f"{host}:{port}", gpu=gpu, ppid=os.getppid(),
      context_length=context_length,
      sched_spread=os.environ.get("OLLAMA_SCHED_SPREAD"),
+     no_prune=os.environ.get("OLLAMA_NOPRUNE"),
      cuda_p2p=os.environ.get("GGML_CUDA_P2P"),
      unified_memory=os.environ.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY"),
      no_pinned=os.environ.get("GGML_CUDA_NO_PINNED"))
