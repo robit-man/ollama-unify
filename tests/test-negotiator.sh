@@ -6,6 +6,7 @@ test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
 python3 "$repo_dir/tests/test-update-reconciliation.py" "$repo_dir"
+python3 "$repo_dir/tests/test-install-agent-discovery.py" "$repo_dir"
 
 listen=$(
   # shellcheck disable=SC1091
