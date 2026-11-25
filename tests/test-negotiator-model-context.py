@@ -37,6 +37,27 @@ INFO = {
     'llama.attention.key_length': 128,
     'llama.attention.value_length': 128,
 }
+INKLING_INFO = {
+    'general.architecture': 'inkling2_loop',
+    'inkling2_loop.context_length': 1048576,
+    'inkling2_loop.block_count': 24,
+    'inkling2_loop.embedding_length': 2304,
+    'inkling2_loop.attention.head_count': [24] * 24,
+    'inkling2_loop.attention.head_count_kv': [8] * 24,
+    'inkling2_loop.attention.key_length': 128,
+    'inkling2_loop.attention.value_length': 128,
+    'inkling2_loop.attention.key_length_swa': 128,
+    'inkling2_loop.attention.value_length_swa': 128,
+    'inkling2_loop.attention.sliding_window': 1024,
+    'inkling2_loop.attention.sliding_window_pattern': ([True] * 5 + [False]) * 4,
+    'inkling2_loop.attn_res.block_size': 6,
+    'inkling2_loop.loop.start': 6,
+    'inkling2_loop.loop.end': 18,
+    'inkling2_loop.loop.count': 3,
+    'inkling2_loop.loop.gate_rank': 64,
+    'inkling2_loop.loop.varying': False,
+    'inkling2_loop.shortconv.l_cache': 4,
+}
 
 
 class ModelContextTests(unittest.TestCase):
@@ -145,6 +166,124 @@ class ModelContextTests(unittest.TestCase):
         memory = n.estimate_model_context_memory(self.info, MAXIMUM)
         expected = math.ceil(MAXIMUM * 32 * 8 * (2 + 2) * 34 / 1024**2)
         self.assertEqual(memory['kv_cache_mib'], expected)
+
+    def test_inkling_reserves_unrolled_cache_and_bounded_attention_graph(self):
+        context = INKLING_INFO['inkling2_loop.context_length']
+        memory = n.estimate_model_context_memory(INKLING_INFO, context)
+        # The 12 physical layers in the loop execute three times. Budget
+        # f16 at full context for every slot, including sliding attention.
+        self.assertEqual(memory['attention_blocks'], 48)
+        self.assertEqual(memory['kv_cache_type'], 'f16')
+        self.assertEqual(memory['kv_cache_mib'], 196608)
+        self.assertEqual(memory['recurrent_state_mib'], 4)
+        self.assertEqual(memory['graph_batch_tokens'], 128)
+        self.assertEqual(memory['graph_workspace_mib'], 49152)
+        self.assertEqual(memory['extra_vram_mib'], 247040)
+
+    def test_inkling_rounds_cache_cells_up_to_runtime_alignment(self):
+        # 32,769 cells are padded to 33,024. Each cell takes 192 KiB
+        # across all 48 logical layers of this exact checkpoint.
+        memory = n.estimate_model_context_memory(INKLING_INFO, 32769)
+        self.assertEqual(memory['kv_cache_mib'], 6192)
+        self.assertEqual(memory['graph_workspace_mib'], 1548)
+        self.assertEqual(memory['extra_vram_mib'], 8960)
+
+    def test_inkling_reserves_widest_value_row_with_per_mode_key_dimensions(self):
+        info = copy.deepcopy(INKLING_INFO)
+        info['inkling2_loop.attention.key_length_swa'] = 64
+        info['inkling2_loop.attention.value_length_swa'] = 64
+        memory = n.estimate_model_context_memory(info, MAXIMUM)
+        # Eight full slots and 40 local slots keep 128- or 64-wide keys.
+        # A transposed V cache can allocate the widest row for either mode.
+        self.assertEqual(memory['kv_cache_mib'], 38912)
+        self.assertEqual(memory['recurrent_state_mib'], 4)
+
+    def test_inkling_graph_reserves_the_largest_query_head_count(self):
+        info = copy.deepcopy(INKLING_INFO)
+        info['inkling2_loop.attention.head_count'][11] = 48
+        memory = n.estimate_model_context_memory(info, 32768)
+        self.assertEqual(memory['graph_workspace_mib'], 3072)
+        self.assertEqual(memory['kv_cache_mib'], 6144)
+
+    def test_inkling_scalar_head_counts_have_the_same_geometry(self):
+        info = copy.deepcopy(INKLING_INFO)
+        info['inkling2_loop.attention.head_count'] = 24
+        info['inkling2_loop.attention.head_count_kv'] = 8
+        self.assertEqual(n.estimate_model_context_memory(info, MAXIMUM),
+                         n.estimate_model_context_memory(INKLING_INFO, MAXIMUM))
+
+    def test_inkling_reserve_participates_in_capacity_before_any_model_start(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        device = {'uuid': 'GPU-context', 'total_mib': 81920, 'free_mib': 81920}
+        with mock.patch.object(n, 'gpu_snapshot', return_value=[device]), mock.patch.object(
+            n, 'require_gpu_health'
+        ), mock.patch.object(n, 'foreign_gpu_usage', return_value={}), mock.patch.object(
+            self.broker, '_spawn_lane'
+        ) as start:
+            with self.assertRaises(n.PermanentCapacityError) as raised:
+                self.broker.ensure_capacity(MODEL, 1, gpu_uuids=('GPU-context',))
+        self.assertEqual(raised.exception.reason_code, 'model_exceeds_gpu_capacity')
+        self.assertEqual(n.MODEL_CONTEXT_RESOLUTIONS[MODEL]['model_max_context'], 1048576)
+        self.assertEqual(n.MODEL_CONTEXT_RESOLUTIONS[MODEL]['kv_cache_mib'], 196608)
+        start.assert_not_called()
+
+    def test_inkling_rejects_unverified_loop_attention_and_convolution_geometry(self):
+        for key, invalid in (
+            ('attn_res.block_size', 0),
+            ('loop.start', 0),
+            ('loop.start', 18),
+            ('loop.end', 17),
+            ('loop.end', 25),
+            ('loop.count', True),
+            ('loop.count', 1),
+            ('loop.count', 43),
+            ('loop.count', None),
+            ('loop.gate_rank', 0),
+            ('loop.varying', True),
+            ('attention.head_count', [24] * 23),
+            ('attention.head_count_kv', [8] * 23),
+            ('attention.head_count_kv', [8] * 23 + [0]),
+            ('attention.head_count_kv', [8] * 23 + [5]),
+            ('attention.head_count_kv', [8] * 23 + [25]),
+            ('attention.sliding_window', 0),
+            ('attention.sliding_window_pattern', [True] * 23),
+            ('attention.sliding_window_pattern', [True] * 23 + [1]),
+            ('attention.value_length_swa', None),
+            ('attention.value_length_swa', 64),
+            ('nextn_predict_layers', 1),
+            ('decision.block_count', 1),
+            ('ssm.inner_size', 1),
+            ('shortconv.l_cache', 0),
+            ('shortconv.l_cache', 65),
+        ):
+            with self.subTest(key=key, invalid=invalid):
+                info = copy.deepcopy(INKLING_INFO)
+                name = f'inkling2_loop.{key}'
+                if invalid is None:
+                    info.pop(name)
+                else:
+                    info[name] = invalid
+                with self.assertRaises(n.PermanentCapacityError) as raised:
+                    n.estimate_model_context_memory(info, MAXIMUM)
+                self.assertEqual(raised.exception.reason_code, 'model_context_memory_unverified')
+
+    def test_unrecognized_per_layer_geometry_remains_unverified(self):
+        info = {key.replace('inkling2_loop.', 'llama.'): value
+                for key, value in INKLING_INFO.items()}
+        info['general.architecture'] = 'llama'
+        with self.assertRaises(n.PermanentCapacityError) as raised:
+            n.estimate_model_context_memory(info, MAXIMUM)
+        self.assertEqual(raised.exception.reason_code, 'model_context_memory_unverified')
+
+    def test_inkling_invalid_geometry_cannot_use_the_legacy_operator_reserve(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        self.info.pop('inkling2_loop.loop.count')
+        n.HARD_MAX_CONTEXT = 32768
+        n.MODEL_CONTEXT_PROFILES[MODEL] = self.profile(32768)
+        with self.assertRaises(n.PermanentCapacityError) as raised:
+            self.broker._model_profile(MODEL)
+        self.assertEqual(raised.exception.reason_code, 'model_context_memory_unverified')
+        self.assertNotIn(MODEL, n.RESOLVED_MODEL_CONTEXT_PROFILES)
 
     def test_unequal_head_dimensions_reserve_actual_f16_fallback_cache(self):
         self.info['llama.attention.key_length'] = 33
@@ -275,6 +414,63 @@ class ModelContextTests(unittest.TestCase):
                 body = json.dumps({'model': MODEL, 'options': {'num_ctx': 8192}}).encode()
                 prepared = json.loads(n.clamp_request(path, 'application/json', body))
                 self.assertEqual(prepared['options']['num_ctx'], MAXIMUM)
+                self.assertNotIn('num_batch', prepared['options'])
+
+    def test_inkling_zero_token_and_native_requests_pin_the_same_reserved_batch(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        n.HARD_MAX_CONTEXT = 32768
+        self.broker._model_profile(MODEL)
+        for endpoint in ('/api/chat', '/api/generate', '/api/embed', '/api/rerank'):
+            with self.subTest(endpoint=endpoint):
+                warm_path, warm = self.broker._warm_request(MODEL, {'completion'}, endpoint)
+                self.assertEqual(warm_path, '/api/generate')
+                self.assertEqual(warm['prompt'], '')
+                self.assertEqual(warm['options'], {'num_predict': 0, 'num_ctx': 32768, 'num_batch': 128})
+        for path in ('/api/chat', '/api/generate'):
+            for options in ({}, {'num_batch': 128}):
+                with self.subTest(path=path, options=options):
+                    body = json.dumps({'model': MODEL, 'options': options}).encode()
+                    prepared = json.loads(n.clamp_request(path, 'application/json', body))
+                    self.assertEqual(prepared['options']['num_batch'], 128)
+                    self.assertEqual(prepared['options']['num_ctx'], 32768)
+
+    def test_inkling_rejects_native_batch_overrides_before_admission(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        for path in ('/api/chat', '/api/generate'):
+            for batch in (64, 2048, True, '128', None):
+                with self.subTest(path=path, batch=batch), self.assertRaises(n.PermanentCapacityError) as raised:
+                    body = json.dumps({'model': MODEL, 'options': {'num_batch': batch}}).encode()
+                    n.clamp_request(path, 'application/json', body)
+                self.assertEqual(raised.exception.status, 400)
+                self.assertEqual(raised.exception.reason_code, 'invalid_model_options')
+
+    def test_inkling_requires_the_native_api_even_with_matching_model_defaults(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        n.HARD_MAX_CONTEXT = 32768
+        self.show_parameters = 'num_ctx 32768\nnum_batch 128\n'
+        self.broker._model_profile(MODEL)
+        body = json.dumps({'model': MODEL, 'options': {'num_batch': 128}}).encode()
+        for path in ('/v1/chat/completions', '/v1/completions', '/v1/responses'):
+            with self.subTest(path=path), self.assertRaises(n.PermanentCapacityError) as raised:
+                n.clamp_request(path, 'application/json', body)
+            self.assertEqual(raised.exception.status, 422)
+            self.assertEqual(raised.exception.reason_code, 'model_context_openai_mismatch')
+
+    def test_inkling_warm_validation_requires_the_exact_batch_after_preparation(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        self.broker._model_profile(MODEL)
+        proof = json.dumps({'model': MODEL, 'context_length': 1048576})
+        body = json.dumps({'model': MODEL}).encode()
+        self.broker.validate_warm_body(proof, MODEL, '/api/chat', body)
+        with self.assertRaises(n.PermanentCapacityError) as missing:
+            self.broker.validate_warm_body(proof, MODEL, '/api/chat', body, prepared=True)
+        self.assertEqual(missing.exception.reason_code, 'invalid_warm_admission')
+        prepared = n.clamp_request('/api/chat', 'application/json', body)
+        self.broker.validate_warm_body(proof, MODEL, '/api/chat', prepared, prepared=True)
+        spoofed = json.dumps({'model': MODEL, 'options': {'num_batch': 2048}}).encode()
+        with self.assertRaises(n.PermanentCapacityError) as conflicting:
+            self.broker.validate_warm_body(proof, MODEL, '/api/chat', spoofed)
+        self.assertEqual(conflicting.exception.reason_code, 'invalid_warm_admission')
 
     def test_openai_rejects_model_parameter_that_prevents_the_admitted_context(self):
         self.show_parameters = 'temperature 0.2\nnum_ctx 8192\n'
@@ -537,6 +733,74 @@ class ModelContextIntegrationTests(unittest.TestCase):
                 request = next(event for event in p.request_events(case.event_log)
                                if event['request_id'] == request_id)
                 self.assertEqual(request['options']['num_ctx'], MAXIMUM)
+
+    def test_inkling_managed_warmup_and_native_inference_use_the_admitted_batch(self):
+        p = self.pool
+        context = 32768
+        with mock.patch.dict(os.environ, {'OLLAMA_UNIFY_CONTEXT_HARD_LIMIT': str(context)}):
+            with p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True,
+                               model_info=INKLING_INFO) as case:
+                code, capacity, _ = case.capacity(p.MODEL)
+                self.assertEqual(code, 200, capacity)
+                lane = capacity['lanes'][0]
+                self.assertEqual(lane['resolved_context_length'], context)
+                self.assertEqual(lane['context_profile']['model_digest'], p.MODEL_DIGEST)
+                self.assertGreaterEqual(lane['reserved_mib'], 8960)
+                started = next(event for event in p.events(case.event_log)
+                               if event['kind'] == 'start')
+                self.assertEqual(started['context_length'], context)
+                warm = next(event for event in p.events(case.event_log)
+                            if event['kind'] == 'request' and event['model'] == p.MODEL
+                            and event['path'] == '/api/generate')
+                self.assertEqual(warm['options']['num_batch'], 128)
+                self.assertEqual(warm['options']['num_predict'], 0)
+                for path in ('/api/chat', '/api/generate'):
+                    with self.subTest(path=path):
+                        code, result, _ = p.http_json(case.proxy_port, 'POST', path, {
+                            'model': p.MODEL, 'stream': False, 'mock_request_id': path,
+                        })
+                        self.assertEqual(code, 200, result)
+                        request = next(event for event in p.request_events(case.event_log)
+                                       if event['request_id'] == path)
+                        self.assertEqual(request['options']['num_batch'], 128)
+                        self.assertEqual(request['options']['num_ctx'], context)
+                gpu_uuids = lane['gpu_uuids']
+                code, proof, _ = p.http_json(case.proxy_port, 'POST',
+                    '/.well-known/ollama-unify-gpu-negotiator/capacity', {
+                        'model': p.MODEL, 'parallel': 1, 'gpu_uuids': gpu_uuids,
+                        'endpoint': '/api/chat', 'warm_admission_proof': True,
+                    })
+                self.assertEqual(code, 200, proof)
+                code, result, _ = p.http_json(case.proxy_port, 'POST', '/api/chat', {
+                    'model': p.MODEL, 'stream': False, 'mock_request_id': 'certified-inkling',
+                }, extra_headers={
+                    'X-Ollama-Unify-GPU-UUIDs': ','.join(gpu_uuids),
+                    'X-Ollama-Unify-Warm-Admission': json.dumps(proof['warm_admission']),
+                })
+                self.assertEqual(code, 200, result)
+                certified = next(event for event in p.request_events(case.event_log)
+                                 if event['request_id'] == 'certified-inkling')
+                self.assertEqual(certified['options']['num_batch'], 128)
+                self.assertEqual(certified['options']['num_ctx'], context)
+
+    def test_inkling_unbudgeted_requests_are_rejected_before_runner_start(self):
+        p = self.pool
+        with mock.patch.dict(os.environ, {'OLLAMA_UNIFY_CONTEXT_HARD_LIMIT': '32768'}):
+            with p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True,
+                               model_info=INKLING_INFO) as case:
+                for path, options, status, reason in (
+                    ('/api/chat', {'num_batch': 2048}, 400, 'invalid_model_options'),
+                    ('/v1/chat/completions', {}, 422, 'model_context_openai_mismatch'),
+                ):
+                    with self.subTest(path=path):
+                        code, result, _ = p.http_json(case.proxy_port, 'POST', path, {
+                            'model': p.MODEL, 'stream': False, 'options': options,
+                            'mock_request_id': path,
+                        })
+                        self.assertEqual(code, status, result)
+                        self.assertEqual(result['reason_code'], reason)
+                self.assertFalse([event for event in p.events(case.event_log)
+                                  if event['kind'] in ('request', 'start')])
 
     def test_unknown_resource_geometry_returns_actionable_failure_without_start(self):
         p = self.pool

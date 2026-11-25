@@ -1037,9 +1037,94 @@ def effective_model_context_profile(model: str) -> dict | None:
     return RESOLVED_MODEL_CONTEXT_PROFILES.get(model) or MODEL_CONTEXT_PROFILES.get(model)
 
 
+def estimate_inkling_loop_context_memory(info: dict, context: int) -> dict:
+    """Bound the independent KV and convolution state of each fixed-loop pass."""
+    prefix = "inkling2_loop."
+
+    def invalid(field: str) -> None:
+        raise PermanentCapacityError(f"invalid Inkling loop context geometry: {field}", 422,
+                                     "model_context_memory_unverified")
+
+    def dimension(field: str) -> int:
+        value = info.get(prefix + field)
+        if type(value) is not int or not 1 <= value <= 2 ** 31 - 1:
+            invalid(field)
+        return value
+
+    if type(context) is not int or not 1 <= context <= 2 ** 31 - 1:
+        invalid("context length")
+    blocks = dimension("block_count")
+    start, end, passes = (dimension("loop." + field) for field in ("start", "end", "count"))
+    residual_block = dimension("attn_res.block_size")
+    dimension("loop.gate_rank")
+    nextn = info.get(prefix + "nextn_predict_layers", 0)
+    decision_blocks = info.get(prefix + "decision.block_count", 0)
+    slots = blocks + (passes - 1) * (end - start)
+    if (not start < end <= blocks or start % residual_block or end % residual_block or passes < 2
+            or slots > 512 or info.get(prefix + "loop.varying", False) is not False
+            or type(nextn) is not int or nextn != 0
+            or type(decision_blocks) is not int or decision_blocks != 0
+            or prefix + "full_attention_interval" in info
+            or any(name.startswith(prefix + "ssm.") for name in info)):
+        invalid("fixed loop bounds or conflicting cache layout")
+
+    def layer_heads(field: str) -> list[int]:
+        value = info.get(prefix + field)
+        if type(value) is int:
+            value = [value] * blocks
+        if not isinstance(value, list) or len(value) != blocks or any(
+                type(heads) is not int or not 1 <= heads <= 2 ** 31 - 1 for heads in value):
+            invalid(field)
+        return value
+
+    queries = layer_heads("attention.head_count")
+    kv_heads = layer_heads("attention.head_count_kv")
+    if any(query % kv for query, kv in zip(queries, kv_heads)):
+        invalid("query heads must be divisible by KV heads")
+
+    dimension("attention.sliding_window")
+    swa = info.get(prefix + "attention.sliding_window_pattern")
+    if not isinstance(swa, list) or len(swa) != blocks or any(type(layer) is not bool for layer in swa):
+        invalid("attention.sliding_window_pattern")
+    key, value = (dimension("attention." + field) for field in ("key_length", "value_length"))
+    swa_key, swa_value = (dimension("attention." + field) for field in ("key_length_swa", "value_length_swa"))
+    if key != value or swa_key != swa_value:
+        invalid("key and value dimensions must match")
+
+    history = dimension("shortconv.l_cache")
+    embedding = dimension("embedding_length")
+    channels = max(2 * heads * (swa_key if local else key) + 2 * embedding
+                   for heads, local in zip(kv_heads, swa))
+    if not 2 <= history <= 64 or channels * (history - 1) > 2 ** 32 - 1:
+        invalid("shortconv.l_cache or convolution state width")
+    recurrent_bytes = slots * channels * (history - 1) * 4
+
+    # Each loop pass has separate state. Reserve fp16 and full-size local
+    # caches, with the widest V row for runtimes that transpose values.
+    widest_value = max(heads * (swa_value if local else value) for heads, local in zip(kv_heads, swa))
+    bytes_per_token = sum(
+        (passes if start <= layer < end else 1) * (heads * (swa_key if local else key) + widest_value) * 2
+        for layer, (heads, local) in enumerate(zip(kv_heads, swa)))
+    padded_context = ((context + 255) // 256) * 256
+    mib = 1024 ** 2
+    kv_mib = (padded_context * bytes_per_token + mib - 1) // mib
+    recurrent_mib = (recurrent_bytes + mib - 1) // mib
+    # Relative attention bias materializes dense per-head tensors even
+    # with flash attention. Bound the live bias and score workspace in fp32.
+    batch_tokens = 128
+    graph_bytes = padded_context * max(queries) * batch_tokens * 16
+    graph_mib = (graph_bytes + mib - 1) // mib
+    reserve = ((kv_mib + recurrent_mib + graph_mib + 1024 + 255) // 256) * 256
+    return {"extra_vram_mib": reserve, "kv_cache_type": "f16", "kv_cache_mib": kv_mib,
+            "recurrent_state_mib": recurrent_mib, "attention_blocks": slots,
+            "graph_workspace_mib": graph_mib, "graph_batch_tokens": batch_tokens}
+
+
 def estimate_model_context_memory(info: dict, context: int) -> dict:
     """Bound KV and fp32 recurrent state from the exact GGUF metadata."""
     architecture = info.get("general.architecture")
+    if architecture == "inkling2_loop":
+        return estimate_inkling_loop_context_memory(info, context)
     if not isinstance(architecture, str) or not architecture:
         raise PermanentCapacityError("model architecture is unavailable for context memory admission", 422,
                                      "model_context_memory_unverified")
@@ -1152,7 +1237,7 @@ def resolve_model_context_profile(model: str, match: dict | None = None) -> dict
             # Retain the original conservative operator contract only when
             # this exact artifact is not being grown. A small manual reserve
             # must never bypass available KV geometry or authorize growth.
-            if (not configured or context > configured["context_length"]
+            if (architecture == "inkling2_loop" or not configured or context > configured["context_length"]
                     or configured["extra_vram_mib"] < math.ceil(context / 16)):
                 raise
             memory = {"memory_estimate_source": "operator_digest_bound_reserve"}
@@ -1168,7 +1253,8 @@ def resolve_model_context_profile(model: str, match: dict | None = None) -> dict
             "source": "operator_profile" if configured else "exact_model_metadata",
             "limit_reason": reason, "checked_at": time.monotonic(), **memory,
             "legacy_profile_upgraded": bool(configured and context > configured["context_length"]),
-            "openai_context_compatible": configured_context is None or int(configured_context[1]) == context,
+            "openai_context_compatible": ("graph_batch_tokens" not in memory
+                                          and (configured_context is None or int(configured_context[1]) == context)),
         }
         return profile
 
@@ -1516,6 +1602,21 @@ class BackendHTTPError(RuntimeError):
         )
 
 
+def pin_model_graph_batch(model: str, options: dict, *, is_openai: bool = False) -> None:
+    batch = MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get("graph_batch_tokens")
+    if batch is None:
+        return
+    if is_openai:
+        raise PermanentCapacityError(
+            "This model requires a broker-verified batch; use the native Ollama API",
+            422, "model_context_openai_mismatch")
+    if "num_batch" in options and (type(options["num_batch"]) is not int or options["num_batch"] != batch):
+        raise PermanentCapacityError(
+            "request conflicts with the model's verified batch geometry",
+            400, "invalid_model_options")
+    options["num_batch"] = batch
+
+
 def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
     """Prevent clients from bypassing dynamic GPU fitting or the scanned context cap.
 
@@ -1568,6 +1669,7 @@ def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
             # The profiled lane always starts at the admitted context so a
             # smaller request cannot create a later, unaccounted VRAM growth.
             options["num_ctx"] = profile["context_length"]
+            pin_model_graph_batch(model, options, is_openai=is_openai)
             if is_openai and not MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get("openai_context_compatible", True):
                 raise PermanentCapacityError(
                     "OpenAI context cannot override the model's explicit num_ctx; "
@@ -5173,8 +5275,14 @@ class Broker:
                 "frequency_penalty", "stop", "mirostat", "mirostat_tau", "mirostat_eta",
                 "penalize_newline", "tfs_z", "num_ctx", "num_gpu",
             }
+            graph_batch = MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get("graph_batch_tokens")
+            if graph_batch is not None:
+                prediction_options.add("num_batch")
             if (not isinstance(options, dict)
                     or set(options).difference(prediction_options)
+                    or ("num_batch" in options and (type(options["num_batch"]) is not int
+                        or options["num_batch"] != graph_batch))
+                    or (prepared and graph_batch is not None and "num_batch" not in options)
                     or ("num_ctx" in options and (type(options["num_ctx"]) is not int
                         or options["num_ctx"] != proof["context_length"]))
                     or ("num_gpu" in options and (type(options["num_gpu"]) is not int or options["num_gpu"] != -1))
@@ -5343,18 +5451,20 @@ class Broker:
                       ) -> tuple[str, dict[str, Any]]:
         # The broker owns eviction timing; native idle expiry bypasses guards.
         keep_alive = -1
-        if request_path in EMBEDDING_PATHS or (
+        model_key = canonical_model_tag(model)
+        graph_batch = MODEL_CONTEXT_RESOLUTIONS.get(model_key, {}).get("graph_batch_tokens")
+        if graph_batch is None and (request_path in EMBEDDING_PATHS or (
             not request_path and "embedding" in capabilities
             and "completion" not in capabilities
-        ):
+        )):
             return "/api/embed", {
                 # Empty input loads the runner without computing an embedding.
                 "model": model, "input": [], "keep_alive": keep_alive,
             }
-        if request_path == "/api/rerank" or (
+        if graph_batch is None and (request_path == "/api/rerank" or (
             not request_path and "reranking" in capabilities
             and "completion" not in capabilities
-        ):
+        )):
             return "/api/rerank", {
                 "model": model,
                 "query": "warmup",
@@ -5366,6 +5476,7 @@ class Broker:
         warm_context = profile["context_length"] if profile else MAX_CONTEXT
         if warm_context > 0:
             options["num_ctx"] = warm_context
+        pin_model_graph_batch(model_key, options)
         return "/api/generate", {
             "model": model,
             "prompt": "",
@@ -7745,6 +7856,7 @@ class Broker:
                 raise PermanentCapacityError("model options must be a JSON object", 400,
                                              "invalid_model_options")
             options["num_ctx"] = prepared_context
+            pin_model_graph_batch(lane.model, options)
         if payload.get("keep_alive") == 0:
             self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
             # Do not leave an empty backend that can reload implicitly on its
