@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from unittest import mock
 
 
 MODEL = "fixture-small:latest"
@@ -594,6 +595,96 @@ class PoolHarness:
             "/.well-known/ollama-unify-gpu-negotiator/capacity",
             payload,
         )
+
+
+def test_catalog_remains_available_during_base_stream(helper, fixture_bin):
+    push_started = threading.Event()
+    release_push = threading.Event()
+    original_post = Handler.do_POST
+
+    def hold_push(handler):
+        if handler.path != "/api/push":
+            original_post(handler)
+            return
+        length = int(handler.headers.get("Content-Length", "0"))
+        handler.rfile.read(length)
+        response = b'{"status":"success"}'
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(response)))
+        handler.end_headers()
+        handler.wfile.flush()
+        push_started.set()
+        if release_push.wait(8):
+            handler.wfile.write(response)
+
+    with mock.patch.object(Handler, "do_POST", hold_push), PoolHarness(helper, fixture_bin) as harness:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            push = executor.submit(http_json, harness.proxy_port, "POST", "/api/push", {"model": MODEL})
+            try:
+                assert push_started.wait(3)
+                assert harness.status()["parallel_pool"]["lanes"][0]["in_flight"] == 1
+                tags_status, tags, tags_headers = http_json(harness.proxy_port, "GET", "/api/tags", timeout=2)
+                assert tags_status == 200 and tags["models"][0]["name"] == MODEL
+                assert tags_headers["X-Ollama-Unify-Lane"] == "base-metadata"
+                ps_status, running, _ = http_json(harness.proxy_port, "GET", "/api/ps", timeout=2)
+                assert ps_status == 200 and running == {"models": []}
+                version_status, version, _ = http_json(harness.proxy_port, "GET", "/api/version", timeout=2)
+                assert version_status == 200 and version["version"] == "fixture"
+                show_status, show, _ = http_json(
+                    harness.proxy_port, "POST", "/api/show", {"model": MODEL}, timeout=2,
+                )
+                assert show_status == 200 and show["model_info"] == FIXTURE_MODEL_INFO
+                chat_status, _, chat_headers = chat(harness.proxy_port, MODEL, "inference-during-push", timeout=4)
+                assert chat_status == 200 and chat_headers["X-Ollama-Unify-Lane"].startswith("lane-")
+                for method, path in (("POST", "/api/tags"), ("GET", "/api/unsupported")):
+                    blocked_status, blocked, _ = http_json(
+                        harness.proxy_port, method, path, timeout=2,
+                        extra_headers={"X-Ollama-Unify-Admission-Wait-Ms": "100"},
+                    )
+                    assert blocked_status == 503 and blocked["reason_code"] == "queue_admission_timeout"
+                assert not push.done()
+                assert harness.status()["active_requests"] == 1
+            finally:
+                release_push.set()
+            assert push.result(timeout=3)[0] == 200
+        wait_until(lambda: harness.status()["active_requests"] == 0, "all base admissions to release")
+
+
+def test_metadata_admission_recovers_after_saturation(helper, fixture_bin):
+    started = threading.Barrier(5)
+    release = threading.Event()
+    original_post = Handler.do_POST
+
+    def hold_show(handler):
+        if handler.path != "/api/show":
+            original_post(handler)
+            return
+        started.wait(4)
+        if release.wait(4):
+            original_post(handler)
+
+    with mock.patch.object(Handler, "do_POST", hold_show), PoolHarness(helper, fixture_bin) as harness:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            shows = [executor.submit(
+                http_json, harness.proxy_port, "POST", "/api/show", {"model": MODEL}, timeout=5,
+            ) for _ in range(4)]
+            try:
+                started.wait(4)
+                state = harness.status()
+                assert state["active_requests"] == 4
+                assert state["parallel_pool"]["lanes"][0]["in_flight"] == 0
+                status, failure, _ = http_json(
+                    harness.proxy_port, "GET", "/api/tags", timeout=2,
+                    extra_headers={"X-Ollama-Unify-Admission-Wait-Ms": "100"},
+                )
+                assert status == 503 and failure["reason_code"] == "queue_admission_timeout"
+                assert failure["error"] == "Ollama metadata admission is busy"
+            finally:
+                release.set()
+            assert all(show.result(timeout=3)[0] == 200 for show in shows)
+        wait_until(lambda: harness.status()["active_requests"] == 0, "all metadata admissions to release")
+        assert http_json(harness.proxy_port, "GET", "/api/tags", timeout=2)[0] == 200
 
 
 def test_existing_pool_contract(helper, fixture_bin):
@@ -3402,6 +3493,8 @@ def test_inference_request_without_json_content_type_is_served(
 def main():
     helper = os.path.abspath(sys.argv[1])
     fixture_bin = os.path.abspath(sys.argv[2])
+    test_catalog_remains_available_during_base_stream(helper, fixture_bin)
+    test_metadata_admission_recovers_after_saturation(helper, fixture_bin)
     test_existing_pool_contract(helper, fixture_bin)
     test_model_gpu_preference_selects_requested_fitting_gpu(helper, fixture_bin)
     test_managed_lane_rejects_cpu_fallback(helper, fixture_bin)

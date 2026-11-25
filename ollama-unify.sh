@@ -1504,9 +1504,14 @@ EMBEDDING_PATHS = ("/api/embed", "/api/embeddings", "/v1/embeddings")
 INFERENCE_PATHS = NATIVE_MODEL_PATHS + (
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
 )
-SAFE_METADATA_PATHS = (
-    "/api/ps", "/api/tags", "/api/version", "/api/show", "/v1/models",
-)
+SAFE_METADATA_REQUESTS = {
+    (method, path)
+    for method in ("GET", "HEAD")
+    for path in ("/api/ps", "/api/tags", "/api/version", "/v1/models")
+} | {("POST", "/api/show")}
+METADATA_PARALLEL = 4
+METADATA_ADMISSION_WAIT = 2.0
+METADATA_IO_TIMEOUT = 5.0
 CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
@@ -3675,6 +3680,13 @@ class Broker:
                 POOL_INSTANCE_PARALLEL, 0, now, now,
             )
         }
+        # Catalog/status calls use the system backend without borrowing its
+        # single operation slot from a pull, push, or other long response.
+        # Keep these slots outside GPU placement and managed lane accounting.
+        self.base_metadata_lane = Lane(
+            "base-metadata", "system", BACKEND_HOST, BACKEND_PORT, None, "",
+            METADATA_PARALLEL, 0, now, now,
+        )
         self.next_lane_id = 1
         self.clients: dict[str, dict[str, Any]] = {}
         if any(lease.state == "revoking" for lease in self.leases.values()):
@@ -7229,7 +7241,8 @@ class Broker:
                     gpu_uuids: tuple[str, ...] | None = None,
                     warm_admission: str | None = None,
                     client: dict[str, str] | None = None,
-                    cpu_offload: bool = False) -> Admission:
+                    cpu_offload: bool = False,
+                    *, metadata_only: bool = False) -> Admission:
         if type(cpu_offload) is not bool:
             raise PermanentCapacityError("cpu_offload must be boolean", 400, "invalid_admission_header")
         if cpu_offload and warm_admission is not None:
@@ -7239,6 +7252,10 @@ class Broker:
             raise PermanentCapacityError("CPU offload requires the managed Ollama pool", 409, "pool_disabled")
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
+        if metadata_only:
+            if routable or model:
+                raise ValueError("metadata admission cannot route inference")
+            allow_during_drain = True
         if routable and model:
             require_inference_enabled(request_id=request_id,
                                       logical_request_id=logical_request_id)
@@ -7280,6 +7297,8 @@ class Broker:
         wait_seconds = DRAIN_TIMEOUT
         if admission_wait is not None:
             wait_seconds = max(0.1, min(DRAIN_TIMEOUT, admission_wait))
+        if metadata_only:
+            wait_seconds = min(wait_seconds, METADATA_ADMISSION_WAIT)
         deadline = enqueued_at + wait_seconds
 
         if not routable or not model or not POOL_ENABLED:
@@ -7311,7 +7330,11 @@ class Broker:
                                 logical_request_id=logical_request_id,
                             )
                         self.cv.wait(min(remaining, 0.25))
-                    lane = self._select_lane_locked(model, routable, gpu_uuids)
+                    if metadata_only:
+                        metadata_lane = self.base_metadata_lane
+                        lane = metadata_lane if metadata_lane.in_flight < metadata_lane.parallel else None
+                    else:
+                        lane = self._select_lane_locked(model, routable, gpu_uuids)
                     if lane is not None:
                         active = self._register_active_request_locked(
                             lane, request_id, logical_request_id
@@ -7325,7 +7348,7 @@ class Broker:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise AdmissionTimeoutError(
-                            "Ollama system lane is busy",
+                            "Ollama metadata admission is busy" if metadata_only else "Ollama system lane is busy",
                             request_id=request_id,
                             logical_request_id=logical_request_id,
                         )
@@ -9627,6 +9650,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
+        safe_metadata = (self.command, path) in SAFE_METADATA_REQUESTS
         if self.command == "GET" and path == "/.well-known/ollama-unify-gpu-negotiator":
             requested_model = parse_qs(self.path.partition("?")[2]).get("model", [""])[0]
             if requested_model:
@@ -9728,7 +9752,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 admission = self.broker.proxy_enter(
                     "", False, self._client_connected,
-                    allow_during_drain=True,
+                    metadata_only=safe_metadata,
                 )
                 self._send_json(200, self.broker.aggregate_running_models())
             except ClientDisconnected:
@@ -9875,7 +9899,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
-                allow_during_drain=path in SAFE_METADATA_PATHS,
+                metadata_only=safe_metadata,
                 request_path=path,
                 admission_wait=self._requested_admission_wait(),
                 logical_request_id=logical_request_id,
@@ -9957,6 +9981,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         watcher_stop_writer = None
         client_watcher = None
         client_socket_timeout = self.connection.gettimeout()
+        io_timeout = min(REQUEST_ACTIVITY_TTL, METADATA_IO_TIMEOUT) if safe_metadata else REQUEST_ACTIVITY_TTL
         try:
             watcher_stop_reader, watcher_stop_writer = socket.socketpair()
             client_watcher = threading.Thread(
@@ -9965,7 +9990,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 daemon=True,
             )
             client_watcher.start()
-            self.connection.settimeout(REQUEST_ACTIVITY_TTL)
+            self.connection.settimeout(io_timeout)
             broker_control_headers = {
                 "x-ollama-unify-admission-wait-ms",
                 "x-ollama-unify-logical-request-id",
@@ -9985,7 +10010,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             ):
                 headers["Content-Type"] = content_type
             backend = http.client.HTTPConnection(
-                lane.host, lane.port, timeout=REQUEST_ACTIVITY_TTL
+                lane.host, lane.port, timeout=io_timeout
             )
             if not self.broker.request_backend_started(admission, backend):
                 raise ConnectionAbortedError(
