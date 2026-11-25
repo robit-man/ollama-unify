@@ -71,6 +71,7 @@ class ModelContextTests(unittest.TestCase):
             ('MAX_CONTEXT', 8192), ('MODEL_CONTEXT_PROFILES', {}),
             ('AUTO_MODEL_CONTEXT', True), ('HARD_MAX_CONTEXT', 0),
             ('RESOLVED_MODEL_CONTEXT_PROFILES', {}), ('MODEL_CONTEXT_RESOLUTIONS', {}),
+            ('CAPACITY_FIT_CONTEXTS', {}),
             ('POOL_ENABLED', True), ('POOL_INSTANCE_PARALLEL', 2),
             ('POOL_MODEL_OVERHEAD_PERCENT', 100), ('POOL_VRAM_RESERVE_MIB', 1024),
             ('SELECTED_GPUS', ['GPU-context']),
@@ -214,7 +215,7 @@ class ModelContextTests(unittest.TestCase):
 
     def test_inkling_reserve_participates_in_capacity_before_any_model_start(self):
         self.info = copy.deepcopy(INKLING_INFO)
-        device = {'uuid': 'GPU-context', 'total_mib': 81920, 'free_mib': 81920}
+        device = {'uuid': 'GPU-context', 'total_mib': 4096, 'free_mib': 4096}
         with mock.patch.object(n, 'gpu_snapshot', return_value=[device]), mock.patch.object(
             n, 'require_gpu_health'
         ), mock.patch.object(n, 'foreign_gpu_usage', return_value={}), mock.patch.object(
@@ -226,6 +227,22 @@ class ModelContextTests(unittest.TestCase):
         self.assertEqual(n.MODEL_CONTEXT_RESOLUTIONS[MODEL]['model_max_context'], 1048576)
         self.assertEqual(n.MODEL_CONTEXT_RESOLUTIONS[MODEL]['kv_cache_mib'], 196608)
         start.assert_not_called()
+
+    def test_inkling_fit_respects_coordinated_headroom_and_the_allowed_gpu_scope(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        required, _ = self.broker._model_profile(MODEL)
+        devices = [
+            {'uuid': 'GPU-first', 'free_mib': 10000},
+            {'uuid': 'GPU-second', 'free_mib': 64000},
+            {'uuid': 'GPU-outside', 'free_mib': 81920},
+        ]
+        with mock.patch.object(self.broker, '_placement_devices', return_value=devices):
+            chosen = self.broker._fit_cold_inkling_singleton(
+                MODEL, required, ('GPU-first', 'GPU-second'), 4096)
+        self.assertEqual(chosen, 'GPU-second')
+        fitted, _ = self.broker._model_profile(MODEL)
+        self.assertLessEqual(fitted, 64000 - 4096)
+        self.assertGreater(n.CAPACITY_FIT_CONTEXTS[MODEL], 32768)
 
     def test_inkling_rejects_unverified_loop_attention_and_convolution_geometry(self):
         for key, invalid in (
@@ -782,6 +799,52 @@ class ModelContextIntegrationTests(unittest.TestCase):
                                  if event['request_id'] == 'certified-inkling')
                 self.assertEqual(certified['options']['num_batch'], 128)
                 self.assertEqual(certified['options']['num_ctx'], context)
+
+    def test_inkling_cold_chat_fits_a_single_gpu_in_the_full_ordered_allowlist(self):
+        p = self.pool
+        maximum = INKLING_INFO['inkling2_loop.context_length']
+        gpu_uuids = ['GPU-large-2', 'GPU-large-0', 'GPU-large-1']
+        with p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True,
+                           model_info=INKLING_INFO) as case:
+            self.assertGreater(n.estimate_model_context_memory(INKLING_INFO, maximum)['extra_vram_mib'],
+                               3 * 81920)
+            code, result, _ = p.http_json(case.proxy_port, 'POST', '/api/chat', {
+                'model': p.MODEL, 'stream': False, 'mock_request_id': 'cold-inkling',
+                'options': {'num_ctx': maximum},
+            }, extra_headers={'X-Ollama-Unify-GPU-UUIDs': ','.join(gpu_uuids)})
+            self.assertEqual(code, 200, result)
+            start, = [event for event in p.events(case.event_log) if event['kind'] == 'start']
+            self.assertEqual(start['gpu'], gpu_uuids[0])
+            context = start['context_length']
+            self.assertGreaterEqual(context, 32768)
+            self.assertLess(context, maximum)
+            self.assertEqual(context % 4096, 0)
+            request = next(event for event in p.request_events(case.event_log)
+                           if event['request_id'] == 'cold-inkling')
+            self.assertEqual(request['options']['num_ctx'], context)
+            self.assertEqual(request['options']['num_batch'], 128)
+            code, capacity, _ = case.capacity(p.MODEL, gpu_uuids=gpu_uuids)
+            self.assertEqual(code, 200, capacity)
+            self.assertEqual(capacity['requested_gpu_uuids'], gpu_uuids)
+            lane, = capacity['lanes']
+            self.assertEqual(lane['gpu_uuids'], gpu_uuids[:1])
+            self.assertEqual(lane['resolved_context_length'], context)
+            self.assertEqual(lane['context_resolution']['limit_reason'], 'lease_capacity_fit')
+            self.assertLessEqual(lane['reserved_mib'], 81920 - 4096)
+
+    def test_inkling_explicit_group_does_not_fit_a_single_gpu(self):
+        p = self.pool
+        with p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True,
+                           model_info=INKLING_INFO) as case:
+            code, result, _ = p.http_json(case.proxy_port, 'POST',
+                '/.well-known/ollama-unify-gpu-negotiator/capacity', {
+                    'model': p.MODEL, 'parallel': 1,
+                    'gpu_uuids': ['GPU-large-2', 'GPU-large-0', 'GPU-large-1'],
+                    'placement': 'exclusive_group',
+                })
+            self.assertEqual(code, 422, result)
+            self.assertEqual(result['reason_code'], 'model_exceeds_gpu_capacity')
+            self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'start'])
 
     def test_inkling_unbudgeted_requests_are_rejected_before_runner_start(self):
         p = self.pool

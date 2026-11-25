@@ -1037,6 +1037,22 @@ def effective_model_context_profile(model: str) -> dict | None:
     return RESOLVED_MODEL_CONTEXT_PROFILES.get(model) or MODEL_CONTEXT_PROFILES.get(model)
 
 
+def context_fit_extra_mib(info: dict, context: int, verified_context: int, floor_mib: int) -> int:
+    scaled_floor = math.ceil(floor_mib * context / verified_context / 256) * 256
+    return max(scaled_floor, estimate_model_context_memory(info, context)["extra_vram_mib"])
+
+
+def set_capacity_fit_context(model: str, context: int | None) -> None:
+    with MODEL_CONTEXT_LOCK:
+        if context is None:
+            if CAPACITY_FIT_CONTEXTS.pop(model, None) is None:
+                return
+        else:
+            CAPACITY_FIT_CONTEXTS[model] = context
+        RESOLVED_MODEL_CONTEXT_PROFILES.pop(model, None)
+        MODEL_CONTEXT_RESOLUTIONS.pop(model, None)
+
+
 def estimate_inkling_loop_context_memory(info: dict, context: int) -> dict:
     """Bound the independent KV and convolution state of each fixed-loop pass."""
     prefix = "inkling2_loop."
@@ -1230,6 +1246,11 @@ def resolve_model_context_profile(model: str, match: dict | None = None) -> dict
         reason = "operator_model_profile" if configured and context < maximum else None
         if HARD_MAX_CONTEXT > 0 and context > HARD_MAX_CONTEXT:
             context, reason = HARD_MAX_CONTEXT, "operator_hard_context_limit"
+        floor_mib = configured["extra_vram_mib"] if configured else 0
+        fitted = CAPACITY_FIT_CONTEXTS.get(model)
+        if fitted is not None and fitted < context:
+            floor_mib = context_fit_extra_mib(info, fitted, context, floor_mib)
+            context, reason = fitted, "lease_capacity_fit"
         try:
             memory = estimate_model_context_memory(info, context)
             memory["memory_estimate_source"] = "exact_model_metadata"
@@ -1242,8 +1263,7 @@ def resolve_model_context_profile(model: str, match: dict | None = None) -> dict
                 raise
             memory = {"memory_estimate_source": "operator_digest_bound_reserve"}
         profile = {"context_length": context,
-                   "extra_vram_mib": max(configured["extra_vram_mib"] if configured else 0,
-                                         memory.get("extra_vram_mib", 0)),
+                   "extra_vram_mib": max(floor_mib, memory.get("extra_vram_mib", 0)),
                    "model_digest": digest}
         RESOLVED_MODEL_CONTEXT_PROFILES[model] = profile
         parameters = metadata.get("parameters", "")
@@ -1374,6 +1394,10 @@ AUTO_MODEL_CONTEXT = env_bool("OLLAMA_UNIFY_AUTO_MODEL_CONTEXT", True)
 HARD_MAX_CONTEXT = max(0, env_int("OLLAMA_UNIFY_CONTEXT_HARD_LIMIT", 0))
 RESOLVED_MODEL_CONTEXT_PROFILES: dict[str, dict] = {}
 MODEL_CONTEXT_RESOLUTIONS: dict[str, dict] = {}
+CAPACITY_FIT_CONTEXTS: dict[str, int] = {}
+CONTEXT_FIT_MIN = max(4096, env_int("OLLAMA_UNIFY_CONTEXT_FIT_MIN", 32768))
+CONTEXT_FIT_STEP = 4096
+CONTEXT_FIT_HEADROOM_MIB = env_int("OLLAMA_UNIFY_CONTEXT_FIT_HEADROOM_MIB", 4096)
 MODEL_CONTEXT_LOCK = threading.RLock()
 CONTEXT_PROFILE_UNSET = object()
 ANON_POLL = env_float("OLLAMA_UNIFY_ANON_POLL", 0.5)
@@ -1659,8 +1683,13 @@ def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
                     "model_context_managed_pool_required",
                 )
             requested = options.get("num_ctx")
+            resolution = MODEL_CONTEXT_RESOLUTIONS.get(model, {})
+            ceiling = profile["context_length"]
+            if resolution.get("limit_reason") == "lease_capacity_fit":
+                maximum = resolution["model_max_context"]
+                ceiling = min(maximum, HARD_MAX_CONTEXT or maximum)
             if requested is not None and (
-                type(requested) is not int or requested > profile["context_length"]
+                type(requested) is not int or requested > ceiling
             ):
                 raise PermanentCapacityError(
                     "request exceeds the model-specific context policy", 400,
@@ -5425,6 +5454,53 @@ class Broker:
                 device["free_mib"] = min(device["free_mib"], lease_capacity[device["uuid"]])
         return available
 
+    def _fit_context_to_capacity(self, model: str, required_mib: int, free_mib: int) -> int | None:
+        with MODEL_CONTEXT_LOCK:
+            profile = effective_model_context_profile(model)
+            resolution = dict(MODEL_CONTEXT_RESOLUTIONS.get(model, {}))
+            configured = MODEL_CONTEXT_PROFILES.get(model)
+        if (profile is None or resolution.get("memory_estimate_source") != "exact_model_metadata"
+                or resolution.get("limit_reason") == "lease_capacity_fit"):
+            return None
+        verified = profile["context_length"]
+        budget = free_mib - required_mib + profile["extra_vram_mib"] * POOL_INSTANCE_PARALLEL
+        if budget <= 0:
+            return None
+        floor_mib = configured["extra_vram_mib"] if configured else 0
+        info = backend_json("POST", "/api/show", {"model": model}, timeout=10.0).get("model_info", {})
+        low = (CONTEXT_FIT_MIN + CONTEXT_FIT_STEP - 1) // CONTEXT_FIT_STEP
+        high = (verified - 1) // CONTEXT_FIT_STEP
+        fitted = None
+        while low <= high:
+            middle = (low + high) // 2
+            context = middle * CONTEXT_FIT_STEP
+            if context_fit_extra_mib(info, context, verified, floor_mib) * POOL_INSTANCE_PARALLEL <= budget:
+                fitted = context
+                low = middle + 1
+            else:
+                high = middle - 1
+        return fitted
+
+    def _fit_cold_inkling_singleton(
+        self, model: str, required_mib: int, gpu_uuids: tuple[str, ...] | None, headroom: int,
+    ) -> str | None:
+        """Fit the native Inkling graph on one allowed GPU in preference order."""
+        if not MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get("graph_batch_tokens"):
+            return None
+        with self.cv:
+            blocked = self._ollama_blocked_gpus_locked()
+        devices = self._placement_devices(blocked)
+        preferred = gpu_uuids if gpu_uuids is not None else MODEL_GPU_PREFERENCES.get(model, [])
+        rank = {gpu: index for index, gpu in enumerate(preferred)}
+        available = [(device["uuid"], device["free_mib"]) for device in devices
+                     if gpu_uuids is None or device["uuid"] in rank]
+        for gpu, free_mib in sorted(available, key=lambda item: (rank.get(item[0], len(rank)), -item[1], item[0])):
+            context = self._fit_context_to_capacity(model, required_mib, free_mib - headroom)
+            if context is not None:
+                set_capacity_fit_context(model, context)
+                return gpu
+        return None
+
     def _require_reclamation_feasible(
         self, gpu_uuids: tuple[str, ...] | None, required_mib: int,
         missing: int, replaceable: list[Lane],
@@ -6225,6 +6301,11 @@ class Broker:
             if stale and self._stop_lanes(stale, "model context identity changed"):
                 raise CapacityError("previous model context lane has not completely stopped",
                                     reason_code="lane_stop_failed")
+            with self.cv:
+                cold = not any(lane.kind == "managed" and lane.model == model for lane in self.lanes.values())
+            if cold and model in CAPACITY_FIT_CONTEXTS:
+                set_capacity_fit_context(model, None)
+                profile_data = None
             if placement == "exclusive_group":
                 if profile_data is None:
                     with MODEL_CONTEXT_LOCK:
@@ -6245,6 +6326,10 @@ class Broker:
                             and not lane.loading and lane.can_serve(gpu_uuids, cpu_offload)]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
+                fitted_gpu = None
+                headroom = (triggered_by or {}).get("context_headroom_mib")
+                if type(headroom) is not int or headroom < 0:
+                    headroom = CONTEXT_FIT_HEADROOM_MIB
                 with MODEL_CONTEXT_LOCK:
                     if profile_data is None:
                         profile_data = self._model_profile(model)
@@ -6256,6 +6341,15 @@ class Broker:
                     if device.get("uuid") in SELECTED_GPUS
                     and (gpu_uuids is None or device.get("uuid") in gpu_uuids)
                 ]
+                if (cold and parallel == 1 and selected_devices
+                        and required_mib > max(int(device.get("total_mib") or 0) for device in selected_devices)):
+                    fitted_gpu = self._fit_cold_inkling_singleton(model, required_mib, gpu_uuids, headroom)
+                    if fitted_gpu is not None:
+                        with MODEL_CONTEXT_LOCK:
+                            profile_data = self._model_profile(model)
+                            expected_profile = effective_model_context_profile(model)
+                            expected_profile = dict(expected_profile) if expected_profile else None
+                        required_mib, capabilities = profile_data
                 if selected_devices and required_mib > max(
                     int(device.get("total_mib") or 0)
                     for device in selected_devices
@@ -6361,6 +6455,8 @@ class Broker:
                             device for device in devices
                             if device.get("uuid") in gpu_uuids
                         ]
+                    if fitted_gpu is not None:
+                        devices = [device for device in devices if device["uuid"] == fitted_gpu]
                     virtual_free = {
                         str(device.get("uuid") or ""):
                             int(device.get("free_mib") or 0)
@@ -6371,7 +6467,7 @@ class Broker:
                         candidates = [
                             (gpu_uuid, free_mib)
                             for gpu_uuid, free_mib in virtual_free.items()
-                            if free_mib >= required_mib
+                            if free_mib >= required_mib + (headroom if fitted_gpu is not None else 0)
                         ]
                         if not candidates:
                             break
