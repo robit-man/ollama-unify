@@ -6374,6 +6374,17 @@ class Broker:
                                 model, parallel, required_mib, capabilities, request_path,
                                 gpu_uuids, triggered_by, expected_profile,
                                 allow_reclaim=allow_reclaim)
+                        if (cold and parallel == 1
+                                and MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get("graph_batch_tokens")
+                                and self._fit_context_to_capacity(
+                                    model, required_mib,
+                                    max(int(device.get("total_mib") or 0) for device in selected_devices) - headroom,
+                                ) is not None):
+                            # The physical limit is only an upper bound for classification.
+                            # Actual placement must still honor live VRAM and lease reservations.
+                            raise CapacityError(
+                                f"model {model!r} can fit at a shorter context once GPU capacity is available",
+                                reason_code="reclaimable_placement_wait")
                         raise PermanentCapacityError(
                             f"model {model!r} requires {required_mib} MiB per lane, "
                             f"but selected GPUs have {capacity} MiB combined physical capacity",

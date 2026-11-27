@@ -691,6 +691,28 @@ class ModelContextTests(unittest.TestCase):
             self.broker._model_profile(MODEL)
         self.assertNotIn(MODEL, n.RESOLVED_MODEL_CONTEXT_PROFILES)
 
+    def test_cold_inkling_distinguishes_reserved_vram_from_physical_limits(self):
+        self.info = copy.deepcopy(INKLING_INFO)
+        self.tag['size'] = 21 * 1024**3
+        gpus = ['GPU-large-0', 'GPU-large-1', 'GPU-large-2']
+        for total_mib, expected in ((81920, 'reclaimable_placement_wait'),
+                                    (16384, 'model_exceeds_gpu_capacity')):
+            with self.subTest(total_mib=total_mib):
+                devices = [{'uuid': gpu, 'total_mib': total_mib, 'free_mib': 2048} for gpu in gpus]
+                with mock.patch.multiple(n, SELECTED_GPUS=gpus, POOL_INSTANCE_PARALLEL=1), \
+                        mock.patch.object(n, 'gpu_snapshot', return_value=devices), \
+                        mock.patch.object(n, 'require_gpu_health'), \
+                        mock.patch.object(n, 'foreign_gpu_usage', return_value={}), \
+                        mock.patch.object(self.broker, '_placement_devices', return_value=devices), \
+                        mock.patch.object(self.broker, '_spawn_lane') as start:
+                    with self.assertRaises(n.CapacityError) as raised:
+                        self.broker.ensure_capacity(MODEL, 1, request_path='/api/chat')
+                self.assertEqual(raised.exception.reason_code, expected)
+                self.assertEqual(raised.exception.retryable, total_mib == 81920)
+                self.assertEqual(raised.exception.status, 503 if total_mib == 81920 else 422)
+                self.assertNotIn(MODEL, n.CAPACITY_FIT_CONTEXTS)
+                start.assert_not_called()
+
     def test_kv_memory_requirement_blocks_placement_before_any_model_start(self):
         device = {'uuid': 'GPU-context', 'total_mib': 16384, 'free_mib': 16384}
         with mock.patch.object(n, 'gpu_snapshot', return_value=[device]), mock.patch.object(
@@ -845,6 +867,41 @@ class ModelContextIntegrationTests(unittest.TestCase):
             self.assertEqual(code, 422, result)
             self.assertEqual(result['reason_code'], 'model_exceeds_gpu_capacity')
             self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'start'])
+
+    def test_cold_inkling_retains_request_until_an_eligible_gpu_fits(self):
+        p = self.pool
+        gpus = ['GPU-large-0', 'GPU-large-1', 'GPU-large-2']
+        with p.PoolHarness(HELPER, FIXTURE_BIN, auto_model_context=True, model_info=INKLING_INFO,
+                           request_detached_ttl=8) as case:
+            leases = {}
+            for gpu in gpus:
+                lease = p.control(case.socket_path, {
+                    'action': 'acquire', 'owner': 'inkling-capacity-fixture-' + gpu,
+                    'gpu_uuids': [gpu], 'requested_mib': 78000, 'ttl': 30,
+                })['lease']
+                leases[gpu] = lease['token']
+                p.control(case.socket_path, {'action': 'ready', 'token': lease['token']})
+
+            logical_id = 'turn:inkling-cold-retained'
+            code, result, _ = p.http_json(case.proxy_port, 'POST', '/api/chat', {
+                'model': p.MODEL, 'stream': False, 'mock_request_id': 'inkling-cold-retained',
+                'options': {'num_ctx': 135168},
+            }, extra_headers={'X-Ollama-Unify-Logical-Request-Id': logical_id,
+                              'X-Ollama-Unify-Admission-Wait-Ms': '1000'})
+            self.assertEqual(code, 503, result)
+            self.assertEqual(result['reason_code'], 'queue_admission_timeout')
+            self.assertEqual(result['cause_reason_code'], 'reclaimable_placement_wait')
+            self.assertIs(result['admission_retained'], True)
+            self.assertFalse([event for event in p.events(case.event_log) if event['kind'] == 'start'])
+
+            p.control(case.socket_path, {'action': 'release', 'token': leases['GPU-large-1']})
+            code, result, _ = p.resume_chat(case.proxy_port, logical_id)
+            self.assertEqual(code, 200, result)
+            start, = [event for event in p.events(case.event_log) if event['kind'] == 'start']
+            self.assertEqual(start['gpu'], 'GPU-large-1')
+            requests = [event for event in p.request_events(case.event_log)
+                        if event['request_id'] == 'inkling-cold-retained']
+            self.assertEqual(len(requests), 1)
 
     def test_inkling_unbudgeted_requests_are_rejected_before_runner_start(self):
         p = self.pool
