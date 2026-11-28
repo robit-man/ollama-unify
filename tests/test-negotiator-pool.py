@@ -2221,6 +2221,45 @@ def test_fifo_queue_and_metrics(helper, fixture_bin):
         assert final_queue["wait_ms_max"] >= final_queue["wait_ms_mean"]
 
 
+def test_warm_same_model_fifo_is_scoped_to_competing_gpus(helper, fixture_bin):
+    first_gpu, second_gpu = "GPU-large-0", "GPU-large-1"
+    tags = [{"name": MODEL, "model": MODEL, "size": 60 * 1024**3, "capabilities": ["completion"]}]
+    with PoolHarness(helper, fixture_bin, max_servers=2, tags=tags,
+                     runner_vram_mib=60 * 1024, request_activity_ttl=6.0) as harness:
+        assert harness.capacity(MODEL, gpu_uuids=[first_gpu])[0] == 200
+        assert harness.capacity(MODEL, gpu_uuids=[second_gpu])[0] == 200
+        lanes = {lane["gpu_uuid"]: lane["id"] for lane in managed_lanes(harness.status())}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            active = executor.submit(chat, harness.proxy_port, MODEL, "scope-active", 3.0, 10,
+                                     gpu_uuids=[first_gpu])
+            wait_until(lambda: request_events(harness.event_log), "first GPU request is active")
+            older = executor.submit(chat, harness.proxy_port, MODEL, "scope-older", 0.01, 10,
+                                    gpu_uuids=[first_gpu], logical_request_id="scope:older")
+            wait_until(lambda: queue_with_depth(harness, 1), "same-model older waiter on first GPU")
+            overlapping = executor.submit(chat, harness.proxy_port, MODEL, "scope-overlap", 0.01, 10,
+                                          gpu_uuids=[first_gpu], logical_request_id="scope:overlap")
+            wait_until(lambda: queue_with_depth(harness, 2), "second waiter competing for first GPU")
+
+            duplicate = chat(harness.proxy_port, MODEL, "scope-older", 0.01,
+                             gpu_uuids=[second_gpu], logical_request_id="scope:older")
+            assert duplicate[0] == 409 and duplicate[1]["reason_code"] == "logical_request_conflict", duplicate
+            younger = chat(harness.proxy_port, MODEL, "scope-disjoint", 0.01,
+                           gpu_uuids=[second_gpu], logical_request_id="scope:disjoint", admission_wait_ms=700)
+            assert younger[0] == 200, younger
+            assert younger[2]["X-Ollama-Unify-Lane"] == lanes[second_gpu], younger
+            flexible = chat(harness.proxy_port, MODEL, "scope-flexible", 0.01,
+                            gpu_uuids=[first_gpu, second_gpu], logical_request_id="scope:flexible", admission_wait_ms=700)
+            assert flexible[0] == 200 and flexible[2]["X-Ollama-Unify-Lane"] == lanes[second_gpu], flexible
+            assert not older.done() and not overlapping.done()
+            results = [pending.result(timeout=10) for pending in (active, older, overlapping)]
+            assert all(result[0] == 200 for result in results)
+            assert duplicate[2]["X-Ollama-Unify-Request-Id"] == results[1][2]["X-Ollama-Unify-Request-Id"]
+
+        assert [event["request_id"] for event in request_events(harness.event_log)] == [
+            "scope-active", "scope-disjoint", "scope-flexible", "scope-older", "scope-overlap"]
+        assert harness.status()["parallel_pool"]["queue"]["duplicate_total"] == 1
+
+
 def test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin):
     with PoolHarness(helper, fixture_bin, max_servers=1, resume_ttl=2.0) as harness:
         status, capacity, _ = harness.capacity(MODEL)
@@ -3536,6 +3575,7 @@ def main():
     test_live_vram_reclaims_idle_lane_below_process_ceiling(helper, fixture_bin)
     test_lazy_parallel_scaling(helper, fixture_bin)
     test_fifo_queue_and_metrics(helper, fixture_bin)
+    test_warm_same_model_fifo_is_scoped_to_competing_gpus(helper, fixture_bin)
     test_logical_request_resumes_fifo_without_reenqueue(helper, fixture_bin)
     test_completed_native_response_replays_without_generation(helper, fixture_bin)
     test_completed_streaming_response_replays_exact_body(helper, fixture_bin)

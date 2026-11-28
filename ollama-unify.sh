@@ -5047,12 +5047,15 @@ class Broker:
         gpu_uuids: tuple[str, ...] | None = None,
         certified_lane_ids: set[str] | None = None,
         cpu_offload: bool = False,
+        earlier_waiter_gpus: set[str] | None = None,
     ) -> Lane | None:
         if routable and model:
             require_inference_enabled()
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
         blocked_gpus = self._ollama_blocked_gpus_locked()
+        if earlier_waiter_gpus:
+            blocked_gpus = blocked_gpus.union(earlier_waiter_gpus)
         if not routable:
             return base if base.in_flight < base.parallel else None
         gpu_uuids = self._policy_constraint_locked(model, gpu_uuids)
@@ -5090,6 +5093,22 @@ class Broker:
         if any(lane.kind == "managed" for lane in self.lanes.values()):
             return None
         return base if base.in_flight < base.parallel else None
+
+    def _earlier_same_model_gpus_locked(self, model: str, waiter_index: int) -> set[str] | None:
+        """Reserve older requests' GPU scopes before admitting a ready lane."""
+        reserved = set()
+        for earlier in self.waiters[:waiter_index]:
+            if earlier.model != model:
+                continue
+            try:
+                scope = self._capacity_scope_locked(
+                    model, earlier.gpu_uuids, "auto", str((earlier.client or {}).get("key") or ""))
+            except PermanentCapacityError:
+                return None  # The older admission owns resolution of a changed policy.
+            if scope is None:
+                return None  # An unscoped request can use every eligible lane.
+            reserved.update(scope)
+        return reserved
 
     def _warm_runtime_identity_locked(self, lane: Lane) -> dict[str, Any]:
         if lane.cpu_offload:
@@ -7647,11 +7666,11 @@ class Broker:
                      if item is waiter),
                     -1,
                 )
-                next_for_model = waiter_index >= 0 and not any(
-                    item.model == model for item in self.waiters[:waiter_index]
-                )
-                if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True, client_scope, certified_ids, waiter.cpu_offload)
+                earlier_gpus = (self._earlier_same_model_gpus_locked(model, waiter_index)
+                                if not self.draining and waiter_index >= 0 else None)
+                if earlier_gpus is not None:
+                    lane = self._select_lane_locked(model, True, client_scope, certified_ids, waiter.cpu_offload,
+                                                    earlier_waiter_gpus=earlier_gpus)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
